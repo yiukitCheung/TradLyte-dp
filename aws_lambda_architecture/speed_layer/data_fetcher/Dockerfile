@@ -18,15 +18,16 @@ RUN useradd --create-home --shell /bin/bash speedlayer
 WORKDIR /app
 
 # Copy speed layer requirements first (for better Docker caching)
-COPY speed_layer/requirements.txt ./requirements.txt
+COPY aws_lambda_architecture/speed_layer/data_fetcher/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy shared client modules
-COPY shared/ ./shared/
+# Copy shared client modules (from aws_lambda_architecture/shared)
+COPY aws_lambda_architecture/shared/ ./shared/
 
-# Copy speed layer services
-COPY speed_layer/services/ ./services/
+# Create services directory and copy speed layer data fetcher service
+RUN mkdir -p ./services
+COPY aws_lambda_architecture/speed_layer/data_fetcher/webosket_service.py ./services/webosket_service.py
 
 # Create directory for logs
 RUN mkdir -p /app/logs && chown -R speedlayer:speedlayer /app
