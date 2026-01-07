@@ -72,18 +72,139 @@ curl http://localhost:8080/health
 
 ## 🚀 Deployment
 
-### Local Development
+### Prerequisites
+
+1. **AWS CLI configured** with appropriate IAM permissions
+2. **Environment variables set**:
+   ```bash
+   export POLYGON_API_KEY='your-polygon-api-key'
+   export AURORA_ENDPOINT='your-aurora-endpoint.region.rds.amazonaws.com'
+   export AWS_REGION='ca-west-1'  # Optional, defaults to ca-west-1
+   ```
+
+3. **Docker installed** (for ECS service deployment)
+
+### Quick Deployment (All Components)
+
+Deploy all Speed Layer components in one command:
+
 ```bash
-docker-compose up -d
+cd aws_lambda_architecture/speed_layer
+./deploy.sh
 ```
 
-### AWS ECS Fargate
-- Deploy via Terraform (see `../infrastructure/terraform/`)
-- Environment variables required:
-  - `POLYGON_API_KEY`
-  - `KINESIS_STREAM_NAME`
-  - `AURORA_ENDPOINT`
-  - `AWS_REGION`
+This will deploy:
+1. DynamoDB Tables (alert configs, ticks, notifications)
+2. Kinesis Data Stream (raw market data ingestion)
+3. SNS Topic (alert notifications)
+4. Signal Generator Lambda (process alerts)
+5. ECS Fargate Service (WebSocket data fetcher)
+
+### Manual Deployment (Step-by-Step)
+
+#### 1. DynamoDB Tables
+```bash
+cd infrastructure
+./deploy_dynamodb_tables.sh
+```
+
+Creates:
+- `alert_configurations` - User alert configurations
+- `realtime_ticks` - Latest tick data (with 24h TTL)
+- `alert_notifications_history` - Alert audit log
+
+#### 2. Kinesis Data Stream
+```bash
+./deploy_kinesis_stream.sh
+```
+
+Creates:
+- `dev-market-data-stream` - Raw market data ingestion stream
+
+#### 3. SNS Topic
+```bash
+./deploy_sns_topic.sh
+```
+
+Creates:
+- `condvest-speed-layer-alerts` - Alert notification topic
+
+**Subscribe to alerts:**
+```bash
+aws sns subscribe \
+  --topic-arn arn:aws:sns:ca-west-1:ACCOUNT_ID:condvest-speed-layer-alerts \
+  --protocol email \
+  --notification-endpoint your-email@example.com \
+  --region ca-west-1
+```
+
+#### 4. Signal Generator Lambda
+```bash
+./deploy_lambda_signal_generator.sh
+```
+
+Deploys:
+- `dev-signal-generator` - Lambda function to process Kinesis Analytics output
+
+**Configure Kinesis event source:**
+```bash
+aws lambda create-event-source-mapping \
+  --function-name dev-signal-generator \
+  --event-source-arn arn:aws:kinesis:ca-west-1:ACCOUNT_ID:stream/dev-market-data-stream \
+  --starting-position LATEST \
+  --region ca-west-1
+```
+
+#### 5. Kinesis Analytics (Flink)
+
+**Note:** Kinesis Analytics deployment requires manual configuration via AWS Console or updated deployment script.
+
+The Flink SQL applications are located in:
+- `kinesis_analytics/flink_apps/`
+
+Deploy via AWS Console:
+1. Go to Kinesis Analytics → Studio
+2. Create new Flink application
+3. Copy SQL from `flink_apps/*.sql` files
+4. Configure input/output streams
+5. Start application
+
+#### 6. ECS Fargate Service
+```bash
+./deploy_ecs_service.sh
+```
+
+Deploys:
+- ECS Cluster: `dev-speed-layer-cluster`
+- ECS Service: `dev-websocket-service`
+- Task Definition: `dev-websocket-task`
+- ECR Repository: `speed-layer-websocket`
+
+**Monitor service:**
+```bash
+# Check service status
+aws ecs describe-services \
+  --cluster dev-speed-layer-cluster \
+  --services dev-websocket-service \
+  --region ca-west-1
+
+# View logs
+aws logs tail /ecs/dev-websocket-task --follow --region ca-west-1
+```
+
+### Local Development
+
+```bash
+# Build and run locally
+cd data_fetcher
+docker-compose up -d
+
+# View logs
+docker-compose logs -f websocket-service
+
+# Health check
+curl http://localhost:8080/health
+```
 
 ## 🔍 Monitoring
 
@@ -143,3 +264,43 @@ curl http://localhost:8080/health
 - **CPU**: 0.25 vCPU (typical)
 - **Memory**: 512 MB
 - **Network**: Minimal (WebSocket + Kinesis API calls)
+
+## 💰 Cost Estimation
+
+| Component | Monthly Cost |
+|-----------|--------------|
+| DynamoDB Tables | $15-25 |
+| Kinesis Data Stream | $50-100 |
+| Kinesis Analytics (Flink) | $50-100 |
+| ECS Fargate | $30-50 |
+| Lambda (Signal Generator) | $5-10 |
+| SNS | $1-5 |
+| **Total** | **~$150-290/month** |
+
+## 🔧 Troubleshooting
+
+### ECS Service Not Starting
+- Check CloudWatch logs: `/ecs/dev-websocket-task`
+- Verify environment variables are set correctly
+- Check IAM role permissions for Kinesis and Aurora
+
+### No Data in Kinesis Stream
+- Verify WebSocket service is running: `aws ecs describe-services --cluster dev-speed-layer-cluster --services dev-websocket-service`
+- Check Polygon API key is valid
+- Verify Aurora endpoint is accessible from ECS
+
+### Lambda Not Processing Records
+- Check Lambda CloudWatch logs
+- Verify event source mapping is configured
+- Check DynamoDB table permissions
+
+### Kinesis Analytics Not Processing
+- Verify Flink application is running
+- Check input stream configuration
+- Review Flink application logs in CloudWatch
+
+## 📚 Additional Resources
+
+- [DynamoDB Tables Documentation](./infrastructure/dynamodb_tables.md)
+- [Redis ElastiCache (Optional)](./infrastructure/redis_elasticache.md)
+- [Kinesis Analytics Flink SQL Apps](./kinesis_analytics/flink_apps/)

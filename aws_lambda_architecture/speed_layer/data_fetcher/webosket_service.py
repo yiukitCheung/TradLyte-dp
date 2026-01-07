@@ -29,7 +29,8 @@ from aiohttp import web, WSMsgType
 from aiohttp.web_runner import GracefulExit
 
 # Import shared utilities
-sys.path.append('/opt/python')
+# Add /app to path for shared modules
+sys.path.insert(0, '/app')
 from shared.clients.kinesis_client import KinesisClient
 from shared.clients.aurora_client import AuroraClient
 from shared.models.data_models import TickData, OHLCVData
