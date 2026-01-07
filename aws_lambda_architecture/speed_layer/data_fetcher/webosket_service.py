@@ -86,11 +86,7 @@ class PolygonWebSocketService:
     async def load_active_symbols(self):
         """Load active symbols from Aurora symbol metadata table"""
         try:
-            query = """
-                SELECT DISTINCT symbol 
-                FROM symbol_metadata 
-                WHERE is_active = t 
-            """
+            query = """ SELECT symbol FROM data_ingestion_watermark WHERE is_current = 'true' """
             
             result = await self.aurora_client.execute_query(query)
             

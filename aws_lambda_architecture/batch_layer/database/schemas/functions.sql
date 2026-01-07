@@ -137,9 +137,10 @@ $$ LANGUAGE plpgsql;
 -- Test Function
 
 -- Test Fetch Symbol Range
-SELECT * FROM Fetch_Symbol_Range('AAPL', 60)
+SELECT * FROM Fetch_Symbol_Range('XYZ', 60)
 -- Test Fetch Symbol Period
-SELECT * FROM Fetch_Symbol_Period('AAPL', 'YTD')
+SELECT * FROM Fetch_Symbol_Period('AMD', 'YTD')
 -- Test Growth Pct
 SELECT * FROM Growth('AAPL', 30)
 
+SELECT symbol FROM data_ingestion_watermark WHERE is_current = 'true'
