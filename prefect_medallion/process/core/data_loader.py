@@ -9,7 +9,16 @@ class DataLoader:
     def __init__(self, settings: dict):
         load_dotenv()
         self.db_file = settings["process"]["silver_db_path"]
-        self.gold_path = settings["process"]["gold"]
+        # Make gold_path absolute if it's relative
+        gold_path = settings["process"]["gold_path"]
+        if not os.path.isabs(gold_path):
+            # Get project root (parent of process directory)
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            self.gold_path = os.path.join(project_root, gold_path)
+        else:
+            self.gold_path = gold_path
+        # Ensure directory exists
+        os.makedirs(self.gold_path, exist_ok=True)
         self.con = duckdb.connect(self.db_file)
         self.strategies = settings["process"]["strategies"]
         self.interval_list = settings["process"]["strategies"]["vegas_channel"]["intervals"]

@@ -7,11 +7,11 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # Load the settings
-from config import load_setting
+from config.load_setting import load_setting
 settings = load_setting()
 
 from process.core import IndicatorCalculator, TrendAlertProcessor, DataLoader, CacheManager
-from process import VegasChannelStrategy
+from process.strategies.VegasChannel import VegasChannelStrategy
 from tools.redis_client import RedisTools
 
 @flow(name="gold-pipeline")
