@@ -2,7 +2,7 @@ WITH numbered AS (
     SELECT
         *,
         ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY timestamp) AS rn
-    FROM test_raw_ohlcv
+    FROM raw
 ),
 grp AS (
     SELECT

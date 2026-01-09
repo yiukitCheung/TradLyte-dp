@@ -31,7 +31,7 @@ class StockDataIngestor:
         
         # Set the topic names
         self.topic_name = '1d'
-        self.table_name = 'test_raw_ohlcv'
+        self.table_name = 'raw'
         
         # Initialize the PostgresTools client
         self.postgres_tools = postgres_client.PostgresTools(POSTGRES_URL)

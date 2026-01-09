@@ -12,8 +12,8 @@ import traceback
 class PostgresTools:
     def __init__(self, postgres_url):
         self.postgres_url = postgres_url
-        self.raw_table_name = "test_raw_ohlcv"
-        self.meta_table_name = "test_symbol_metadata"
+        self.raw_table_name = "raw"
+        self.meta_table_name = "symbol_metadata"
     
         # self.engine = create_engine(postgres_url) 
         
@@ -30,7 +30,7 @@ class PostgresTools:
             return pd.DataFrame(result, columns=['symbol', 'timestamp'])
         except Exception as e:
             logging.error(f"PostgresTools: Error fetching latest date by symbol: {e}")
-            return {}
+            return pd.DataFrame(columns=['symbol', 'timestamp'])
     
     def execute_sql(self, sql):
         """
@@ -233,7 +233,7 @@ class PostgresTools:
         try:
             conn = psycopg2.connect(self.postgres_url)
             cursor = conn.cursor()
-            cursor.execute(f"SELECT COUNT(symbol) FROM test_symbol_metadata")
+            cursor.execute(f"SELECT COUNT(symbol) FROM symbol_metadata")
             return cursor.fetchone()[0]
         except Exception as e:
             logging.error(f"PostgresTools: Error fetching symbol count: {e}")
@@ -580,4 +580,4 @@ class JDBCSparkTools:
 if __name__ == "__main__":
     postgres_url = "postgresql://yiukitcheung:409219@localhost:5432/condvest"
     postgres_tool = PostgresTools(postgres_url)
-    print(postgres_tool.fetch_latest_date("test_raw_ohlcv").keys())
+    print(postgres_tool.fetch_latest_date("raw").keys())

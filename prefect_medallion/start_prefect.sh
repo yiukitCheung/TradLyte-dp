@@ -2,8 +2,8 @@
 # Navigate to prefect_medallion directory
 cd "$(dirname "$0")"
 
-# Activate virtual environment from parent directory
-source ../.dp/bin/activate
+# Activate virtual environment
+source .local_dp/bin/activate
 
 # Load environment variables from parent directory
 set -a

@@ -1,7 +1,7 @@
 data_extract:    
   meta:
     topic_names: "meta"
-    table_name: "test_symbol_metadata"
+    table_name: "symbol_metadata"
     chunk_size: 100
     batch_size: 100
     max_workers: 3  # Reduced for Yahoo Finance rate limiting
@@ -28,12 +28,12 @@ process:
     - 55
   postgres_source: # NEW: PostgreSQL source configuration for DuckDB
     host: localhost
-    port: 5434
+    port: 5432
     dbname: condvest
     user_env_var: yiukitcheung # Environment variable for user
     password_env_var: "409219" # Environment variable for password
     schema: public
-    raw_ohlcv_table: test_raw_ohlcv # Source table for raw OHLCV data
+    raw_ohlcv_table: raw # Source table for raw OHLCV data
   strategies:
     vegas_channel:
       intervals:

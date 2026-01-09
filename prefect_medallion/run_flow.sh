@@ -5,7 +5,7 @@
 cd "$(dirname "$0")"
 
 # Activate virtual environment
-source ../.dp/bin/activate
+source .local_dp/bin/activate
 
 # Load environment variables
 set -a
@@ -18,15 +18,15 @@ FLOW=${1:-bronze}
 case $FLOW in
     bronze)
         echo "🔄 Running Bronze Pipeline (data extraction)..."
-        python flows/make_bronze_pipeline.py
+        python3 flows/make_bronze_pipeline.py
         ;;
     silver)
         echo "🔄 Running Silver Pipeline (data processing)..."
-        python flows/make_silver_pipeline.py
+        python3 flows/make_silver_pipeline.py
         ;;
     gold)
         echo "🔄 Running Gold Pipeline (analytics)..."
-        python flows/make_gold_pipeline.py
+        python3 flows/make_gold_pipeline.py
         ;;
     *)
         echo "❌ Unknown flow: $FLOW"

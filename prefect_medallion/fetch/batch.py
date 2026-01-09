@@ -31,6 +31,8 @@ logging.basicConfig(
 )
 
 POSTGRES_URL = os.getenv('POSTGRES_URL')
+if not POSTGRES_URL:
+    raise ValueError("POSTGRES_URL environment variable is not set. Please set it in your .env file.")
 POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')
 KAFKA_BROKER = os.getenv('KAFKA_BROKER')
 
@@ -41,7 +43,7 @@ class BatchDataExtractor:
         self.mode = settings['mode']
         self.current_date = pd.to_datetime("today").strftime('%Y-%m-%d')
         self.topic_names = "1d"
-        self.table_name = "test_raw_ohlcv"
+        self.table_name = "raw"
         
         # Initialize core components
         self.timescale_tool = postgres_client.PostgresTools(POSTGRES_URL)

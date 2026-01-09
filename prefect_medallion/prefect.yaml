@@ -80,7 +80,7 @@ deployments:
             - 5
             - 8
             - 13
-      mode: production
+      mode: catch_up
   work_pool:
     name: data-pipeline
     work_queue_name: bronze

@@ -24,7 +24,8 @@ venv.bak/
 # Prefect Medallion specific
 prefect_medallion/process/storage/silver/resampled.duckdb
 prefect_medallion/process/storage/gold/*.parquet
-.dp/
+.cloud_dp/
+.local_dp/
 
 # AWS Lambda Architecture specific
 aws_lambda_architecture/logs/

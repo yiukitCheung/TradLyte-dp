@@ -17,7 +17,7 @@ yfinance==0.2.55
 # Database Clients
 psycopg2-binary==2.9.10
 redis==5.0.1
-
+duckdb==1.3.0
 # Stream Processing
 kafka-python==2.1.4
 
@@ -52,20 +52,22 @@ moto==5.0.21  # AWS mocking for tests
 black==24.10.0
 ruff==0.8.4
 
-# Serverless Framework (optional)
-serverless==3.38.0
-
-# AWS CDK (optional)
-aws-cdk-lib==2.167.1
-constructs==10.4.2
+# AWS CDK (optional - install separately if needed)
+# aws-cdk-lib==2.167.1  # Install via: npm install -g aws-cdk
+# constructs==10.4.2     # Install via: npm install -g aws-cdk
 
 # Local Development
-docker-compose==1.29.2
 localstack==3.8.1
 
 # Financial Analysis
 ta==0.11.0
 
 # Async Programming
-asyncio==3.4.3
+# asyncio is part of Python standard library (no need to install)
 aiofiles==24.1.0
+
+# Note: serverless framework is a Node.js package, install via:
+# npm install -g serverless
+#
+# Note: docker-compose is a standalone tool, install via:
+# https://docs.docker.com/compose/install/
