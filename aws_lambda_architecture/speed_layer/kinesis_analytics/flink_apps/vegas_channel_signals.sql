@@ -26,7 +26,7 @@ CREATE TABLE ohlcv_15min_input (
 ) WITH (
     'connector' = 'kinesis',
     'stream' = 'market-data-15min',
-    'aws.region' = 'us-east-1',
+    'aws.region' = 'ca-west-1',
     'scan.stream.initpos' = 'LATEST',
     'format' = 'json'
 );
@@ -47,7 +47,7 @@ CREATE TABLE vegas_channel_signals (
 ) WITH (
     'connector' = 'kinesis',
     'stream' = 'trading-signals',
-    'aws.region' = 'us-east-1',
+    'aws.region' = 'ca-west-1',
     'format' = 'json'
 );
 
