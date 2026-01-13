@@ -2,12 +2,12 @@
 
 ## 🎯 Purpose
 
-This Speed Layer is responsible for **real-time data ingestion only**. It connects to Polygon.io WebSocket and streams 1-minute OHLCV data to Kinesis for downstream processing.
+This Speed Layer is responsible for **real-time data ingestion only**. It connects to Massive (formerly Polygon.io) WebSocket and streams 1-minute OHLCV data to Kinesis for downstream processing.
 
 ## 🏗️ Architecture
 
 ```
-Polygon WebSocket (AM.*) → ECS WebSocket Service → Kinesis Stream → Kinesis Analytics
+Massive WebSocket (AM.*) → ECS WebSocket Service → Kinesis Stream → Kinesis Analytics
                                                                   ↓
                                                             Multi-timeframe 
                                                             Aggregation
@@ -16,9 +16,9 @@ Polygon WebSocket (AM.*) → ECS WebSocket Service → Kinesis Stream → Kinesi
 
 ## 📦 Components
 
-### ECS WebSocket Service (`services/webosket_service.py`)
-- **Purpose**: Maintains persistent WebSocket connection to Polygon.io
-- **Input**: Polygon AM.* (1-minute aggregates)
+### ECS WebSocket Service (`fetching/webosket_service.py`)
+- **Purpose**: Maintains persistent WebSocket connection to Massive (formerly Polygon.io)
+- **Input**: Massive AM.* (1-minute aggregates, 15-minute delayed for testing)
 - **Output**: Raw 1-minute OHLCV data to Kinesis Stream
 - **Features**:
   - No 15-minute timeout (unlike Lambda)
@@ -48,12 +48,12 @@ curl http://localhost:8080/health
 
 ## 🔌 Data Flow
 
-1. **WebSocket Connection**: Connects to Polygon.io with AM.* subscriptions
-2. **Message Processing**: Parses 1-minute OHLCV data from Polygon format
+1. **WebSocket Connection**: Connects to Massive (formerly Polygon.io) with AM.* subscriptions using delayed feed
+2. **Message Processing**: Parses 1-minute OHLCV data from Massive format
 3. **Kinesis Publishing**: Sends raw data to Kinesis Stream with symbol as partition key
 4. **Downstream**: Kinesis Analytics consumes for multi-timeframe aggregation
 
-## 📊 Polygon Data Format
+## 📊 Massive Data Format
 
 ```json
 {

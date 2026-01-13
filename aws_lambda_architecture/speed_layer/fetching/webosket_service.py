@@ -2,10 +2,10 @@
 ECS Fargate WebSocket Service for Speed Layer
 
 This service runs 24/7 during market hours and provides:
-1. Persistent Polygon WebSocket connection (no 15-min timeout)
-2. Real-time tick data ingestion 
+1. Persistent Massive (formerly Polygon.io) WebSocket connection (no 15-min timeout)
+2. Real-time tick data ingestion (15-minute delayed data for testing)
 3. Feeds data to Kinesis for signal processing
-4. Uses official Polygon WebSocket client
+4. Uses official Massive WebSocket client
 
 Runs on ECS Fargate for continuous operation.
 """
@@ -20,9 +20,10 @@ import boto3
 from datetime import datetime
 from typing import List
 
-# Polygon WebSocket Client (official)
-from polygon import WebSocketClient
-from polygon.websocket.models import WebSocketMessage
+# Massive (formerly Polygon) WebSocket Client (official)
+from massive import WebSocketClient
+from massive.websocket.models import WebSocketMessage
+from massive.websocket.models.common import Feed
 
 # HTTP server for health checks
 from aiohttp import web
@@ -37,15 +38,24 @@ from shared.clients.polygon_client import PolygonClient
 # Removed OHLCVData import - using direct dict for performance
 
 # Configure logging
+log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, log_level, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Set specific loggers to INFO to reduce noise
+logging.getLogger('aiohttp').setLevel(logging.INFO)
+logging.getLogger('botocore').setLevel(logging.INFO)
+logging.getLogger('boto3').setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.INFO)
+logging.getLogger('websockets').setLevel(logging.INFO)
+
 class PolygonWebSocketService:
     def __init__(self):
-        # Get Polygon API key - support both Secrets Manager (production) and direct env var (local testing)
+        # Get Massive API key - support both Secrets Manager (production) and direct env var (local testing)
+        # Note: Environment variable name still uses POLYGON_* for backward compatibility
         polygon_secret_arn = os.environ.get('POLYGON_API_KEY_SECRET_ARN')
         if polygon_secret_arn:
             # Production: Use Secrets Manager
@@ -109,7 +119,7 @@ class PolygonWebSocketService:
         self.reconnect_delay = 5  # Start with 5 seconds, exponential backoff
         self.connection_start_time = None
         
-        logger.info("Polygon WebSocket Service initialized")
+        logger.info("Massive WebSocket Service initialized")
     
     async def check_market_status(self) -> bool:
         """
@@ -142,7 +152,7 @@ class PolygonWebSocketService:
     async def start(self):
         """Start the WebSocket service"""
         try:
-            logger.info("Starting Polygon WebSocket Service...")
+            logger.info("Starting Massive WebSocket Service...")
             
             # 1. Check market status (consistent with batch layer pattern)
             if not await self.check_market_status():
@@ -154,7 +164,7 @@ class PolygonWebSocketService:
             # 2. Load active symbols from RDS
             await self.load_active_symbols()
             
-            # 3. Initialize Polygon WebSocket client  
+            # 3. Initialize Massive WebSocket client  
             await self.initialize_websocket()
             
             # 4. Start market hours monitoring (to pause/resume based on market status)
@@ -225,38 +235,44 @@ class PolygonWebSocketService:
                     idle_time = (datetime.utcnow() - self.last_message_time).total_seconds()
                     
                     if idle_time > self.max_idle_time:
-                        logger.warning(f"Connection appears dead - no messages for {idle_time:.0f} seconds")
+                        logger.warning(f"⚠️ Connection appears dead - no messages for {idle_time:.0f} seconds")
                         logger.info("Triggering reconnection...")
                         
                         # Close current connection
                         try:
+                            logger.info("Closing WebSocket connection...")
                             await self.websocket_client.close()
+                            logger.info("WebSocket connection closed")
                         except Exception as close_error:
-                            logger.debug(f"Error closing WebSocket during health check: {close_error}")
+                            logger.warning(f"Error closing WebSocket during health check: {close_error}")
                         
                         self.running = False
                         self.websocket_client = None
                         
                         # Reinitialize and reconnect
                         try:
+                            logger.info("Reinitializing WebSocket...")
                             await self.initialize_websocket()
                             self.running = True
+                            logger.info("Starting new service loop...")
                             asyncio.create_task(self.run_service_loop())
-                            logger.info("Connection reestablished after health check")
+                            logger.info("✅ Connection reestablished after health check")
                         except Exception as e:
                             logger.error(f"Error reconnecting after health check: {str(e)}")
+                            logger.exception("Full traceback for reconnection error:")
                     elif idle_time > self.max_idle_time / 2:
                         # Warning threshold (half of max idle time)
-                        logger.debug(f"Connection idle for {idle_time:.0f} seconds (warning threshold)")
+                        logger.warning(f"⚠️ Connection idle for {idle_time:.0f} seconds (warning threshold: {self.max_idle_time / 2:.0f}s)")
                 else:
                     # No messages received yet, but connection exists
                     if self.connection_start_time:
                         connection_age = (datetime.utcnow() - self.connection_start_time).total_seconds()
                         if connection_age > 300:  # 5 minutes with no messages
-                            logger.warning(f"Connection established {connection_age:.0f} seconds ago but no messages received")
+                            logger.warning(f"⚠️ Connection established {connection_age:.0f} seconds ago but no messages received (count: {self.message_count})")
                 
             except Exception as e:
                 logger.error(f"Error in connection health monitor: {str(e)}")
+                logger.exception("Full traceback for health monitor error:")
                 await asyncio.sleep(30)  # Wait 30 seconds before retrying
     
     async def load_active_symbols(self):
@@ -287,23 +303,33 @@ class PolygonWebSocketService:
             self.active_symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
     
     async def initialize_websocket(self):
-        """Initialize Polygon WebSocket client with active symbols"""
+        """Initialize Massive WebSocket client with active symbols"""
         try:
             # Create subscription list for 1 minute tick (T.*)
             subscriptions = [f"AM.{symbol}" for symbol in self.active_symbols]
             
             logger.info(f"Initializing WebSocket with {len(subscriptions)} AM.* subscriptions")
+            logger.info(f"Sample subscriptions (first 5): {subscriptions[:5]}")
+            logger.info(f"Total active symbols: {len(self.active_symbols)}")
             
-            # Initialize Polygon WebSocket client
+            # Initialize Massive WebSocket client with delayed feed
+            # Using Feed.Delayed for 15-minute delayed data (required when API key doesn't have real-time access)
             self.websocket_client = WebSocketClient(
                 api_key=self.polygon_api_key,
-                subscriptions=subscriptions
+                subscriptions=subscriptions,
+                feed=Feed.Delayed  # Use delayed feed: delayed.massive.com (15-min delayed data)
             )
             
-            logger.info("Polygon WebSocket client initialized successfully")
+            logger.info("Using delayed feed (15-minute delayed data) - Feed.Delayed")
+            
+            logger.info("Massive WebSocket client initialized successfully")
+            logger.info(f"WebSocket client type: {type(self.websocket_client)}")
+            if hasattr(self.websocket_client, 'subscriptions'):
+                logger.info(f"Client subscriptions count: {len(self.websocket_client.subscriptions) if self.websocket_client.subscriptions else 0}")
             
         except Exception as e:
             logger.error(f"Error initializing WebSocket: {str(e)}")
+            logger.exception("Full traceback for WebSocket initialization:")
             raise
     
     async def run_service_loop(self):
@@ -320,7 +346,22 @@ class PolygonWebSocketService:
                 self.reconnect_attempts = 0  # Reset on successful connection
                 
                 logger.info("Starting WebSocket connection...")
-                await self.websocket_client.connect(self.handle_websocket_message)
+                logger.info(f"Connection start time: {self.connection_start_time}")
+                logger.info(f"API key present: {bool(self.polygon_api_key)}")
+                logger.info(f"API key length: {len(self.polygon_api_key) if self.polygon_api_key else 0}")
+                
+                logger.info("Connecting to Massive WebSocket...")
+                
+                # Try to connect - if we get "no real-time access" error, the SDK should handle it
+                # or we'll catch it and reconnect to delayed endpoint
+                try:
+                    await self.websocket_client.connect(self.handle_websocket_message)
+                except Exception as connect_error:
+                    error_str = str(connect_error).lower()
+                    if 'real-time' in error_str or 'delayed' in error_str:
+                        logger.warning("Received real-time access error - SDK should handle delayed endpoint automatically")
+                        logger.info("If connection fails, the SDK may need manual configuration for delayed endpoint")
+                    raise
                 
                 # If we get here, connection closed normally or error occurred
                 logger.warning("WebSocket connection closed, will attempt reconnection...")
@@ -328,6 +369,7 @@ class PolygonWebSocketService:
                 
             except Exception as e:
                 logger.error(f"Error in service loop: {str(e)}")
+                logger.exception("Full traceback for service loop error:")
                 self.running = False
                 
             # Exponential backoff reconnection
@@ -349,20 +391,29 @@ class PolygonWebSocketService:
                 await asyncio.sleep(60)
     
     async def handle_websocket_message(self, messages: List[WebSocketMessage]):
-        """Handle incoming WebSocket messages from Polygon"""
+        """Handle incoming WebSocket messages from Massive"""
         try:
-            for message in messages:
+            logger.debug(f"Received {len(messages)} message(s) from Massive")
+            
+            if not messages:
+                logger.warning("Received empty message list from Massive")
+                return
+            
+            for i, message in enumerate(messages):
                 await self.process_aggregate_message(message)
                 self.message_count += 1
                 self.last_message_time = datetime.utcnow()
                 self.reconnect_attempts = 0  # Reset on successful message
                 
-                # Log stats every 100 messages
-                if self.message_count % 100 == 0:
+                # Log first message and then every 100 messages
+                if self.message_count == 1:
+                    logger.info(f"✅ First message received! Total processed: {self.message_count}")
+                elif self.message_count % 100 == 0:
                     logger.info(f"Processed {self.message_count} messages")
                 
         except Exception as e:
             logger.error(f"Error handling WebSocket messages: {str(e)}")
+            logger.exception("Full traceback for message handling error:")
             # Don't raise - let run_service_loop handle reconnection
     
     async def process_aggregate_message(self, message: WebSocketMessage):
@@ -375,7 +426,7 @@ class PolygonWebSocketService:
         - No intermediate objects (create dict directly)
         - Minimal transformations for maximum throughput
         
-        Polygon AM.* format:
+        Massive AM.* format:
         {
             "ev": "AM",           # Event type (Aggregate Minute)
             "sym": "AAPL",        # Symbol
@@ -398,11 +449,12 @@ class PolygonWebSocketService:
             else:
                 data = message
             
-            # Extract symbol using Polygon AM.* field names
-            symbol = data.get('sym')  # Polygon uses 'sym' for symbol
+            # Extract symbol using Massive AM.* field names
+            symbol = data.get('sym')  # Massive uses 'sym' for symbol
             
             if not symbol:
                 logger.warning(f"No symbol found in message: {data}")
+                logger.warning(f"Message keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
                 return
             
             # FAST PATH: Create Kinesis record directly with minimal transformations
@@ -431,13 +483,16 @@ class PolygonWebSocketService:
                 partition_key=symbol
             )
             
-            # Log sample data for debugging (only every 100 messages to reduce overhead)
-            if self.message_count % 100 == 0:
-                logger.debug(f"Processed {symbol}: O=${kinesis_record['open_price']} H=${kinesis_record['high_price']} L=${kinesis_record['low_price']} C=${kinesis_record['close_price']} V={kinesis_record['volume']}")
+            # Log sample data (first message and then every 100 messages)
+            if self.message_count == 1:
+                logger.info(f"✅ First Kinesis record sent: {symbol} - O=${kinesis_record['open_price']:.2f} H=${kinesis_record['high_price']:.2f} L=${kinesis_record['low_price']:.2f} C=${kinesis_record['close_price']:.2f} V={kinesis_record['volume']}")
+            elif self.message_count % 100 == 0:
+                logger.debug(f"Processed {symbol}: O=${kinesis_record['open_price']:.2f} H=${kinesis_record['high_price']:.2f} L=${kinesis_record['low_price']:.2f} C=${kinesis_record['close_price']:.2f} V={kinesis_record['volume']}")
             
         except Exception as e:
             logger.error(f"Error processing aggregate message: {str(e)}")
             logger.error(f"Message data: {data}")
+            logger.exception("Full traceback for message processing error:")
     
     async def stop(self):
         """Stop the service gracefully"""
