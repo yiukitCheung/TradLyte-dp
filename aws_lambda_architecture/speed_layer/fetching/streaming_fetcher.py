@@ -118,6 +118,9 @@ class PolygonWebSocketService:
         self.max_reconnect_attempts = 10
         self.reconnect_delay = 5  # Start with 5 seconds, exponential backoff
         self.connection_start_time = None
+        # Subscription limits (optional cap for local testing)
+        self.max_symbols = int(os.environ.get('MAX_SYMBOLS', '0'))  # 0 = no cap
+        self.use_wildcard_subscription = os.environ.get('USE_WILDCARD_SUBSCRIPTION', 'false').lower() == 'true'
         
         logger.info("Massive WebSocket Service initialized")
     
@@ -305,8 +308,29 @@ class PolygonWebSocketService:
     async def initialize_websocket(self):
         """Initialize Massive WebSocket client with active symbols"""
         try:
+            # Use wildcard subscription (single message) if enabled
+            if self.use_wildcard_subscription:
+                subscriptions = ["AM.*"]
+                self.websocket_client = WebSocketClient(
+                    api_key=self.polygon_api_key,
+                    subscriptions=subscriptions,
+                    feed=Feed.Delayed  # Use delayed feed: delayed.massive.com (15-min delayed data)
+                )
+                
+                logger.info("Using wildcard subscription: AM.*")
+                logger.info("Using delayed feed (15-minute delayed data) - Feed.Delayed")
+                logger.info("Massive WebSocket client initialized successfully")
+                logger.info(f"WebSocket client type: {type(self.websocket_client)}")
+                logger.info("Client subscriptions count: 1 (wildcard)")
+                return
+            
             # Create subscription list for 1 minute tick (T.*)
-            subscriptions = [f"AM.{symbol}" for symbol in self.active_symbols]
+            symbols = self.active_symbols
+            if self.max_symbols > 0:
+                symbols = symbols[:self.max_symbols]
+                logger.info(f"Limiting symbols to MAX_SYMBOLS={self.max_symbols}")
+            
+            subscriptions = [f"AM.{symbol}" for symbol in symbols]
             
             logger.info(f"Initializing WebSocket with {len(subscriptions)} AM.* subscriptions")
             logger.info(f"Sample subscriptions (first 5): {subscriptions[:5]}")
@@ -324,8 +348,7 @@ class PolygonWebSocketService:
             
             logger.info("Massive WebSocket client initialized successfully")
             logger.info(f"WebSocket client type: {type(self.websocket_client)}")
-            if hasattr(self.websocket_client, 'subscriptions'):
-                logger.info(f"Client subscriptions count: {len(self.websocket_client.subscriptions) if self.websocket_client.subscriptions else 0}")
+            logger.info(f"Client subscriptions count: {len(subscriptions)}")
             
         except Exception as e:
             logger.error(f"Error initializing WebSocket: {str(e)}")
@@ -352,16 +375,7 @@ class PolygonWebSocketService:
                 
                 logger.info("Connecting to Massive WebSocket...")
                 
-                # Try to connect - if we get "no real-time access" error, the SDK should handle it
-                # or we'll catch it and reconnect to delayed endpoint
-                try:
-                    await self.websocket_client.connect(self.handle_websocket_message)
-                except Exception as connect_error:
-                    error_str = str(connect_error).lower()
-                    if 'real-time' in error_str or 'delayed' in error_str:
-                        logger.warning("Received real-time access error - SDK should handle delayed endpoint automatically")
-                        logger.info("If connection fails, the SDK may need manual configuration for delayed endpoint")
-                    raise
+                await self.websocket_client.connect(self.handle_websocket_message)
                 
                 # If we get here, connection closed normally or error occurred
                 logger.warning("WebSocket connection closed, will attempt reconnection...")
@@ -375,6 +389,7 @@ class PolygonWebSocketService:
             # Exponential backoff reconnection
             if self.reconnect_attempts < self.max_reconnect_attempts:
                 wait_time = min(self.reconnect_delay * (2 ** self.reconnect_attempts), 300)  # Max 5 minutes
+                
                 logger.info(f"Reconnecting in {wait_time} seconds (attempt {self.reconnect_attempts + 1}/{self.max_reconnect_attempts})...")
                 await asyncio.sleep(wait_time)
                 
@@ -416,6 +431,8 @@ class PolygonWebSocketService:
             logger.exception("Full traceback for message handling error:")
             # Don't raise - let run_service_loop handle reconnection
     
+    
+    
     async def process_aggregate_message(self, message: WebSocketMessage):
         """
         Process a single aggregate message (AM.* subscription)
@@ -449,31 +466,41 @@ class PolygonWebSocketService:
             else:
                 data = message
             
-            # Extract symbol using Massive AM.* field names
-            symbol = data.get('sym')  # Massive uses 'sym' for symbol
+            # Extract symbol - handle both formats:
+            # 1. Raw Polygon format: 'sym' (e.g., {'sym': 'AAPL', 'o': 150.85, ...})
+            # 2. Transformed format: 'symbol' (e.g., {'symbol': 'ACIW', 'open': 45.61, ...})
+            symbol = data.get('sym') or data.get('symbol')
             
             if not symbol:
                 logger.warning(f"No symbol found in message: {data}")
                 logger.warning(f"Message keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
                 return
             
+            # Handle both message formats:
+            # Raw Polygon format: 'o', 'h', 'l', 'c', 'v', 'e'
+            # Transformed format: 'open', 'high', 'low', 'close', 'volume', 'end_timestamp'
+            open_price = data.get('o') or data.get('open', 0)
+            high_price = data.get('h') or data.get('high', 0)
+            low_price = data.get('l') or data.get('low', 0)
+            close_price = data.get('c') or data.get('close', 0)
+            volume = data.get('v') or data.get('volume', 0)
+            end_timestamp_ms = data.get('e') or data.get('end_timestamp') or int(datetime.utcnow().timestamp() * 1000)
+            
             # FAST PATH: Create Kinesis record directly with minimal transformations
             # Keep timestamp as integer milliseconds (no datetime conversion)
             # Keep prices as floats (no Decimal conversion)
             # No intermediate OHLCVData object creation
-            end_timestamp_ms = data.get('e') or int(datetime.utcnow().timestamp() * 1000)
-            
             kinesis_record = {
                 'record_type': 'ohlcv',
                 'symbol': symbol,
-                'open_price': float(data.get('o', 0)),      # Direct float conversion
-                'high_price': float(data.get('h', 0)),      # Direct float conversion
-                'low_price': float(data.get('l', 0)),       # Direct float conversion
-                'close_price': float(data.get('c', 0)),     # Direct float conversion
-                'volume': int(data.get('v', 0)),            # Direct int conversion
-                'timestamp_str': str(end_timestamp_ms),      # Keep as string milliseconds
+                'open_price': float(open_price),
+                'high_price': float(high_price),
+                'low_price': float(low_price),
+                'close_price': float(close_price),
+                'volume': int(volume),
+                'timestamp_str': str(end_timestamp_ms),
                 'interval_type': '1m',                       # AM.* provides 1-minute aggregates
-                'source': 'polygon_websocket_am',
+                'source': 'massive_websocket_am',
                 'ingestion_time': int(datetime.utcnow().timestamp() * 1000)  # Milliseconds
             }
             

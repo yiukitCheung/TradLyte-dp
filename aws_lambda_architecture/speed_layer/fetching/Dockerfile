@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY shared/ ./shared/
 
 # Copy speed layer fetching service
-COPY speed_layer/fetching/webosket_service.py ./fetching/webosket_service.py
+COPY speed_layer/fetching/streaming_fetcher.py ./fetching/streaming_fetcher.py
 
 # Create directory for logs
 RUN mkdir -p /app/logs && chown -R speedlayer:speedlayer /app
@@ -45,5 +45,5 @@ EXPOSE 8080
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Run the WebSocket service
-CMD ["python", "fetching/webosket_service.py"]
+# Run the streaming fetcher service
+CMD ["python", "fetching/streaming_fetcher.py"]
