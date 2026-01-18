@@ -29,9 +29,9 @@ from massive.websocket.models.common import Feed
 from aiohttp import web
 from aiohttp.web_runner import GracefulExit
 
-# Import shared utilities
-# Add parent directory to path for shared modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../'))
+# Import speed_layer shared utilities (decoupled from main shared directory)
+# Add speed_layer directory to path for shared modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../'))
 from shared.clients.kinesis_client import KinesisClient
 from shared.clients.rds_timescale_client import RDSTimescaleClient
 from shared.clients.polygon_client import PolygonClient
@@ -41,8 +41,7 @@ from shared.clients.polygon_client import PolygonClient
 log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Set specific loggers to INFO to reduce noise
@@ -430,8 +429,6 @@ class PolygonWebSocketService:
             logger.error(f"Error handling WebSocket messages: {str(e)}")
             logger.exception("Full traceback for message handling error:")
             # Don't raise - let run_service_loop handle reconnection
-    
-    
     
     async def process_aggregate_message(self, message: WebSocketMessage):
         """

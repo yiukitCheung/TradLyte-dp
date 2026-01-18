@@ -33,14 +33,16 @@ build_and_deploy_lambda() {
     
     # Install dependencies (for Linux x86_64 - Lambda runtime)
     echo "📥 Installing dependencies for Linux x86_64..."
-    pip install -r "$FETCHING_DIR/requirements.txt" -t "$package_dir" \
+    # Use pip3 if available, otherwise fall back to pip
+    PIP_CMD=$(command -v pip3 || command -v pip || echo "pip3")
+    $PIP_CMD install -r "$FETCHING_DIR/requirements.txt" -t "$package_dir" \
         --platform manylinux2014_x86_64 \
         --only-binary=:all: \
         --python-version 3.11 \
         --implementation cp \
         --no-cache-dir \
         --quiet 2>/dev/null || \
-    pip install -r "$FETCHING_DIR/requirements.txt" -t "$package_dir" \
+    $PIP_CMD install -r "$FETCHING_DIR/requirements.txt" -t "$package_dir" \
         --no-cache-dir \
         --quiet
     

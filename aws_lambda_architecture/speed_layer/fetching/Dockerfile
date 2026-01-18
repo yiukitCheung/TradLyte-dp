@@ -22,11 +22,11 @@ COPY speed_layer/fetching/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy shared client modules
-COPY shared/ ./shared/
+# Copy speed_layer shared client modules (decoupled from main shared directory)
+COPY speed_layer/shared/ ./shared/
 
 # Copy speed layer fetching service
-COPY speed_layer/fetching/streaming_fetcher.py ./fetching/streaming_fetcher.py
+COPY speed_layer/fetching/data_stream_fetcher.py ./fetching/data_stream_fetcher.py
 
 # Create directory for logs
 RUN mkdir -p /app/logs && chown -R speedlayer:speedlayer /app
@@ -45,5 +45,5 @@ EXPOSE 8080
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Run the streaming fetcher service
-CMD ["python", "fetching/streaming_fetcher.py"]
+# Run the data stream fetcher service
+CMD ["python", "fetching/data_stream_fetcher.py"]

@@ -60,16 +60,12 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         
         # Get Polygon API key from Secrets Manager
         secrets_client = boto3.client('secretsmanager')
-        polygon_secret = secrets_client.get_secret_value(
-            SecretId=os.environ['POLYGON_API_KEY_SECRET_ARN']
-        )
+        polygon_secret = secrets_client.get_secret_value(SecretId=os.environ['POLYGON_API_KEY_SECRET_ARN'])
         polygon_api_key = json.loads(polygon_secret['SecretString'])['POLYGON_API_KEY']
         
         # Initialize clients
         polygon_client = PolygonClient(api_key=polygon_api_key)
-        rds_client = RDSPostgresClient(
-            secret_arn=os.environ['RDS_SECRET_ARN']
-        ) 
+        rds_client = RDSPostgresClient(secret_arn=os.environ['RDS_SECRET_ARN']) 
         
         # Market Status Check (can be skipped for testing)
         if not skip_market_check:
@@ -190,7 +186,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 logger.info(f"  Batch {i//batch_size + 1}: {len(batch_symbols)} symbols (async)")
                 
                 try:
-                    # Fetch OHLCV data for batch ASYNC (10x faster!)
+                    # Fetch OHLCV data for batch ASYNC 
                     ohlcv_data = asyncio.run(
                         polygon_client.fetch_batch_ohlcv_data_async(
                             batch_symbols, 

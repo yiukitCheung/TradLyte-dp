@@ -16,7 +16,7 @@ Massive WebSocket (AM.*) → ECS WebSocket Service → Kinesis Stream → Kinesi
 
 ## 📦 Components
 
-### ECS WebSocket Service (`fetching/webosket_service.py`)
+### ECS WebSocket Service (`fetching/data_stream_fetcher.py`)
 - **Purpose**: Maintains persistent WebSocket connection to Massive (formerly Polygon.io)
 - **Input**: Massive AM.* (1-minute aggregates, 15-minute delayed for testing)
 - **Output**: Raw 1-minute OHLCV data to Kinesis Stream
