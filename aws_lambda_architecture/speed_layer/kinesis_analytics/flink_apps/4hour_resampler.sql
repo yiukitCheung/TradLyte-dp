@@ -21,7 +21,7 @@ CREATE TABLE ohlcv_2hour_input (
 ) WITH (
     'connector' = 'kinesis',
     'stream' = 'market-data-2hour',
-    'aws.region' = 'us-east-1',
+    'aws.region' = 'ca-west-1',
     'scan.stream.initpos' = 'LATEST',
     'format' = 'json'
 );
@@ -43,7 +43,7 @@ CREATE TABLE ohlcv_4hour_stream (
 ) WITH (
     'connector' = 'kinesis',
     'stream' = 'market-data-4hour',
-    'aws.region' = 'us-east-1',
+    'aws.region' = 'ca-west-1',
     'format' = 'json'
 );
 

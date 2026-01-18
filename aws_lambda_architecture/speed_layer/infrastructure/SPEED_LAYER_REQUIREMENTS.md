@@ -503,7 +503,7 @@ def lambda_handler(event, context):
 
 - [Speed Layer README](../README.md) - Overall architecture
 - [Kinesis Analytics Flink SQL](../kinesis_analytics/flink_apps/) - Resampling queries
-- [WebSocket Service](../data_fetcher/webosket_service.py) - ECS service implementation
+- [WebSocket Service](../fetching/data_stream_fetcher.py) - ECS service implementation
 
 ---
 

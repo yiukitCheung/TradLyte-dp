@@ -1,0 +1,63 @@
+{
+  "family": "dev-speed-layer-websocket",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::471112909340:role/dev-speed-layer-websocket-execution-role",
+  "taskRoleArn": "arn:aws:iam::471112909340:role/dev-speed-layer-websocket-task-role",
+  "containerDefinitions": [
+    {
+      "name": "websocket-service",
+      "image": "471112909340.dkr.ecr.ca-west-1.amazonaws.com/dev-speed-layer-websocket:latest",
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/speed-layer-websocket",
+          "awslogs-region": "ca-west-1",
+          "awslogs-stream-prefix": "websocket"
+        }
+      },
+      "environment": [
+        {
+          "name": "AWS_REGION",
+          "value": "ca-west-1"
+        },
+        {
+          "name": "KINESIS_STREAM_NAME",
+          "value": "market-data-raw"
+        },
+        {
+          "name": "SKIP_MARKET_CHECK",
+          "value": "false"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "INFO"
+        },
+        {
+          "name": "USE_WILDCARD_SUBSCRIPTION",
+          "value": "true"
+        },
+        {
+          "name": "RDS_SECRET_ARN",
+          "value": "arn:aws:secretsmanager:ca-west-1:471112909340:secret:dev-batch-postgres-credentials-IWxGJx"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "POLYGON_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ca-west-1:471112909340:secret:prod/Condvest/PolygonAPI-iFAG4h:POLYGON_API_KEY::"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

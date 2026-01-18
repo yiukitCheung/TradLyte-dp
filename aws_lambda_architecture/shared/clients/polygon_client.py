@@ -7,7 +7,7 @@ import requests
 import logging
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional
-from polygon import RESTClient
+from massive import RESTClient
 from decimal import Decimal
 import boto3
 import re
