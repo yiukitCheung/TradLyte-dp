@@ -12,12 +12,11 @@ Your AWS Lambda Architecture data pipeline batch layer is complete and ready for
 | Layer | Completion | Status |
 |-------|------------|--------|
 | **Batch Layer** | 95% | ✅ Core Complete - Testing Phase |
-| **Speed Layer** | 0% | ⏳ Not Started (Designed) |
-| **Serving Layer** | 0% | ⏳ Not Started (Designed) |
+| **Serving Layer** | 0% | 📋 Designed - MVP Focus |
 
 **Current Focus:** Testing and deploying Lambda fetcher, scheduling automation  
 **Est. Time to Batch Complete:** Testing phase (1-2 days)  
-**Est. Time to Full MVP:** 2-3 weeks
+**Est. Time to Full MVP:** 2-3 weeks (Batch + Serving Layer)
 
 ---
 
@@ -111,7 +110,6 @@ Polygon API → Lambda Fetcher
               ├─→ S3 Bronze (all history)
               └─→ RDS (last 3 years, fast queries)
 ```
-
 **Code Changes:**
 - ✅ `write_to_s3_bronze()` - Symbol-partitioned parquet writes
 - ✅ `write_to_rds_with_retention()` - Filtered RDS inserts
@@ -184,35 +182,33 @@ RETENTION_YEARS = 5  # Keep last 5 years in RDS
 
 ---
 
-## ⚡ Phase 2: Speed Layer (0% - Designed Only)
+## 🌐 Phase 2: Serving Layer (0% - Designed, MVP Focus)
 
-### Architecture Designed ✅
-- Kinesis Data Streams for real-time ingestion
-- Kinesis Analytics (Flink SQL) for stream processing
-- DynamoDB for tick storage with TTL
-- Lambda for signal generation
-- SNS for alert notifications
+### MVP Architecture ✅
 
-### Status: Not Started
-**Reason:** Focusing on solid batch layer foundation first
+**Strategic Decision:** Removed Speed Layer for MVP - aligns with "Clarity Over Noise" mission. Real-time streaming encourages reactive behavior, which conflicts with product goals.
 
-**Estimated Implementation:** 1 week after batch layer complete
+**MVP Components:**
+1. **Quote Service** (Key Deliverable) - Latest price endpoint
+   - API Gateway REST endpoint: `GET /api/quote?symbol=AAPL`
+   - Lambda function with Redis cache (60s TTL)
+   - On-demand Polygon.io REST API calls (not WebSocket)
+   - Cost: ~$5/month vs $115/month for Speed Layer
 
----
+2. **Backtest API** - Historical data queries
+   - Query RDS (5-year cache) for recent data
+   - Query S3 Data Lake for full historical data
+   - Support for Fibonacci intervals (3d, 5d, 8d, 13d, 21d, 34d)
 
-## 🌐 Phase 3: Serving Layer (0% - Designed Only)
+3. **Alert Service** (Future) - Scheduled checks
+   - EventBridge scheduled Lambda (every 15 minutes)
+   - Check watchlist conditions
+   - SNS notifications (not real-time WebSocket)
 
-### Architecture Designed ✅
-- API Gateway for RESTful APIs
-- WebSocket API for real-time subscriptions
-- Lambda backend functions
-- Redis ElastiCache for caching
-- CloudFront CDN
+### Status: Design Complete, Ready for Implementation
+**Reason:** MVP focuses on "Latest Price" + "Backtesting" - no real-time streaming needed
 
-### Status: Not Started
-**Reason:** Requires speed layer to be functional
-
-**Estimated Implementation:** 1 week after speed layer complete
+**Estimated Implementation:** 1-2 weeks after batch layer complete
 
 ---
 
@@ -245,22 +241,12 @@ RETENTION_YEARS = 5  # Keep last 5 years in RDS
 - [ ] CloudWatch alarms setup
 - [ ] **Batch Layer Complete! ✅**
 
-### ⏳ Week 3-4: Speed Layer Implementation
-- [ ] Deploy Kinesis Data Streams
-- [ ] Deploy Kinesis Analytics (Flink SQL)
-- [ ] Deploy DynamoDB tables
-- [ ] Deploy Redis ElastiCache
-- [ ] Deploy ECS WebSocket service
-- [ ] Deploy signal_generator Lambda
-- [ ] Create SNS topics
-- [ ] Test real-time flow
-
-### ⏳ Week 5-6: Serving Layer Implementation
+### ⏳ Week 3-4: Serving Layer Implementation (MVP)
 - [ ] Deploy API Gateway REST API
-- [ ] Deploy API Gateway WebSocket API
-- [ ] Deploy Lambda backend functions
+- [ ] Deploy Quote Service Lambda (latest price)
+- [ ] Deploy Backtest API Lambda (historical data)
+- [ ] Set up Redis ElastiCache for caching
 - [ ] Configure authentication
-- [ ] Set up CloudFront CDN
 - [ ] Integration testing
 - [ ] Load testing
 - [ ] **MVP Launch! 🎉**
@@ -400,7 +386,7 @@ processing/migration_log.txt                             ← Export progress
 7. **Set up EventBridge schedules**
 8. **End-to-end testing**
 9. **CloudWatch alarms**
-10. **Move to Speed Layer!**
+10. **Move to Serving Layer (MVP)!**
 
 ---
 
@@ -415,7 +401,11 @@ processing/migration_log.txt                             ← Export progress
 | CloudWatch Logs | $3 | Log retention |
 | **Current Total** | **$40** | Batch layer only |
 
-**After Speed + Serving layers:** ~$305/month (estimated)
+**After Serving Layer (MVP):** ~$50/month (estimated)
+- Quote Service: ~$5/month (Lambda + Redis)
+- Backtest API: ~$3/month (Lambda)
+- API Gateway: ~$2/month
+- Total MVP: ~$50/month (vs $305/month with Speed Layer)
 
 ---
 
