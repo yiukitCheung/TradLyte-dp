@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Processed OHLCV Data Schema",
+  "description": "Schema for processed multi-timeframe OHLCV data from Kinesis Analytics",
+  "type": "object",
+  "required": [
+    "symbol",
+    "open_price",
+    "high_price",
+    "low_price", 
+    "close_price",
+    "volume",
+    "window_start",
+    "window_end",
+    "interval_type"
+  ],
+  "properties": {
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z]{1,10}$",
+      "description": "Stock symbol"
+    },
+    "open_price": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Opening price for the time window"
+    },
+    "high_price": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Highest price during the time window"
+    },
+    "low_price": {
+      "type": "number", 
+      "minimum": 0,
+      "description": "Lowest price during the time window"
+    },
+    "close_price": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Closing price for the time window"
+    },
+    "volume": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total trading volume during the window"
+    },
+    "trade_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of individual trades aggregated"
+    },
+    "vwap": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Volume Weighted Average Price for the window"
+    },
+    "window_start": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Start timestamp of the aggregation window"
+    },
+    "window_end": {
+      "type": "string",
+      "format": "date-time", 
+      "description": "End timestamp of the aggregation window"
+    },
+    "interval_type": {
+      "type": "string",
+      "enum": ["1m", "5m", "15m", "30m", "1h", "2h", "4h"],
+      "description": "Time interval of this OHLCV candle"
+    },
+    "processing_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this data was processed by Kinesis Analytics"
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "symbol": "AAPL",
+      "open_price": 150.25,
+      "high_price": 152.80,
+      "low_price": 149.90,
+      "close_price": 151.75,
+      "volume": 6234500,
+      "trade_count": 1247,
+      "vwap": 151.23,
+      "window_start": "2024-01-15T15:00:00.000Z",
+      "window_end": "2024-01-15T15:05:00.000Z",
+      "interval_type": "5m",
+      "processing_time": "2024-01-15T15:05:01.123Z"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# AWS Lambda function requirements for Signal Generator
+# Python 3.11
+
+# AWS SDK (included in Lambda runtime, but specified for local dev)
+boto3>=1.28.0
+
+# No additional dependencies needed - using only AWS SDK and stdlib
+

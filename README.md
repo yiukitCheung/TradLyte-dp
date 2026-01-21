@@ -1,211 +1,117 @@
-# Tradlyte Web App - Backend Data Pipeline
+# TradLyte - Backend Data Pipeline
 
-## Project Overview
+## Purpose
 
-This is the **backend data pipeline component** for the **Tradlyte Web App**, a comprehensive trading analytics platform. The pipeline is responsible for ingesting, processing, and serving financial market data to power three core features:
+This repository contains the **backend data pipeline** for TradLyte, a trading analytics platform focused on "Clarity Over Noise" and "Purpose Over Profit". The pipeline ingests, processes, and serves financial market data to power:
 
-1. **📊 Backtesting Engine** - Historical data storage and retrieval for strategy validation
-2. **🤖 Machine Learning Models** - Clean, structured datasets for predictive analytics and pattern recognition
-3. **⚡ Real-time Alerts** - Timely price notifications and technical indicator signals
+1. **📊 Backtesting Engine** - Historical data for strategy validation
+2. **📈 Latest Price Service** - On-demand quote service for dashboard
+3. **🤖 Analytics Engine** - Strategy scanning and signal generation
 
-## Architecture
+## Solution Architecture
 
-This repository implements **two complementary architectures** designed for different stages of the platform's evolution:
+### Production Stack (`aws_lambda_architecture/`)
 
-### 1. AWS Lambda Architecture (`aws_lambda_architecture/`) - **Production Focus**
+**Two-Layer MVP Architecture:**
 
-Cloud-native, serverless implementation designed for scalability and real-time processing:
+```
+Polygon.io API (Daily + On-demand)
+         │
+         ├── Batch Layer ──► S3 Data Lake + RDS (5yr cache)
+         │   └── Analytics Core ──► Strategy Scanning
+         │
+         └── Serving Layer ──► API Gateway ──► Frontend
+             ├── Quote Service (Latest Price)
+             ├── Backtest API (Historical Data)
+             └── Alert Service (Scheduled Checks)
+```
 
-**Three-Layer Design:**
-- **Batch Layer**: Historical OHLCV data processing via AWS Lambda + Batch
-  - Daily data ingestion from Polygon.io
-  - Fibonacci interval resampling (3d, 5d, 8d, 13d, 21d, 34d)
-  - S3 Data Lake (Parquet) + RDS PostgreSQL cache (5-year retention)
-  
-- **Speed Layer**: Real-time stream processing (Planned)
-  - Kinesis Data Streams for live market data
-  - Flink SQL for windowed aggregations
-  - DynamoDB for tick-level storage with TTL
-  
-- **Serving Layer**: Fast data access for frontend (Planned)
-  - API Gateway REST + WebSocket APIs
-  - Redis ElastiCache for sub-millisecond queries
-  - CloudFront CDN for global distribution
+**Components:**
+- **Batch Layer**: Daily OHLCV ingestion, Fibonacci resampling (3d-34d), S3 + RDS storage
+- **Analytics Core**: Reusable strategy framework (3-step: Setup → Trigger → Exit)
+- **Serving Layer**: REST APIs for quotes, backtesting, and alerts
 
-**Key Features:**
-- Auto-scaling serverless infrastructure
-- 5-year fast-access cache in RDS + full archive in S3
-- Symbol-partitioned data lake for efficient backtesting queries
-- Checkpointed batch processing for fault tolerance
-- EventBridge scheduling for daily updates
+**Cost:** ~$63/month (MVP)
 
-### 2. Prefect Medallion Architecture (`prefect_medallion/`) - **Development/Testing**
+### Development Stack (`prefect_medallion/`)
 
-Traditional Bronze-Silver-Gold pipeline for local development and prototyping:
-
-- **Bronze Layer**: Raw data ingestion to TimescaleDB
-- **Silver Layer**: DuckDB-powered resampling and transformations
-- **Gold Layer**: Technical indicators and trading signals
-- **Orchestration**: Prefect workflows for dependency management
-- **Storage**: Local PostgreSQL + DuckDB + Redis
-
-**Purpose:**
-- Rapid prototyping of data transformations
-- Local testing without AWS costs
-- Algorithm development and validation
-- Data quality assurance
+Local development environment for rapid prototyping:
+- Bronze-Silver-Gold pipeline
+- Prefect orchestration
+- Local PostgreSQL + DuckDB + Redis
 
 ## Technology Stack
 
-### AWS Lambda Architecture (Production)
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| **Data Lake** | S3 + Parquet | Source of truth for all historical data |
-| **Fast Cache** | RDS PostgreSQL | Last 5 years for frontend queries |
-| **Processing** | AWS Lambda + Batch | Serverless compute for data ingestion/resampling |
-| **Streaming** | Kinesis + Flink | Real-time market data processing |
-| **API Layer** | API Gateway + Lambda | RESTful and WebSocket endpoints |
-| **Caching** | ElastiCache Redis | Sub-millisecond response times |
-| **Orchestration** | EventBridge + Step Functions | Scheduling and workflow coordination |
+**Production (AWS):**
+- **Storage**: S3 (Parquet) + RDS PostgreSQL (5yr cache)
+- **Compute**: AWS Lambda + Batch (serverless)
+- **APIs**: API Gateway (REST)
+- **Caching**: ElastiCache Redis
+- **Orchestration**: Step Functions + EventBridge
+- **Analytics**: Polars (high-performance), Pydantic (validation)
 
-### Prefect Medallion (Development)
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| **Database** | TimescaleDB | Time-series optimized storage |
-| **Analytics** | DuckDB | In-memory analytical processing |
-| **Cache** | Redis | Fast lookups and session data |
-| **Orchestration** | Prefect | Workflow DAGs and dependency management |
-| **Deployment** | Docker Compose | Local containerized environment |
+**Development (Local):**
+- **Database**: PostgreSQL/TimescaleDB
+- **Analytics**: DuckDB
+- **Orchestration**: Prefect
+- **Deployment**: Docker Compose
 
-## Data Pipeline Features
+## Key Features
 
-### Backtesting Support
-- **Historical Coverage**: 63+ years of market data (1962-present)
-- **Multiple Timeframes**: 1-minute, daily, and Fibonacci intervals (3d-34d)
-- **Symbol-Partitioned**: Efficient queries for individual ticker analysis
-- **Parquet Format**: Columnar storage for fast analytical queries
-- **5-Year Cache**: Recent data in RDS for sub-second frontend responses
-
-### Machine Learning Ready
-- **Clean Schema**: Standardized OHLCV format with timestamps
-- **Gap Detection**: Automated missing data identification
-- **Incremental Updates**: Daily batch processing with deduplication
-- **Feature Engineering**: Pre-computed resampled intervals
-- **Audit Trail**: Job metadata tracking for data lineage
-
-### Real-Time Alerts (In Development)
-- **Stream Processing**: Kinesis for live tick data ingestion
-- **Windowed Aggregations**: Flink SQL for indicator calculations
-- **SNS Notifications**: Push alerts for price thresholds and signals
-- **WebSocket API**: Real-time subscriptions for frontend updates
-- **Rate Limiting**: Controlled notification delivery
+- **Historical Data**: 63+ years of market data (1962-present)
+- **Fibonacci Resampling**: 3d, 5d, 8d, 13d, 21d, 34d intervals
+- **Analytics Engine**: Reusable strategy framework with 3-step logic
+- **On-Demand Quotes**: Latest price service (REST API, 60s cache)
+- **Backtesting API**: Historical data queries from RDS/S3
+- **Daily Automation**: Step Functions pipeline (fully automated)
 
 ## Project Status
 
-**Current Phase:** Batch Layer Implementation (95% Complete)
+| Component | Status |
+|-----------|--------|
+| **Batch Layer** | ✅ 95% Complete |
+| **Analytics Core** | ✅ Implemented |
+| **Serving Layer** | 📋 Designed (MVP) |
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| **Batch Layer** | ✅ 95% | Ready for testing |
-| **Speed Layer** | 📋 Designed | Implementation pending |
-| **Serving Layer** | 📋 Designed | Implementation pending |
+**Current Focus:** Batch Layer testing → Serving Layer implementation
 
-**Recent Milestones:**
-- ✅ Fibonacci resampler processed 10.8M records across 6 intervals
-- ✅ RDS→S3 migration completed (22.6M records, 5,350 symbols)
-- ✅ 5-year retention policy implemented in RDS
-- ✅ Lambda fetcher redesigned for dual S3+RDS writes
-- ✅ Symbol-partitioned bronze layer established
+## Related Projects
 
-**Next Steps:**
-- Test Lambda fetcher deployment
-- Set up EventBridge daily schedules
-- Implement Speed Layer (Kinesis + Flink)
-- Build Serving Layer APIs
-
-## Integration with Tradlyte Web App
-
-This data pipeline serves as the **foundational backend** for Tradlyte's trading analytics platform:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Tradlyte Web App                     │
-│  (React Frontend + Node.js Backend + Auth + UI/UX)    │
-└───────────────────┬─────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────┐
-│              Data Pipeline (This Repo)                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │ Batch Layer  │  │ Speed Layer  │  │Serving Layer │ │
-│  │ (Historical) │  │ (Real-time)  │  │   (APIs)     │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘ │
-└─────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-         ┌──────────────────────┐
-         │   External Sources    │
-         │  - Polygon.io API     │
-         │  - Market Data Feeds  │
-         └──────────────────────┘
-```
-
-**Data Flow:**
-1. **Ingestion**: Daily/real-time data from Polygon.io → Pipeline
-2. **Processing**: Resampling, indicators, signals → S3 + RDS + DynamoDB
-3. **Serving**: API Gateway → Redis cache → Frontend
-4. **Backtesting**: Frontend queries → RDS (5yr) or S3 (full history)
-5. **ML Models**: Training data → S3 Data Lake → Model endpoints
-6. **Alerts**: Signal detection → SNS → WebSocket → User notifications
+- **[TradLyte Frontend](https://github.com/yiukitCheung/TradLyte-frontend.git)** - React frontend application
 
 ## Documentation
 
-- [AWS Lambda Architecture Guide](aws_lambda_architecture/README.md)
-- [Implementation Status & Roadmap](aws_lambda_architecture/IMPLEMENTATION_STATUS.md)
-- [Prefect Medallion Guide](prefect_medallion/README.md)
-- [Deployment Procedures](docs/deployment.md)
-- [API Specifications](docs/api.md)
-- [Data Architecture Diagram](docs/data_architecture.mmd)
+- [AWS Lambda Architecture](aws_lambda_architecture/README.md) - Production architecture overview
+- [Implementation Status](aws_lambda_architecture/IMPLEMENTATION_STATUS.md) - Current progress and roadmap
+- [Serving Layer Design](aws_lambda_architecture/serving_layer/README.md) - MVP API design
+- [Analytics Core](aws_lambda_architecture/shared/analytics_core/README.md) - Strategy framework documentation
 
 ## Repository Structure
 
 ```
-data_pipeline/
-├── aws_lambda_architecture/     # Production cloud-native implementation
-│   ├── batch_layer/             # Daily OHLCV processing
-│   │   ├── fetching/            # Lambda functions for data ingestion
-│   │   ├── processing/          # AWS Batch resampling jobs
-│   │   ├── database/            # RDS schemas and retention policies
-│   │   └── infrastructure/      # Terraform + deployment scripts
-│   ├── speed_layer/             # Real-time stream processing (planned)
-│   ├── serving_layer/           # API Gateway + caching (planned)
-│   └── shared/                  # Common utilities and models
-├── prefect_medallion/           # Local development implementation
-│   ├── fetch/                   # Data ingestion from APIs
-│   ├── ingest/                  # Database loading
-│   ├── process/                 # Transformations and indicators
-│   ├── flows/                   # Prefect workflow definitions
-│   └── tools/                   # Client libraries (Polygon, Postgres, Redis)
-├── docs/                        # Architecture and API documentation
-└── polygon_data/                # Local data cache for testing
+TradLyte-dp/
+├── aws_lambda_architecture/          # Production AWS implementation
+│   ├── batch_layer/                  # Daily data processing
+│   │   ├── fetching/                 # Lambda: OHLCV + Meta fetchers
+│   │   ├── processing/                # AWS Batch: Consolidator + Resampler
+│   │   ├── database/                 # RDS schemas + migrations
+│   │   └── infrastructure/           # Deployment scripts + Step Functions
+│   ├── serving_layer/                # API Layer (MVP)
+│   │   └── lambda_functions/         # Quote Service, Backtest API
+│   └── shared/                       # Shared utilities
+│       └── analytics_core/          # Analytics Engine (strategy framework)
+│           ├── indicators/           # Technical indicators (Polars)
+│           ├── strategies/            # Strategy framework + library
+│           └── models.py             # Pydantic models
+├── prefect_medallion/                # Local development environment
+│   ├── fetch/                        # Data ingestion
+│   ├── process/                      # Transformations
+│   └── flows/                        # Prefect workflows
+└── docs/                             # Architecture diagrams
 ```
-
-## Development Philosophy
-
-This project prioritizes:
-
-1. **Scalability First**: Cloud-native design for millions of data points
-2. **Cost Efficiency**: Serverless pay-per-use model + intelligent caching
-3. **Data Quality**: Deduplication, gap detection, and audit trails
-4. **Fault Tolerance**: Checkpointing, retries, and graceful degradation
-5. **Developer Experience**: Local testing environment mirrors production
-
-## License & Usage
-
-This is a **private project** developed specifically for the Tradlyte Web App. It is not intended for public distribution or third-party usage.
 
 ---
 
-**Maintained by:** Tradlyte Development Team  
-**Last Updated:** October 2025  
-**Current Focus:** AWS Lambda Architecture Batch Layer Testing
+**Private Commercial Project**  
+**Maintained by:** TradLyte Development Team  
+**Last Updated:** January 2026
