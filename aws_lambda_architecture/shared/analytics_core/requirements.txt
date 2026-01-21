@@ -1,0 +1,14 @@
+# Analytics Core Dependencies
+
+# High-performance data processing
+polars>=0.19.0
+
+# JSON validation and models
+pydantic>=2.0.0
+
+# AWS services
+boto3>=1.28.0
+
+# PostgreSQL connection
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0

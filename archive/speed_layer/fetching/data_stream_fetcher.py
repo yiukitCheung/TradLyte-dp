@@ -157,7 +157,8 @@ class PolygonWebSocketService:
             logger.info("Starting Massive WebSocket Service...")
             
             # 1. Check market status (consistent with batch layer pattern)
-            if not await self.check_market_status():
+            # Skip market check if SKIP_MARKET_CHECK=true (for testing)
+            if not self.skip_market_check and not await self.check_market_status():
                 logger.info("Market is closed - service will wait for market to open")
                 # Start a background task to periodically check market status
                 asyncio.create_task(self.market_hours_monitor())
@@ -544,11 +545,22 @@ class HealthCheckServer:
     
     async def health_check(self, request):
         """ECS health check endpoint"""
-        if self.websocket_service.running:
+        # Service is considered healthy if:
+        # 1. WebSocket is connected and running, OR
+        # 2. Service is initialized (even if market is closed - that's expected behavior)
+        if self.websocket_service.running and self.websocket_service.websocket_client:
             return web.json_response({
                 'status': 'healthy',
                 'message_count': self.websocket_service.message_count,
                 'last_message': self.websocket_service.last_message_time.isoformat() if self.websocket_service.last_message_time else None
+            })
+        elif self.websocket_service.polygon_client:  # Service is initialized, market might be closed
+            # Check market status to provide context
+            is_market_open = await self.websocket_service.check_market_status()
+            return web.json_response({
+                'status': 'healthy',
+                'message': 'Market is closed, waiting for open' if not is_market_open else 'Service initialized, connecting...',
+                'market_open': is_market_open
             })
         else:
             return web.json_response({'status': 'unhealthy'}, status=503)

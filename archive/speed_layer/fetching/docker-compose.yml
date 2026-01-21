@@ -1,0 +1,117 @@
+# Speed Layer Local Development Environment
+# This file is gitignored - contains sensitive credentials
+# Copy from docker-compose.yml.example and fill in your credentials
+
+services:
+  # PostgreSQL/TimescaleDB for Aurora simulation
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: speedlayer-timescaledb
+    environment:
+      POSTGRES_DB: condvest_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      # Schema initialization: For local testing, database will be empty
+      # You can manually run schema scripts if needed, or connect to existing RDS
+    networks:
+      - speedlayer-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # LocalStack for AWS service simulation
+  localstack:
+    image: localstack/localstack:latest
+    container_name: speedlayer-localstack
+    environment:
+      SERVICES: kinesis,cloudwatch
+      DEBUG: 1
+      DATA_DIR: /var/lib/localstack/data
+      DOCKER_HOST: unix:///var/run/docker.sock
+      PERSISTENCE: 1
+    ports:
+      - "4566:4566"
+      - "4571:4571"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - speedlayer-network
+
+  # Speed Layer WebSocket Service
+  websocket-service:
+    build:
+      context: ../..  # aws_lambda_architecture/
+      dockerfile: speed_layer/fetching/Dockerfile         
+    container_name: speedlayer-websocket
+    environment:
+      # AWS Region
+      AWS_REGION: ca-west-1
+      
+      # Kinesis Stream (LocalStack)
+      KINESIS_STREAM_NAME: market-data-raw
+      
+      # For local testing: Use direct credentials instead of Secrets Manager
+      # In production, these would be set via Secrets Manager ARNs
+      POLYGON_API_KEY: KnTeDGFNrePQsOG1OssqzLfcYCPZd1PN
+      
+      # Local testing: Direct PostgreSQL connection (bypass Secrets Manager)
+      # In production, use RDS_SECRET_ARN instead
+      # Use host.docker.internal to connect to localhost PostgreSQL from container
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: yiukitcheung
+      POSTGRES_PASSWORD: 409219
+      POSTGRES_DB: condvest
+      
+      # Market hours check (set to true for local testing to skip market check)
+      SKIP_MARKET_CHECK: ${SKIP_MARKET_CHECK:-true}
+      
+      # AWS LocalStack endpoints (for local Kinesis testing)
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # WebSocket policy/rate limits (tune for your Massive plan)
+      # Set USE_WILDCARD_SUBSCRIPTION=true to subscribe to all tickers via AM.*
+      USE_WILDCARD_SUBSCRIPTION: ${USE_WILDCARD_SUBSCRIPTION:-false}
+      MAX_SYMBOLS: ${MAX_SYMBOLS:-0}
+      MAX_SYMBOLS_PER_CONNECTION: ${MAX_SYMBOLS_PER_CONNECTION:-500}
+      MAX_CONNECTIONS: ${MAX_CONNECTIONS:-10}
+      CONNECTION_STAGGER_SECONDS: ${CONNECTION_STAGGER_SECONDS:-1}
+      RATE_LIMIT_BACKOFF_SECONDS: ${RATE_LIMIT_BACKOFF_SECONDS:-60}
+      
+    ports:
+      - "8888:8080"  # Health check endpoint (mapped to 8888 to avoid conflicts)
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      # Note: LocalStack may have issues, but WebSocket service can run without it for basic testing
+    networks:
+      - speedlayer-network
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  timescale_data:
+  localstack_data:
+
+networks:
+  speedlayer-network:
+    driver: bridge
