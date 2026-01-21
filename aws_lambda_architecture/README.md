@@ -2,47 +2,66 @@
 
 ## Overview
 
-This directory contains the AWS-native implementation of the Condvest data pipeline using **Lambda Architecture** pattern for real-time financial data processing.
+This directory contains the AWS-native implementation of the TradLyte data pipeline using **Lambda Architecture** pattern for financial data processing.
+
+**MVP Strategy:** Two-layer architecture (Batch + Serving) focused on "Clarity Over Noise" mission. Speed Layer removed to avoid encouraging reactive trading behavior.
 
 ## 🏗️ Architecture Diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│                           CONDVEST DATA PIPELINE                                  │
+│                           TRADLYTE DATA PIPELINE (MVP)                            │
 ├──────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                  │
 │   ┌─────────────────────────────────────────────────────────────────────────┐   │
 │   │                         DATA SOURCES                                     │   │
 │   │  ┌──────────────┐                         ┌──────────────┐              │   │
-│   │  │ Polygon REST │  Daily OHLCV            │ Polygon WS   │  Real-time   │   │
+│   │  │ Polygon REST │  Daily OHLCV            │ Polygon REST │  Latest Price│   │
+│   │  │  (Batch)     │                         │  (On-demand) │              │   │
 │   │  └──────┬───────┘                         └──────┬───────┘              │   │
 │   └─────────┼────────────────────────────────────────┼──────────────────────┘   │
 │             │                                        │                          │
-│   ┌─────────▼────────────────────────┐   ┌──────────▼────────────────────┐     │
-│   │     BATCH LAYER (✅ 100%)         │   │     SPEED LAYER (⚠️ 50%)      │     │
-│   │                                  │   │                               │     │
-│   │  ┌────────────────────────────┐  │   │  ECS Fargate → Kinesis        │     │
-│   │  │   Step Functions Pipeline  │  │   │         ↓                     │     │
-│   │  │  ┌────────┐ ┌────────┐    │  │   │  Kinesis Analytics (Flink)    │     │
-│   │  │  │Fetchers│→│Consol. │    │  │   │         ↓                     │     │
-│   │  │  │(Lambda)│ │(Batch) │    │  │   │  DynamoDB (tick storage)      │     │
-│   │  │  └────────┘ └───┬────┘    │  │   │                               │     │
-│   │  │       ┌─────────▼──────┐  │  │   │                               │     │
-│   │  │       │Resamplers (6x) │  │  │   │                               │     │
-│   │  │       │  (Parallel)    │  │  │   │                               │     │
-│   │  │       └────────────────┘  │  │   │                               │     │
-│   │  └────────────────────────────┘  │   │                               │     │
-│   └──────────────────────────────────┘   └───────────────────────────────┘     │
+│   ┌─────────▼─────────────────────────────────────────────────────────────┐   │
+│   │                    BATCH LAYER (✅ 95% Complete)                        │   │
+│   │                                                                         │   │
+│   │  ┌──────────────────────────────────────────────────────────────────┐  │   │
+│   │  │              Step Functions Pipeline                              │  │   │
+│   │  │  ┌────────┐ ┌────────┐                                           │  │   │
+│   │  │  │Fetchers│→│Consol. │                                           │  │   │
+│   │  │  │(Lambda)│ │(Batch) │                                           │  │   │
+│   │  │  └────────┘ └───┬────┘                                           │  │   │
+│   │  │       ┌─────────▼──────┐                                          │  │   │
+│   │  │       │Resamplers (6x) │  → S3 Silver (Fibonacci intervals)       │  │   │
+│   │  │       │  (Parallel)    │                                          │  │   │
+│   │  │       └────────────────┘                                          │  │   │
+│   │  └──────────────────────────────────────────────────────────────────┘  │   │
+│   │                                                                         │   │
+│   │  ┌──────────────────────────────────────────────────────────────────┐  │   │
+│   │  │              Analytics Core (Shared)                              │  │   │
+│   │  │  - Technical Indicators (RSI, SMA, MACD, etc.)                   │  │   │
+│   │  │  - Strategy Framework (3-step: Setup → Trigger → Exit)           │  │   │
+│   │  │  - Pre-built Strategies (Golden Cross, RSI, etc.)                │  │   │
+│   │  │  - Composite Strategy Builder (from JSON config)                  │  │   │
+│   │  └──────────────────────────────────────────────────────────────────┘  │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
 │                        │                              │                         │
 │                        └──────────────┬───────────────┘                         │
 │                                       │                                         │
 │   ┌───────────────────────────────────▼──────────────────────────────────────┐  │
-│   │                       SERVING LAYER (⚠️ 30%)                              │  │
+│   │                    SERVING LAYER (📋 MVP Design)                          │  │
 │   │                                                                          │  │
-│   │     ┌─────────┐     ┌─────────────┐     ┌──────────────┐                │  │
-│   │     │  Redis  │ ←── │ API Gateway │ ←── │  CloudFront  │ ←── Users     │  │
-│   │     │ (cache) │     │  (REST/WS)  │     │    (CDN)     │                │  │
-│   │     └─────────┘     └─────────────┘     └──────────────┘                │  │
+│   │     ┌─────────┐     ┌─────────────┐                                      │  │
+│   │     │  Redis  │ ←── │ API Gateway │ ←── Frontend                        │  │
+│   │     │ (cache) │     │  (REST)     │                                      │  │
+│   │     └─────────┘     └──────┬──────┘                                      │  │
+│   │                            │                                             │  │
+│   │              ┌──────────────┼──────────────┐                            │  │
+│   │              ▼              ▼              ▼                            │  │
+│   │      ┌──────────┐  ┌──────────┐  ┌──────────┐                          │  │
+│   │      │  Quote   │  │ Backtest │  │  Alert   │                          │  │
+│   │      │ Service  │  │   API    │  │ Service  │                          │  │
+│   │      │(Latest)  │  │(Historical)│ │(Scheduled)│                          │  │
+│   │      └──────────┘  └──────────┘  └──────────┘                          │  │
 │   └──────────────────────────────────────────────────────────────────────────┘  │
 │                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -74,19 +93,21 @@ aws_lambda_architecture/
 │   ├── shared/                 # Shared utilities
 │   └── BATCH_LAYER_IMPLEMENTATION_SUMMARY.md
 │
-├── speed_layer/                 # ⚠️ Real-time processing (50% complete)
-│   ├── data_fetcher/           # ECS WebSocket service
-│   ├── kinesis_analytics/      # Flink SQL queries
-│   └── README.md
-│
-├── serving_layer/               # ⚠️ API serving (30% complete)
-│   ├── api_gateway/            # API configurations
-│   └── lambda_functions/       # API backends
+├── serving_layer/               # 📋 API serving (MVP Design)
+│   ├── lambda_functions/       # Quote Service, Backtest API, Alert Service
+│   │   ├── quote_service.py    # Latest price endpoint
+│   │   └── backtester/         # Backtesting API (future)
+│   └── README.md               # Serving Layer design
 │
 ├── shared/                      # Common utilities
 │   ├── clients/                # AWS service clients
 │   ├── models/                 # Data models
-│   └── utils/                  # Utility functions
+│   ├── utils/                  # Utility functions
+│   └── analytics_core/         # Analytics Engine (The Brain)
+│       ├── indicators/         # Technical indicators (Polars)
+│       ├── strategies/          # Strategy framework + library
+│       ├── inputs.py           # Data loading utilities
+│       └── models.py           # Pydantic models
 │
 └── README.md                    # This file
 ```
@@ -111,70 +132,17 @@ aws_lambda_architecture/
 | **Step Functions** | ✅ Deployed | Pipeline orchestration with parallel execution |
 | **SNS Alerts** | ✅ Configured | Failure notifications |
 
-### Speed Layer (50% Complete)
+### Serving Layer (📋 MVP Design - Ready for Implementation)
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| **ECS WebSocket Service** | ✅ Code Ready | Polygon WebSocket connection |
-| **Kinesis Streams** | ⚠️ Not Deployed | Real-time data ingestion |
-| **Kinesis Analytics** | ⚠️ Not Deployed | Stream processing (Flink SQL) |
-| **DynamoDB** | ⚠️ Not Deployed | Tick storage with TTL |
-| **Signal Generation** | ❌ Not Started | Price alerts, indicators |
-
-### Serving Layer (30% Complete)
-
-| Component | Status | Description |
-|-----------|--------|-------------|
+| **Quote Service** | 📋 Designed | Latest price endpoint (on-demand REST API) |
+| **Backtest API** | 📋 Designed | Historical data queries from RDS/S3 |
+| **Alert Service** | 📋 Designed | Scheduled checks (future, not real-time) |
 | **API Gateway** | ⚠️ Not Deployed | REST API endpoints |
-| **WebSocket API** | ❌ Not Started | Real-time subscriptions |
-| **Redis Cache** | ⚠️ Not Deployed | Latest prices cache |
-| **CloudFront** | ❌ Not Started | CDN distribution |
+| **Redis Cache** | ⚠️ Not Deployed | Quote caching (60s TTL) |
 
----
-
-## 🚀 Quick Start
-
-### Batch Layer (Local Testing)
-
-```bash
-# Activate virtual environment
-cd data_pipeline
-source .dp/bin/activate
-
-# Run consolidation locally
-cd aws_lambda_architecture/batch_layer/processing/batch_jobs
-python consolidator.py --mode incremental --max-workers 10
-
-# Run vacuum (dry-run)
-python vaccume.py --dry-run
-
-# Run resampler locally
-python resampler.py
-```
-
-### Manual Pipeline Trigger (AWS)
-
-```bash
-# Trigger the entire Step Functions pipeline
-aws stepfunctions start-execution \
-  --state-machine-arn "arn:aws:states:ca-west-1:471112909340:stateMachine:condvest-daily-ohlcv-pipeline" \
-  --name "manual-$(date +%Y%m%d%H%M%S)" \
-  --region ca-west-1
-
-# Or trigger individual Batch jobs
-aws batch submit-job \
-  --job-name manual-consolidator-$(date +%Y%m%d%H%M%S) \
-  --job-queue dev-batch-duckdb-resampler \
-  --job-definition dev-batch-bronze-consolidator \
-  --region ca-west-1
-```
-
-### Deploy Lambda Functions
-
-```bash
-cd aws_lambda_architecture/batch_layer/infrastructure/fetching/deployment_packages
-./deploy_lambda.sh daily-ohlcv-fetcher
-```
+**Strategic Decision:** Speed Layer removed for MVP - aligns with "Clarity Over Noise" mission. Real-time streaming encourages reactive behavior. Simple on-demand quote service is sufficient and 95% cheaper (~$5/month vs $115/month).
 
 ---
 
@@ -220,6 +188,7 @@ Vacuum Script (local) → Deep clean old date files if needed
 
 | Service | Cost |
 |---------|------|
+| **Batch Layer** | |
 | Lambda (fetchers) | $5 |
 | RDS (t3.micro) | $20 |
 | S3 Storage | $10 |
@@ -228,25 +197,25 @@ Vacuum Script (local) → Deep clean old date files if needed
 | SNS Alerts | $1 |
 | **Batch Layer Total** | **$53** |
 | | |
-| Kinesis Streams | $50 |
-| Kinesis Analytics | $50 |
-| DynamoDB | $15 |
-| **Speed Layer Total** | **$115** |
+| **Serving Layer (MVP)** | |
+| Quote Service (Lambda + Redis) | $5 |
+| Backtest API (Lambda) | $3 |
+| API Gateway | $2 |
+| **Serving Layer Total** | **$10** |
 | | |
-| API Gateway | $10 |
-| ElastiCache | $15 |
-| CloudFront | $10 |
-| **Serving Layer Total** | **$35** |
-| | |
-| **TOTAL** | **~$200/month** |
+| **TOTAL MVP** | **~$63/month** |
+
+**Cost Savings:** Removed Speed Layer saves ~$110/month (91% reduction)
 
 ---
 
 ## 📚 Documentation
 
-- [**Batch Layer Summary**](./batch_layer/BATCH_LAYER_IMPLEMENTATION_SUMMARY.md) - Full implementation details
-- [**Orchestration README**](./batch_layer/infrastructure/orchestration/README.md) - Step Functions pipeline
-- [**Speed Layer README**](./speed_layer/README.md) - Real-time processing docs
+- [**Implementation Status**](./IMPLEMENTATION_STATUS.md) - Overall progress and roadmap
+- [**Serving Layer Design**](./serving_layer/README.md) - MVP architecture (Quote Service + Backtest API)
+- [**Analytics Core**](./shared/analytics_core/README.md) - Analytics Engine documentation
+- [**Orchestration Guide**](./batch_layer/infrastructure/orchestration/README.md) - Step Functions pipeline
+- [**Database Setup**](./batch_layer/database/README.md) - Database initialization guide
 
 ---
 
@@ -256,13 +225,15 @@ Vacuum Script (local) → Deep clean old date files if needed
 2. **Auto-Scaling**: Handle traffic spikes automatically
 3. **Managed Services**: Minimal operational overhead
 4. **Incremental Processing**: Smart data compaction
-5. **Cost-Optimized**: ~$200/month for full stack
+5. **Cost-Optimized**: ~$63/month for MVP (vs $200+ with Speed Layer)
 6. **Industry Standards**: Delta Lake/Iceberg-style patterns
 7. **Orchestrated Pipeline**: Step Functions for reliability & visibility
 8. **Parallel Execution**: ~3x faster with parallel resamplers
 9. **Failure Alerts**: SNS notifications on pipeline failures
+10. **Analytics Engine**: Reusable strategy framework for scanning & backtesting
+11. **MVP-Aligned**: "Clarity Over Noise" - no real-time streaming distractions
 
 ---
 
-**Last Updated:** December 10, 2025  
-**Overall Status:** ✅ Batch Layer 100% Complete & Automated | Speed/Serving Layers In Progress
+**Last Updated:** January 2026  
+**Overall Status:** ✅ Batch Layer 95% Complete | 📋 Serving Layer MVP Design Ready | 🧠 Analytics Core Implemented
