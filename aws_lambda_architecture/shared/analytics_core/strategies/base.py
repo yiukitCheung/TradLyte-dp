@@ -1,30 +1,32 @@
 """
-Base Strategy Class - Enforces 3-Step Structure
+Base Strategy Class - Supports Expandable Step-Based Architecture
 
-All strategies must implement:
-1. setup() - Momentum/trend validation
-2. trigger() - Entry signal detection
-3. exit() - Exit/management logic
+Legacy 3-step structure (setup/trigger/exit) is still supported for backward compatibility.
+New expandable architecture supports N steps with individual timeframes.
 """
 
 from abc import ABC, abstractmethod
-from typing import Literal, Optional, Dict, Any
+from typing import Literal, Optional, Dict, Any, List
 import polars as pl
+from ..models import StepConfig
 
 
 class BaseStrategy(ABC):
     """
     Base class for all trading strategies
     
-    Enforces the 3-step sequential logic:
-    1. Setup (Momentum): Is the trend valid?
-    2. Trigger (Pattern): Did the entry happen?
-    3. Exit (Management): When do we sell?
+    Supports two modes:
+    1. Legacy 3-step mode: setup() -> trigger() -> exit()
+    2. Expandable step mode: steps: List[StepConfig] with execute_step()
+    
+    The expandable mode allows for N steps (not just 3), each with its own timeframe.
     """
     
-    def __init__(self, name: str, description: Optional[str] = None):
+    def __init__(self, name: str, description: Optional[str] = None, steps: Optional[List[StepConfig]] = None):
         self.name = name
         self.description = description
+        self.steps = steps  # Expandable steps (None = use legacy 3-step mode)
+        self._use_expandable_mode = steps is not None and len(steps) > 0
     
     @abstractmethod
     def setup(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -76,7 +78,7 @@ class BaseStrategy(ABC):
     
     def run(self, df: pl.DataFrame) -> pl.DataFrame:
         """
-        Execute the complete 3-step strategy
+        Execute the strategy (supports both legacy 3-step and expandable modes)
         
         Args:
             df: OHLCV dataframe (must have indicators pre-calculated)
@@ -84,6 +86,15 @@ class BaseStrategy(ABC):
         Returns:
             DataFrame with all strategy columns added
         """
+        if self._use_expandable_mode:
+            # Expandable step-based execution
+            return self._run_expandable(df)
+        else:
+            # Legacy 3-step execution (backward compatibility)
+            return self._run_legacy(df)
+    
+    def _run_legacy(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Legacy 3-step execution (backward compatibility)"""
         # Step 1: Setup (Momentum)
         df = self.setup(df)
         
@@ -102,6 +113,44 @@ class BaseStrategy(ABC):
         df = self.exit(df)
         
         return df
+    
+    def _run_expandable(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Execute expandable step-based strategy
+        
+        Steps are executed sequentially. Each step can specify its own timeframe.
+        The executor (in executor.py) handles multi-timeframe alignment.
+        """
+        if not self.steps:
+            raise ValueError(f"{self.name}: No steps defined for expandable mode")
+        
+        for step in self.steps:
+            if not step.enabled:
+                continue
+            
+            # Execute step (subclasses must implement execute_step)
+            df = self.execute_step(step, df)
+        
+        return df
+    
+    def execute_step(self, step: StepConfig, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Execute a single step (for expandable mode)
+        
+        Subclasses should override this method to implement step logic.
+        The step's timeframe is available in step.timeframe.
+        
+        Args:
+            step: StepConfig with step_name, timeframe, and enabled flag
+            df: DataFrame with data at the step's timeframe
+            
+        Returns:
+            DataFrame with step results added
+        """
+        raise NotImplementedError(
+            f"{self.name}: execute_step() must be implemented for expandable mode. "
+            f"Step: {step.step_name}, Timeframe: {step.timeframe}"
+        )
     
     def get_signals(self, df: pl.DataFrame) -> pl.DataFrame:
         """
