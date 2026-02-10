@@ -446,35 +446,27 @@ class DuckDBS3Resampler:
             return None
     
     def _write_to_s3_parquet(self, df: pd.DataFrame, s3_prefix: str, interval: int):
-        """Write DataFrame to S3 as partitioned Parquet files"""
+        """Write DataFrame to S3 partitioned by interval -> symbol -> year -> month (one file per month)"""
         try:
-            # Add a year/month partition column for efficient queries
-            df['year'] = pd.to_datetime(df['ts']).dt.year
-            df['month'] = pd.to_datetime(df['ts']).dt.month
-            
-            # Group by year/month for partitioning
-            for (year, month), group_df in df.groupby(['year', 'month']):
-                # Remove partition columns before writing
+            if 'symbol' not in df.columns:
+                raise ValueError("Resampled DataFrame must have a 'symbol' column for partitioning")
+            ts = pd.to_datetime(df['ts'])
+            df = df.copy()
+            df['year'] = ts.dt.year
+            df['month'] = ts.dt.month.apply(lambda x: f"{x:02d}")
+
+            for (symbol_val, year, month_str), group_df in df.groupby(['symbol', 'year', 'month']):
                 output_df = group_df.drop(columns=['year', 'month'])
-                
-                # Create partitioned path
-                partition_path = f"{s3_prefix}/year={year}/month={month:02d}"
-                filename = f"data_{interval}d_{year}{month:02d}.parquet"
+                partition_path = f"{s3_prefix}/{symbol_val}/{year}/{month_str}"
+                filename = f"data_{interval}d_{year}{month_str}.parquet"
                 s3_key = f"{partition_path}/{filename}"
-                
-                # Write to local temp file first (DuckDB can write directly to S3 but this is more reliable)
-                temp_file = f"/tmp/{filename}"
+                temp_file = f"/tmp/{symbol_val}_{year}_{month_str}_{filename}"
                 output_df.to_parquet(temp_file, engine='pyarrow', compression='snappy', index=False)
-                
-                # Upload to S3
                 self.s3_client.upload_file(temp_file, self.s3_bucket, s3_key)
                 logger.info(f"📦 Wrote {len(output_df)} records to s3://{self.s3_bucket}/{s3_key}")
-                
-                # Clean up temp file
                 os.remove(temp_file)
-            
+
             logger.info(f"✅ Successfully wrote {len(df)} total records to S3")
-            
         except Exception as e:
             logger.error(f"Error writing to S3: {str(e)}")
             raise

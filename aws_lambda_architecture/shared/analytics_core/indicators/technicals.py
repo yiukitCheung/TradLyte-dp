@@ -21,8 +21,8 @@ def calculate_rsi(df: pl.DataFrame, period: int = 14, price_col: str = 'close') 
         DataFrame with 'rsi' column added
     """
     delta = pl.col(price_col).diff()
-    gain = delta.filter(delta > 0).fill_null(0)
-    loss = -delta.filter(delta < 0).fill_null(0)
+    gain = pl.when(delta > 0).then(delta).otherwise(0).fill_null(0)
+    loss = pl.when(delta < 0).then(-delta).otherwise(0).fill_null(0)
     
     avg_gain = gain.rolling_mean(window_size=period)
     avg_loss = loss.rolling_mean(window_size=period)
@@ -189,13 +189,18 @@ def calculate_stochastic(
 def calculate_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
     """
     Calculate all common technical indicators
-    
+
     Args:
         df: DataFrame with OHLCV data
-        
+
     Returns:
         DataFrame with all indicator columns added
     """
+    # Cast OHLCV to Float64 so rolling_min/rolling_max/ewm work (RDS often returns Decimal)
+    ohlcv = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+    if ohlcv:
+        df = df.with_columns([pl.col(c).cast(pl.Float64) for c in ohlcv])
+
     # RSI
     df = calculate_rsi(df, period=14)
     
@@ -204,7 +209,7 @@ def calculate_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
         df = calculate_sma(df, period=period)
     
     # EMAs (common periods)
-    for period in [12, 26]:
+    for period in [8, 13, 21, 55, 89, 144, 169]:
         df = calculate_ema(df, period=period)
     
     # MACD

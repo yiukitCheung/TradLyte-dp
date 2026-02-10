@@ -141,6 +141,12 @@ class Backtester:
         Returns:
             BacktestResult with performance metrics
         """
+        # Use strategy's stop/take profit when not passed to run()
+        if stop_loss_pct is None:
+            stop_loss_pct = getattr(strategy, 'stop_loss_pct', None)
+        if take_profit_pct is None:
+            take_profit_pct = getattr(strategy, 'take_profit_pct', None)
+
         # Execute strategy to get signals
         if 'signal' not in data.columns:
             data = strategy.run(data)

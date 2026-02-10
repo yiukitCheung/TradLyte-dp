@@ -10,15 +10,10 @@ Common trading strategies ready to use:
 - etc.
 """
 
-from .momentum_strategies import GoldenCrossStrategy, RSIMomentumStrategy, MACDCrossoverStrategy
-from .breakout_strategies import BollingerBreakoutStrategy, ATRBreakoutStrategy
+from .golden_cross_strategy import GoldenCrossStrategy
 from .vegas_channel_strategy import VegasChannelStrategy
 
 __all__ = [
     'GoldenCrossStrategy',
-    'RSIMomentumStrategy',
-    'MACDCrossoverStrategy',
-    'BollingerBreakoutStrategy',
-    'ATRBreakoutStrategy',
     'VegasChannelStrategy',
 ]

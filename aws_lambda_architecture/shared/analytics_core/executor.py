@@ -71,29 +71,28 @@ class MultiTimeframeExecutor:
         
         for timeframe in timeframes:
             try:
-                if use_s3 and self.s3_bucket:
-                    # Load from S3
-                    if timeframe == '1d':
-                        prefix = 'bronze/raw_ohlcv'
-                    else:
-                        prefix = f'silver/silver_{timeframe}'
-                    
-                    df = load_ohlcv_from_s3(
-                        bucket=self.s3_bucket,
-                        symbol=symbol,
-                        prefix=prefix,
-                        start_date=start_date,
-                        end_date=end_date
-                    )
-                else:
-                    # Load from RDS
-                    table_name = self.TIMEFRAME_TABLE_MAP.get(timeframe, 'raw_ohlcv')
+                # Daily (1d): load from RDS only. Resampled: load from S3 only.
+                if timeframe == '1d':
+                    if not self.rds_connection_string:
+                        raise ValueError("Daily (1d) data requires rds_connection_string.")
                     df = load_ohlcv_from_rds(
                         symbol=symbol,
                         connection_string=self.rds_connection_string,
                         start_date=start_date,
                         end_date=end_date,
-                        table_name=table_name
+                        table_name='raw_ohlcv'
+                    )
+                elif use_s3 and self.s3_bucket and start_date and end_date:
+                    df = load_ohlcv_from_s3(
+                        bucket=self.s3_bucket,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        start_date=start_date,
+                        end_date=end_date
+                    )
+                else:
+                    raise ValueError(
+                        f"Resampled timeframe {timeframe} requires use_s3=True, s3_bucket, start_date and end_date."
                     )
                 
                 if df.height > 0:
