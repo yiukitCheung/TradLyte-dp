@@ -11,13 +11,9 @@ from datetime import date, datetime
 from .models import SignalResult
 from .strategies.base import BaseStrategy
 from .executor import MultiTimeframeExecutor
-from .strategies.library.momentum_strategies import (
-    GoldenCrossStrategy, RSIMomentumStrategy, MACDCrossoverStrategy
+from .strategies.library import (
+    GoldenCrossStrategy, VegasChannelStrategy
 )
-from .strategies.library.breakout_strategies import (
-    BollingerBreakoutStrategy, ATRBreakoutStrategy
-)
-from .strategies.library.vegas_channel_strategy import VegasChannelStrategy
 
 
 class DailyScanner:
@@ -73,10 +69,6 @@ class DailyScanner:
         """
         strategies = [
             GoldenCrossStrategy(),
-            RSIMomentumStrategy(),
-            MACDCrossoverStrategy(),
-            BollingerBreakoutStrategy(),
-            ATRBreakoutStrategy(),
             VegasChannelStrategy(),
         ]
         return strategies

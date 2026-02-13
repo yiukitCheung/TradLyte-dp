@@ -23,56 +23,43 @@ def load_ohlcv_from_s3(
     """
     Load resampled OHLCV data from S3 using a lazy scan with predicate pushdown.
 
-    Path structure (partition: interval -> symbol -> year -> month):
-    silver_{x}d/{symbol}/{year}/{month}/data_{x}d_{YYYYMM}.parquet
-
-    Uses pl.scan_parquet() with s3://bucket/prefix/{symbol}/**/*.parquet so that:
-    - Only that symbol's partition is scanned (path-level pruning).
-    - Date and symbol filters are pushed down; Polars fetches only relevant row groups.
+    Path structure (no symbol in path): silver_{x}d/{year}/{month}/*.parquet
+    e.g. silver_3d/2024/01/data_3d_202401.parquet. Filter by symbol via predicate pushdown.
 
     Expects parquet columns: ts, symbol, open, high, low, close, volume.
-    Returns data filtered to [start_date, end_date] with a "date" column for downstream.
-
-    Args:
-        bucket: S3 bucket name
-        symbol: Stock symbol (e.g., 'AAPL', 'NVDA')
-        timeframe: Resample period (e.g., '3d', '5d', '8d')
-        start_date: Start date (inclusive)
-        end_date: End date (inclusive)
-        s3_prefix_base: Top-level S3 prefix (default "silver"; use "" for silver_{x}d at bucket root)
-        aws_region: AWS region for S3 (default: boto3 default session or AWS_REGION env)
-
-    Returns:
-        Polars DataFrame with OHLCV data
+    Returns data for the given symbol in [start_date, end_date] with a "date" column.
     """
     x = timeframe.rstrip("d") if isinstance(timeframe, str) else str(timeframe)
     prefix = f"{s3_prefix_base}/silver_{x}d".strip("/") if s3_prefix_base else f"silver_{x}d"
-    # Lazy scan: only this symbol's partition (/**/*.parquet matches year/month subdirs)
-    s3_path = f"s3://{bucket}/{prefix}/{symbol}/**/*.parquet"
+    start_year_str = start_date.strftime("%Y")
+    start_month_str = start_date.strftime("%m")
+    s3_path = f"s3://{bucket}/{prefix}/{start_year_str}/{start_month_str}/*.parquet"
 
     session = boto3.Session()
-    region = aws_region or session.region_name or os.environ.get("AWS_REGION", "us-east-1")
+    storage_options = {"aws_region": aws_region or session.region_name or os.environ.get("AWS_REGION", "us-east-1")}
     creds = session.get_credentials()
-    storage_options: dict = {"aws_region": region}
     if creds:
-        frozen = creds.get_frozen_credentials()
-        storage_options["aws_access_key_id"] = frozen.access_key
-        storage_options["aws_secret_access_key"] = frozen.secret_key
-        if frozen.token:
-            storage_options["aws_session_token"] = frozen.token
+        f = creds.get_frozen_credentials()
+        storage_options["aws_access_key_id"] = f.access_key
+        storage_options["aws_secret_access_key"] = f.secret_key
+        if f.token:
+            storage_options["aws_session_token"] = f.token
 
     q = pl.scan_parquet(s3_path, storage_options=storage_options)
     names = q.collect_schema().names()
+    # Unify datetime schema across files (μs/UTC vs ns mismatch causes SchemaError on concat)
+    for col_name in ("ts", "timestamp"):
+        if col_name in names:
+            q = q.with_columns(
+                pl.col(col_name).dt.cast_time_unit("us").dt.replace_time_zone("Etc/UTC")
+            )
     if "symbol" in names:
         q = q.filter(pl.col("symbol") == symbol)
     date_col = next((c for c in ("ts", "date", "timestamp") if c in names), None)
     if date_col:
         col = pl.col(date_col)
-        if date_col == "ts" or date_col == "timestamp":
-            q = q.filter(
-                col.dt.date() >= start_date,
-                col.dt.date() <= end_date,
-            )
+        if date_col in ("ts", "timestamp"):
+            q = q.filter(col.dt.date() >= start_date, col.dt.date() <= end_date)
         else:
             q = q.filter(col >= start_date, col <= end_date)
 
@@ -80,13 +67,12 @@ def load_ohlcv_from_s3(
     if df.is_empty():
         raise ValueError(
             f"No OHLCV data found in S3 for {symbol} {timeframe} from {start_date} to {end_date}. "
-            f"Path pattern: {s3_path}. Ensure bucket={bucket}, prefix={prefix}, and parquet under {prefix}/{symbol}/YYYY/MM/."
+            f"Path: s3://{bucket}/{prefix}/YYYY/MM/*.parquet"
         )
     if "date" not in df.columns and "ts" in df.columns:
-        if df["ts"].dtype == pl.Datetime:
-            df = df.with_columns(pl.col("ts").dt.date().alias("date"))
-        else:
-            df = df.with_columns(pl.col("ts").alias("date"))
+        df = df.with_columns(
+            pl.col("ts").dt.date().alias("date") if df["ts"].dtype == pl.Datetime else pl.col("ts").alias("date")
+        )
     return df
 
 
@@ -165,7 +151,7 @@ def load_ohlcv_from_rds(
 # Multi-Timeframe Data Loading
 # ============================================================================
 
-# Daily data: RDS only. Resampled data: S3 only (partition: silver_{x}d/{symbol}/{year}/{month}/data_{x}d_{YYYYMM}.parquet).
+# Daily data: RDS only. Resampled data: S3 only (partition: silver_{x}d/{year}/{month}/*.parquet; filter by symbol in query).
 TIMEFRAME_TABLE_MAP = {
     '1d': 'raw_ohlcv',
 }
@@ -185,7 +171,7 @@ def load_ohlcv_by_timeframe(
 
     - 1d: requires connection_string; loads from RDS raw_ohlcv.
     - 3d, 5d, 8d, etc.: requires s3_bucket and start_date/end_date; loads from S3
-      path silver_{x}d/{symbol}/{year}/{month}/data_{x}d_{YYYYMM}.parquet.
+      path silver_{x}d/{year}/{month}/*.parquet (symbol filtered in query).
 
     Args:
         symbol: Stock symbol (e.g., 'AAPL')
