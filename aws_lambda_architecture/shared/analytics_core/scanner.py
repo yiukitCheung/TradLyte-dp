@@ -23,25 +23,12 @@ class DailyScanner:
     Loads active symbols, runs pre-built strategies, and generates signals.
     """
     
-    def __init__(
-        self,
-        rds_connection_string: Optional[str] = None,
-        s3_bucket: Optional[str] = None,
-        use_s3: bool = False
-    ):
+    def __init__(self, rds_connection_string: Optional[str] = None):
         """
-        Initialize scanner
-        
-        Args:
-            rds_connection_string: PostgreSQL connection string
-            s3_bucket: S3 bucket name
-            use_s3: Load data from S3 instead of RDS
+        Initialize scanner. Data is loaded from RDS (1d); resampled timeframes
+        are computed at use from 1d.
         """
-        self.executor = MultiTimeframeExecutor(
-            rds_connection_string=rds_connection_string,
-            s3_bucket=s3_bucket
-        )
-        self.use_s3 = use_s3
+        self.executor = MultiTimeframeExecutor(rds_connection_string=rds_connection_string)
     
     def get_active_symbols(self, rds_client) -> List[str]:
         """
@@ -108,8 +95,7 @@ class DailyScanner:
                 timeframes=timeframes,
                 start_date=start_date,
                 end_date=end_date,
-                base_timeframe='1d',
-                use_s3=self.use_s3
+                base_timeframe="1d",
             )
             
             if result_df.height == 0:

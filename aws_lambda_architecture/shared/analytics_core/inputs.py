@@ -1,79 +1,41 @@
 """
 Data Input Utilities
 
-Load OHLCV data from various sources (S3, RDS) into Polars DataFrames
+Load OHLCV from RDS (raw 1d) and resample at use for multi-timeframe (3d, 5d, etc.).
+No S3 loading; resampling is done in memory from 1d data.
 """
 
 import polars as pl
-import boto3
 from typing import Optional
 from datetime import date
-import os
 
 
-def load_ohlcv_from_s3(
-    bucket: str,
-    symbol: str,
-    timeframe: str,
-    start_date: date,
-    end_date: date,
-    s3_prefix_base: Optional[str] = "silver",
-    aws_region: Optional[str] = None,
-) -> pl.DataFrame:
+def resample_ohlcv_1d_to_nd(df_1d: pl.DataFrame, interval_days: int) -> pl.DataFrame:
     """
-    Load resampled OHLCV data from S3 using a lazy scan with predicate pushdown.
+    Resample 1d OHLCV to Nd (e.g. 3d, 5d) using Polars group_by_dynamic.
 
-    Path structure (no symbol in path): silver_{x}d/{year}/{month}/*.parquet
-    e.g. silver_3d/2024/01/data_3d_202401.parquet. Filter by symbol via predicate pushdown.
-
-    Expects parquet columns: ts, symbol, open, high, low, close, volume.
-    Returns data for the given symbol in [start_date, end_date] with a "date" column.
+    Expects columns: timestamp or date (datetime), open, high, low, close, volume.
+    Optional: symbol. Returns one row per interval with date = period end date.
     """
-    x = timeframe.rstrip("d") if isinstance(timeframe, str) else str(timeframe)
-    prefix = f"{s3_prefix_base}/silver_{x}d".strip("/") if s3_prefix_base else f"silver_{x}d"
-    start_year_str = start_date.strftime("%Y")
-    start_month_str = start_date.strftime("%m")
-    s3_path = f"s3://{bucket}/{prefix}/{start_year_str}/{start_month_str}/*.parquet"
-
-    session = boto3.Session()
-    storage_options = {"aws_region": aws_region or session.region_name or os.environ.get("AWS_REGION", "us-east-1")}
-    creds = session.get_credentials()
-    if creds:
-        f = creds.get_frozen_credentials()
-        storage_options["aws_access_key_id"] = f.access_key
-        storage_options["aws_secret_access_key"] = f.secret_key
-        if f.token:
-            storage_options["aws_session_token"] = f.token
-
-    q = pl.scan_parquet(s3_path, storage_options=storage_options)
-    names = q.collect_schema().names()
-    # Unify datetime schema across files (μs/UTC vs ns mismatch causes SchemaError on concat)
-    for col_name in ("ts", "timestamp"):
-        if col_name in names:
-            q = q.with_columns(
-                pl.col(col_name).dt.cast_time_unit("us").dt.replace_time_zone("Etc/UTC")
-            )
-    if "symbol" in names:
-        q = q.filter(pl.col("symbol") == symbol)
-    date_col = next((c for c in ("ts", "date", "timestamp") if c in names), None)
-    if date_col:
-        col = pl.col(date_col)
-        if date_col in ("ts", "timestamp"):
-            q = q.filter(col.dt.date() >= start_date, col.dt.date() <= end_date)
-        else:
-            q = q.filter(col >= start_date, col <= end_date)
-
-    df = q.collect()
-    if df.is_empty():
-        raise ValueError(
-            f"No OHLCV data found in S3 for {symbol} {timeframe} from {start_date} to {end_date}. "
-            f"Path: s3://{bucket}/{prefix}/YYYY/MM/*.parquet"
-        )
-    if "date" not in df.columns and "ts" in df.columns:
-        df = df.with_columns(
-            pl.col("ts").dt.date().alias("date") if df["ts"].dtype == pl.Datetime else pl.col("ts").alias("date")
-        )
-    return df
+    if df_1d.is_empty():
+        return df_1d
+    time_col = "timestamp" if "timestamp" in df_1d.columns else "date"
+    if time_col not in df_1d.columns:
+        raise ValueError("DataFrame must have 'timestamp' or 'date' column")
+    if df_1d[time_col].dtype != pl.Datetime:
+        df_1d = df_1d.with_columns(pl.col(time_col).cast(pl.Datetime).alias(time_col))
+    df_1d = df_1d.sort(time_col)
+    out = df_1d.group_by_dynamic(time_col, every=f"{interval_days}d").agg(
+        pl.col("open").first().alias("open"),
+        pl.col("high").max().alias("high"),
+        pl.col("low").min().alias("low"),
+        pl.col("close").last().alias("close"),
+        pl.col("volume").sum().alias("volume"),
+    )
+    out = out.with_columns(pl.col(time_col).dt.date().alias("date"))
+    if "symbol" in df_1d.columns:
+        out = out.with_columns(pl.lit(df_1d["symbol"][0]).alias("symbol"))
+    return out
 
 
 def load_ohlcv_from_rds(
@@ -148,13 +110,10 @@ def load_ohlcv_from_rds(
         raise ValueError(f"Error loading {symbol} from RDS: {str(e)}")
 
 # ============================================================================
-# Multi-Timeframe Data Loading
+# Multi-Timeframe Data Loading (RDS only; resample at use)
 # ============================================================================
 
-# Daily data: RDS only. Resampled data: S3 only (partition: silver_{x}d/{year}/{month}/*.parquet; filter by symbol in query).
-TIMEFRAME_TABLE_MAP = {
-    '1d': 'raw_ohlcv',
-}
+TIMEFRAME_TABLE_MAP = {'1d': 'raw_ohlcv'}
 RESAMPLED_TIMEFRAMES = ('3d', '5d', '8d', '13d', '21d', '34d')
 
 
@@ -162,47 +121,54 @@ def load_ohlcv_by_timeframe(
     symbol: str,
     timeframe: str,
     connection_string: Optional[str] = None,
-    s3_bucket: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    days: Optional[int] = None,
 ) -> pl.DataFrame:
     """
-    Load OHLCV by timeframe: daily (1d) from RDS, resampled (3d, 5d, ...) from S3.
+    Load OHLCV by timeframe: 1d from RDS; 3d, 5d, etc. from RDS 1d then resampled at use.
 
-    - 1d: requires connection_string; loads from RDS raw_ohlcv.
-    - 3d, 5d, 8d, etc.: requires s3_bucket and start_date/end_date; loads from S3
-      path silver_{x}d/{year}/{month}/*.parquet (symbol filtered in query).
+    - 1d: loads from RDS raw_ohlcv.
+    - 3d, 5d, 8d, ...: loads 1d from RDS for the range, then resamples in memory.
 
     Args:
         symbol: Stock symbol (e.g., 'AAPL')
-        timeframe: '1d' or resampled ('3d', '5d', '8d', '13d', '21d', '34d')
-        connection_string: PostgreSQL connection (required for 1d)
-        s3_bucket: S3 bucket (required for resampled)
-        start_date: Start date (required for resampled; optional for 1d)
-        end_date: End date (required for resampled; optional for 1d)
+        timeframe: '1d' or '3d', '5d', '8d', '13d', '21d', '34d'
+        connection_string: PostgreSQL connection (required)
+        start_date: Start date (required for resampled; optional for 1d if days set)
+        end_date: End date (required for resampled; optional for 1d if days set)
+        days: If set, fetch last N days (1d only; for resampled use start_date/end_date)
 
     Returns:
-        Polars DataFrame with OHLCV data
+        Polars DataFrame with OHLCV and date column
     """
+    if not connection_string:
+        raise ValueError("connection_string (RDS) is required for all timeframes.")
     if timeframe == "1d":
-        if not connection_string:
-            raise ValueError("Daily (1d) data requires connection_string (RDS).")
-        return load_ohlcv_from_rds(
+        df = load_ohlcv_from_rds(
+            symbol=symbol,
+            connection_string=connection_string,
+            start_date=start_date,
+            end_date=end_date,
+            table_name=TIMEFRAME_TABLE_MAP["1d"],
+            days=days,
+        )
+    else:
+        x = timeframe.rstrip("d") if isinstance(timeframe, str) else str(timeframe)
+        try:
+            interval_days = int(x)
+        except ValueError:
+            raise ValueError(f"Invalid timeframe: {timeframe}")
+        if not start_date or not end_date:
+            raise ValueError("Resampled timeframes require start_date and end_date.")
+        df = load_ohlcv_from_rds(
             symbol=symbol,
             connection_string=connection_string,
             start_date=start_date,
             end_date=end_date,
             table_name=TIMEFRAME_TABLE_MAP["1d"],
         )
-    # Resampled: load from S3
-    if not s3_bucket:
-        raise ValueError("Resampled timeframes require s3_bucket.")
-    if not start_date or not end_date:
-        raise ValueError("Resampled timeframes require start_date and end_date.")
-    return load_ohlcv_from_s3(
-        bucket=s3_bucket,
-        symbol=symbol,
-        timeframe=timeframe,
-        start_date=start_date,
-        end_date=end_date,
-    )
+        df = resample_ohlcv_1d_to_nd(df, interval_days)
+    if df.height > 0 and "date" not in df.columns and "timestamp" in df.columns:
+        df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
+    return df

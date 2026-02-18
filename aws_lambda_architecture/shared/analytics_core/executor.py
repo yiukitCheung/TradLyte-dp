@@ -8,7 +8,7 @@ for multi-timeframe strategy execution.
 import polars as pl
 from typing import Dict, List, Optional, Any
 from datetime import date, datetime
-from .inputs import load_ohlcv_from_rds, load_ohlcv_from_s3
+from .inputs import load_ohlcv_by_timeframe
 from .strategies.base import BaseStrategy
 from .indicators.technicals import calculate_all_indicators
 from .indicators.patterns import detect_all_patterns
@@ -24,91 +24,44 @@ class MultiTimeframeExecutor:
     - Aligning higher timeframe signals to base timeframe
     """
     
-    # Map timeframe strings to table names
-    TIMEFRAME_TABLE_MAP = {
-        '1d': 'raw_ohlcv',
-        '3d': 'silver_3d',
-        '5d': 'silver_5d',
-        '8d': 'silver_8d',
-        '13d': 'silver_13d',
-        '21d': 'silver_21d',
-        '34d': 'silver_34d',
-    }
-    
-    def __init__(self, rds_connection_string: Optional[str] = None, s3_bucket: Optional[str] = None):
+    def __init__(self, rds_connection_string: Optional[str] = None):
         """
-        Initialize executor with data source configuration
-        
-        Args:
-            rds_connection_string: PostgreSQL connection string (for RDS data)
-            s3_bucket: S3 bucket name (for S3 data lake)
+        Initialize executor with RDS connection. All timeframes load from RDS (1d);
+        resampled (3d, 5d, etc.) are computed at use from 1d.
         """
         self.rds_connection_string = rds_connection_string
-        self.s3_bucket = s3_bucket
-    
+
     def load_multi_timeframe_data(
         self,
         symbol: str,
         timeframes: List[str],
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
-        use_s3: bool = False
     ) -> Dict[str, pl.DataFrame]:
         """
-        Load OHLCV data for multiple timeframes
-        
-        Args:
-            symbol: Stock symbol (e.g., 'AAPL')
-            timeframes: List of timeframes to load (e.g., ['1d', '3d', '5d'])
-            start_date: Start date filter (optional)
-            end_date: End date filter (optional)
-            use_s3: If True, load from S3; if False, load from RDS
-            
-        Returns:
-            Dictionary mapping timeframe to DataFrame
+        Load OHLCV for multiple timeframes from RDS. 1d from raw_ohlcv;
+        3d, 5d, etc. from 1d resampled at use.
         """
         data_by_timeframe = {}
-        
+        if not self.rds_connection_string:
+            raise ValueError("rds_connection_string is required.")
         for timeframe in timeframes:
             try:
-                # Daily (1d): load from RDS only. Resampled: load from S3 only.
-                if timeframe == '1d':
-                    if not self.rds_connection_string:
-                        raise ValueError("Daily (1d) data requires rds_connection_string.")
-                    df = load_ohlcv_from_rds(
-                        symbol=symbol,
-                        connection_string=self.rds_connection_string,
-                        start_date=start_date,
-                        end_date=end_date,
-                        table_name='raw_ohlcv'
-                    )
-                elif use_s3 and self.s3_bucket and start_date and end_date:
-                    df = load_ohlcv_from_s3(
-                        bucket=self.s3_bucket,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        start_date=start_date,
-                        end_date=end_date
-                    )
-                else:
-                    raise ValueError(
-                        f"Resampled timeframe {timeframe} requires use_s3=True, s3_bucket, start_date and end_date."
-                    )
-                
+                df = load_ohlcv_by_timeframe(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    connection_string=self.rds_connection_string,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 if df.height > 0:
-                    # Ensure date column exists and is properly named
-                    if 'timestamp' in df.columns:
-                        df = df.rename({'timestamp': 'date'})
-                    elif 'date' not in df.columns:
-                        raise ValueError(f"No date/timestamp column found in {timeframe} data")
-                    
-                    # Sort by date
-                    df = df.sort('date')
-                    
-                    # Add symbol column if missing
-                    if 'symbol' not in df.columns:
-                        df = df.with_columns(pl.lit(symbol).alias('symbol'))
-                    
+                    if "date" not in df.columns and "timestamp" in df.columns:
+                        df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
+                    if "date" not in df.columns:
+                        raise ValueError(f"No date/timestamp column in {timeframe} data")
+                    df = df.sort("date")
+                    if "symbol" not in df.columns:
+                        df = df.with_columns(pl.lit(symbol).alias("symbol"))
                     data_by_timeframe[timeframe] = df
                 else:
                     print(f"Warning: No data found for {symbol} at {timeframe} timeframe")
@@ -253,31 +206,16 @@ class MultiTimeframeExecutor:
         timeframes: List[str],
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
-        base_timeframe: str = '1d',
-        use_s3: bool = False
+        base_timeframe: str = "1d",
     ) -> pl.DataFrame:
         """
-        Complete workflow: Load data and execute strategy
-        
-        Args:
-            strategy: Strategy instance
-            symbol: Stock symbol
-            timeframes: List of timeframes needed (e.g., ['1d', '3d'])
-            start_date: Start date
-            end_date: End date
-            base_timeframe: Base timeframe for output
-            use_s3: Load from S3 instead of RDS
-            
-        Returns:
-            Base timeframe DataFrame with strategy results
+        Load data from RDS (1d + resample at use) and execute strategy.
         """
-        # Load data for all required timeframes
         data_by_timeframe = self.load_multi_timeframe_data(
             symbol=symbol,
             timeframes=timeframes,
             start_date=start_date,
             end_date=end_date,
-            use_s3=use_s3
         )
         
         if not data_by_timeframe:
