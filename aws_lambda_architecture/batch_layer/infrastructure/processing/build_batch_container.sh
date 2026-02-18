@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build and push Docker container for batch processing jobs
-# Location: infrastructure/processing/build_batch_container.sh
-# Supports: resampler, consolidator
+# DEPRECATED: Resampler/consolidator container. Jobs moved to batch_layer/archive_scripts/
+# Pipeline uses raw 1d only; resampling is on-the-fly in backtester.
+# Use archive_scripts/build_batch_container.sh if you need to build this image.
 
 set -e
 

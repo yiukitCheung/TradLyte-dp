@@ -235,11 +235,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         # Store job metadata (optional - for monitoring)
         store_job_metadata(rds_client, batch_job)
         
-        # Trigger downstream processing (Silver layer - Fibonacci resampling) for the latest date
-        latest_date = max(dates_to_fetch) if dates_to_fetch else None
-        if latest_date:
-            trigger_fibonacci_resampling_job(latest_date)
-        
+        # Resampling is done on-the-fly in backtester from raw 1d; no Batch resampler trigger.
+
         execution_time = (batch_job.end_time - batch_job.start_time).total_seconds()
         
         # Final summary with execution mode
@@ -412,35 +409,6 @@ def store_job_metadata(rds_client: RDSPostgresClient, batch_job: BatchProcessing
     except Exception as e:
         logger.error(f"Error storing job metadata: {str(e)}")
         # Don't fail the main job for metadata storage issues
-
-def trigger_fibonacci_resampling_job(target_date: datetime.date):
-    """
-    Trigger the S3 Data Lake Resampling job after bronze layer completion
-    Uses AWS Batch for cost-efficient DuckDB + S3 processing
-    """
-    try:
-        batch_client = boto3.client('batch')
-        
-        # Submit S3 Data Lake Resampling job to AWS Batch
-        job_name = f"s3-resampler-{target_date.isoformat()}-{int(datetime.utcnow().timestamp())}"
-        
-        response = batch_client.submit_job(
-            jobName=job_name,
-            jobQueue=os.environ.get('BATCH_JOB_QUEUE', 'dev-batch-duckdb-resampler'),
-            jobDefinition=os.environ.get('RESAMPLING_JOB_DEFINITION', 'dev-batch-duckdb-resampler')
-        )
-        
-        job_id = response['jobId']
-        logger.info(f"✅ Triggered S3 Data Lake Resampling job {job_name} (ID: {job_id}) for {target_date}")
-        logger.info(f"📦 Resampler will write silver data to S3: s3://dev-condvest-datalake/silver/")
-        
-        return job_id
-        
-    except Exception as e:
-        logger.error(f"❌ Error triggering S3 Resampling job: {str(e)}")
-        # Don't fail Bronze layer for Resampling layer trigger issues
-        return None
-
 
 def write_to_s3_bronze(ohlcv_data: List[OHLCVData], fetch_date: date) -> int:
     """

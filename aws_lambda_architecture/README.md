@@ -80,10 +80,9 @@ aws_lambda_architecture/
 │   │       ├── daily_ohlcv_fetcher.py
 │   │       └── daily_meta_fetcher.py
 │   ├── processing/             # AWS Batch jobs
-│   │   └── batch_jobs/
-│   │       ├── consolidator.py     # Merge date files
-│   │       ├── resampler.py        # Fibonacci resampling
+│   │   └── batch_jobs/             # (resampler/consolidator moved to archive_scripts)
 │   │       └── vaccume.py          # Cleanup old files (local)
+│   ├── archive_scripts/         # Archived: resampler, consolidator, deploy scripts
 │   ├── infrastructure/         # Deployment & orchestration
 │   │   ├── fetching/           # Lambda deployment scripts
 │   │   ├── processing/         # Batch container & job deployment
@@ -124,12 +123,9 @@ aws_lambda_architecture/
 | **Lambda Meta Fetcher** | ✅ Deployed | Symbol metadata updates |
 | **Watermark System** | ✅ Working | Incremental processing tracking |
 | **S3 Bronze Layer** | ✅ Working | Raw data storage (symbol partitioned) |
-| **Consolidation Job** | ✅ Deployed | AWS Batch: Merge date files → data.parquet |
-| **Vacuum/Cleanup** | ✅ Integrated | Consolidator cleans up old files |
-| **Resampler** | ✅ Deployed | AWS Batch: Fibonacci resampling (3d-34d) |
-| **Checkpoint System** | ✅ Working | Incremental resampling |
-| **S3 Silver Layer** | ✅ Validated | Resampled data storage |
-| **Step Functions** | ✅ Deployed | Pipeline orchestration with parallel execution |
+| **Step Functions** | ✅ Deployed | Pipeline: Fetchers → Complete (no consolidator/resampler) |
+| **Resampling** | 📋 On-the-fly | Backtester resamples 1d→3d/5d/… from raw OHLCV (no silver pre-store) |
+| **Archived** | 📁 archive_scripts | consolidator.py, resampler.py, deploy/build scripts (see README_ARCHIVED_BATCH_JOBS.md) |
 | **SNS Alerts** | ✅ Configured | Failure notifications |
 
 ### Serving Layer (📋 MVP Design - Ready for Implementation)
@@ -161,18 +157,10 @@ Market Close (4:00 PM ET)
    │ OHLCV Fetch │  Metadata Fetch  │  ← Lambda (2 retries each)
    └─────────────┴──────────────────┘
          │
-         ▼ STAGE 2 (Sequential)
-   ┌────────────────────────────────┐
-   │ Consolidator (AWS Batch)       │  ← Merges date files + cleanup
-   └────────────────────────────────┘
-         │
-         ▼ STAGE 3 (Parallel - 6x)
-   ┌────┬────┬────┬─────┬─────┬─────┐
-   │ 3d │ 5d │ 8d │ 13d │ 21d │ 34d │  ← All resamplers in parallel!
-   └────┴────┴────┴─────┴─────┴─────┘
-         │
-         ▼ ~4:23 PM ET
-   ✅ Pipeline Complete (~18 min total)
+         ▼
+   ✅ Pipeline Complete
+
+   (Resampling for backtesting is done on-the-fly from raw 1d; consolidator/resampler Batch jobs archived.)
 
    ON FAILURE → SNS Alert → Email notification
 ```
@@ -228,7 +216,7 @@ Vacuum Script (local) → Deep clean old date files if needed
 5. **Cost-Optimized**: ~$63/month for MVP (vs $200+ with Speed Layer)
 6. **Industry Standards**: Delta Lake/Iceberg-style patterns
 7. **Orchestrated Pipeline**: Step Functions for reliability & visibility
-8. **Parallel Execution**: ~3x faster with parallel resamplers
+8. **Simplified Pipeline**: Fetchers only; resampling at backtest time
 9. **Failure Alerts**: SNS notifications on pipeline failures
 10. **Analytics Engine**: Reusable strategy framework for scanning & backtesting
 11. **MVP-Aligned**: "Clarity Over Noise" - no real-time streaming distractions

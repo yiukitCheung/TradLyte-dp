@@ -1,7 +1,7 @@
 #!/bin/bash
-# Deploy AWS Batch Job Definitions
-# Location: infrastructure/processing/deploy_batch_jobs.sh
-# Creates/updates job definitions for: consolidator, resampler
+# DEPRECATED: Consolidator and resampler moved to batch_layer/archive_scripts/
+# Pipeline no longer runs these jobs. Use archive_scripts/deploy_batch_jobs.sh if you need to deploy them.
+# This file is kept so existing references do not break; consider removing after reconfiguring CI/CD.
 
 set -e
 

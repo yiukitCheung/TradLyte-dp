@@ -214,7 +214,5 @@ echo "  - Test function: aws lambda invoke --function-name daily_ohlcv_fetcher r
 echo ""
 echo "📦 Lambda packages stored in S3: s3://${LAMBDA_DEPLOY_BUCKET:-dev-condvest-lambda-deploy}/lambda-packages/"
 echo ""
-echo "📝 Note: Consolidation is now handled by AWS Batch (not Lambda)"
-echo "   Build container: ./processing/container_images/build_container.sh"
-echo "   Run consolidator: Set JOB_TYPE=consolidator in AWS Batch job definition"
-
+echo "📝 Note: Consolidator/resampler Batch jobs are archived. Pipeline is fetchers only."
+echo "   See batch_layer/archive_scripts/README_ARCHIVED_BATCH_JOBS.md"
