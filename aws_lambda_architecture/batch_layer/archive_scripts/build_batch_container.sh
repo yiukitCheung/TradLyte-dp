@@ -13,8 +13,9 @@ if [ ! -f "$INFRA_PROCESSING/Dockerfile" ]; then
     INFRA_PROCESSING="$(cd "$SCRIPT_DIR/../../infrastructure/processing" 2>/dev/null && pwd)" || true
 fi
 BATCH_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+AWS_ARCH_DIR="$(dirname "$BATCH_DIR")"
 PROCESSING_DIR="$BATCH_DIR/processing"
-SHARED_DIR="$BATCH_DIR/shared"
+SHARED_DIR="$AWS_ARCH_DIR/shared"
 
 AWS_REGION=${AWS_REGION:-ca-west-1}
 AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null)}

@@ -8,8 +8,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(dirname "$SCRIPT_DIR")"
 BATCH_DIR="$(dirname "$INFRA_DIR")"
+AWS_ARCH_DIR="$(dirname "$BATCH_DIR")"
 PROCESSING_DIR="$BATCH_DIR/processing"
-SHARED_DIR="$BATCH_DIR/shared"
+SHARED_DIR="$AWS_ARCH_DIR/shared"
 
 # Default values
 AWS_REGION=${AWS_REGION:-ca-west-1}

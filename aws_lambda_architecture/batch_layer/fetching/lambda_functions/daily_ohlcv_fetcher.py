@@ -24,7 +24,7 @@ import pytz
 
 # Import shared utilities (included in deployment package)
 from shared.clients.polygon_client import PolygonClient
-from shared.clients.rds_timescale_client import RDSPostgresClient
+from shared.clients.rds_timescale_client import RDSTimescaleClient
 from shared.models.data_models import OHLCVData, BatchProcessingJob
 
 # Configure logging
@@ -65,7 +65,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         
         # Initialize clients
         polygon_client = PolygonClient(api_key=polygon_api_key)
-        rds_client = RDSPostgresClient(secret_arn=os.environ['RDS_SECRET_ARN']) 
+        rds_client = RDSTimescaleClient(secret_arn=os.environ['RDS_SECRET_ARN']) 
         
         # Market Status Check (can be skipped for testing)
         if not skip_market_check:
@@ -280,7 +280,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             })
         }
 
-def get_missing_dates(rds_client: RDSPostgresClient, max_days_back: int = 30) -> List[date]:
+def get_missing_dates(rds_client: RDSTimescaleClient, max_days_back: int = 30) -> List[date]:
     """
     Find missing trading dates by checking watermark table (FAST & SCALABLE)
     
@@ -400,7 +400,7 @@ def fetch_ohlcv_batch(
     return polygon_client.fetch_batch_ohlcv_data(symbols, target_date)
 
 
-def store_job_metadata(rds_client: RDSPostgresClient, batch_job: BatchProcessingJob):
+def store_job_metadata(rds_client: RDSTimescaleClient, batch_job: BatchProcessingJob):
     """
     Store batch job metadata for monitoring
     """
@@ -491,7 +491,7 @@ def write_to_s3_bronze(ohlcv_data: List[OHLCVData], fetch_date: date) -> int:
 
 
 def write_to_rds_with_retention(
-    rds_client: RDSPostgresClient, 
+    rds_client: RDSTimescaleClient,
     ohlcv_data: List[OHLCVData],
     retention_years: int = 5
 ) -> int:
@@ -547,7 +547,7 @@ def write_to_rds_with_retention(
         return 0
 
 
-def update_watermark(rds_client: RDSPostgresClient, symbols: List[str], fetch_date: date):
+def update_watermark(rds_client: RDSTimescaleClient, symbols: List[str], fetch_date: date):
     """
     Update watermark table after successful ingestion (SCD TYPE 2 PATTERN)
     
@@ -611,7 +611,7 @@ def update_watermark(rds_client: RDSPostgresClient, symbols: List[str], fetch_da
 
 def handle_historical_backfill(
     polygon_client: PolygonClient,
-    rds_client: RDSPostgresClient,
+    rds_client: RDSTimescaleClient,
     symbols: List[str] = None,
     years_back: int = 5,
     new_symbols_only: bool = True
@@ -749,7 +749,7 @@ def handle_historical_backfill(
         }
 
 
-def get_new_symbols(rds_client: RDSPostgresClient, days_threshold: int = 7) -> List[str]:
+def get_new_symbols(rds_client: RDSTimescaleClient, days_threshold: int = 7) -> List[str]:
     """
     Find symbols that need historical backfill:
     1. Symbols NOT in watermark table (never fetched)

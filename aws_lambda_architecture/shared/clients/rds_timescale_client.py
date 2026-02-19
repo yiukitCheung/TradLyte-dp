@@ -366,3 +366,7 @@ class RDSTimescaleClient:
         if self.connection:
             self.connection.close()
             logger.info("RDS TimescaleDB connection closed")
+
+
+# Backward-compatible alias used by older batch-layer modules.
+RDSPostgresClient = RDSTimescaleClient

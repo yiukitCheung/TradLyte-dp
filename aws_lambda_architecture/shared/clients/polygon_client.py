@@ -7,70 +7,85 @@ import requests
 import logging
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional
-from massive import RESTClient
+from polygon import RESTClient
 from decimal import Decimal
 import boto3
 import re
 from botocore.client import Config
 from concurrent import futures
 import os
-from dotenv import load_dotenv
+import asyncio
+import aiohttp
 
 from ..models.data_models import OHLCVData
 
 logger = logging.getLogger(__name__)
-
-load_dotenv()
 
 
 class PolygonClient:
     """
     Polygon.io API client optimized for AWS Lambda usage
     """
+
+    TRADABLE_TYPES = [
+        'CS',
+        'ADRC',
+        'ETF',
+        'ETV',
+        'PFD',
+    ]
+
+    NA_EXCHANGES = [
+        'XNYS',
+        'XNAS',
+        'XASE',
+        'ARCX',
+        'BATS',
+        'XNMS',
+        'XNCM',
+    ]
     
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.client = RESTClient(api_key=self.api_key)
         self.base_url = "https://api.polygon.io"
     
-    def get_active_symbols(self, limit: int = 100) -> List[str]:
+    def get_active_symbols(self, limit: int = None) -> List[str]:
         """
-        Get active stock symbols for data fetching
-        Returns a limited list suitable for AWS Lambda batch processing
+        Get active tradable symbols for data fetching.
         
         Args:
-            limit: Maximum number of symbols to return
+            limit: Optional maximum number of symbols (None = return all)
             
         Returns:
             List of stock symbols
         """
         try:
+            # Polygon max page size is 1000; SDK handles pagination iterator.
             tickers_response = self.client.list_tickers(
                 market="stocks",
                 active=True,
-                limit=limit
+                limit=1000
             )
-            # Filter for common stocks on major exchanges
+
             symbols = [
-                ticker.ticker for ticker in tickers_response 
-                if ticker.type in ['CS', 'ADRC'] 
-                and ticker.primary_exchange in ['XNYS', 'XNAS', 'XAMS']
+                ticker.ticker for ticker in tickers_response
+                if ticker.type in self.TRADABLE_TYPES
+                and (ticker.primary_exchange in self.NA_EXCHANGES or ticker.primary_exchange is None)
             ]
             
             if symbols:
                 logger.info(f"Retrieved {len(symbols)} active symbols from API")
-                return symbols[:limit]  # Ensure we don't exceed the limit
+                return symbols[:limit] if limit is not None else symbols
             else:
                 logger.warning("No symbols returned from API, using fallback")
-                # Fallback to default symbols (weekend-safe)
-                fallback_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "JPM", "V", "JNJ"]
-                return fallback_symbols[:limit]
+                fallback_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "SPY", "QQQ", "IWM"]
+                return fallback_symbols[:limit] if limit is not None else fallback_symbols
             
         except Exception as e:
             logger.error(f"Error fetching active symbols: {e}")
-            # Fallback to default symbols (weekend-safe)
-            fallback_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "JPM", "V", "JNJ"]
-            return fallback_symbols[:limit]
+            fallback_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "SPY", "QQQ", "IWM"]
+            return fallback_symbols[:limit] if limit is not None else fallback_symbols
     
     def fetch_meta(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
@@ -218,6 +233,173 @@ class PolygonClient:
         
         logger.info(f"Successfully fetched OHLCV data for {len(results)}/{len(symbols)} symbols")
         return results
+
+    async def fetch_ohlcv_data_async(
+        self,
+        session: aiohttp.ClientSession,
+        symbol: str,
+        target_date: date,
+        timespan: str = "day",
+        multiplier: int = 1
+    ) -> Optional[OHLCVData]:
+        """Async fetch OHLCV data for one symbol and date."""
+        try:
+            date_str = target_date.strftime('%Y-%m-%d')
+            url = f"{self.base_url}/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{date_str}/{date_str}"
+            params = {'apiKey': self.api_key, 'adjusted': 'true'}
+
+            async with session.get(url, params=params) as response:
+                if response.status != 200:
+                    logger.warning(f"API request failed for {symbol} with status {response.status}")
+                    return None
+
+                data = await response.json()
+                results = data.get('results', [])
+                if not results:
+                    return None
+
+                bar = results[0]
+                return OHLCVData(
+                    symbol=symbol,
+                    timestamp=datetime.fromtimestamp(bar['t'] / 1000),
+                    open=Decimal(str(bar['o'])),
+                    high=Decimal(str(bar['h'])),
+                    low=Decimal(str(bar['l'])),
+                    close=Decimal(str(bar['c'])),
+                    volume=int(bar['v']),
+                    interval=f"{multiplier}{timespan[0]}"
+                )
+        except Exception as e:
+            logger.error(f"Error fetching OHLCV data for {symbol} on {target_date}: {e}")
+            return None
+
+    async def fetch_batch_ohlcv_data_async(
+        self,
+        symbols: List[str],
+        target_date: date,
+        max_concurrent: int = 10
+    ) -> List[OHLCVData]:
+        """Async fetch OHLCV data for multiple symbols concurrently."""
+        connector = aiohttp.TCPConnector(limit=max_concurrent)
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            tasks = [
+                self.fetch_ohlcv_data_async(session, symbol, target_date)
+                for symbol in symbols
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            ohlcv_list: List[OHLCVData] = []
+            failed_symbols = []
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Exception for {symbol}: {str(result)}")
+                    failed_symbols.append(symbol)
+                elif result is not None:
+                    ohlcv_list.append(result)
+                else:
+                    failed_symbols.append(symbol)
+
+            if failed_symbols:
+                logger.warning(f"Failed to fetch {len(failed_symbols)} symbols: {failed_symbols[:10]}...")
+
+            logger.info(f"Successfully fetched OHLCV data for {len(ohlcv_list)}/{len(symbols)} symbols (async)")
+            return ohlcv_list
+
+    async def fetch_historical_ohlcv_async(
+        self,
+        session: aiohttp.ClientSession,
+        symbol: str,
+        from_date: date,
+        to_date: date,
+        timespan: str = "day",
+        multiplier: int = 1
+    ) -> List[OHLCVData]:
+        """Async fetch OHLCV data for a date range."""
+        try:
+            from_str = from_date.strftime('%Y-%m-%d')
+            to_str = to_date.strftime('%Y-%m-%d')
+            url = f"{self.base_url}/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from_str}/{to_str}"
+            params = {
+                'apiKey': self.api_key,
+                'adjusted': 'true',
+                'sort': 'asc',
+                'limit': 50000
+            }
+
+            async with session.get(url, params=params) as response:
+                if response.status != 200:
+                    logger.warning(f"API request failed for {symbol} with status {response.status}")
+                    return []
+
+                data = await response.json()
+                results = data.get('results', [])
+                if not results:
+                    return []
+
+                ohlcv_list = []
+                for bar in results:
+                    try:
+                        ohlcv_list.append(
+                            OHLCVData(
+                                symbol=symbol,
+                                timestamp=datetime.fromtimestamp(bar['t'] / 1000),
+                                open=Decimal(str(bar['o'])),
+                                high=Decimal(str(bar['h'])),
+                                low=Decimal(str(bar['l'])),
+                                close=Decimal(str(bar['c'])),
+                                volume=int(bar['v']),
+                                interval=f"{multiplier}{timespan[0]}"
+                            )
+                        )
+                    except Exception as parse_error:
+                        logger.warning(f"Error parsing bar for {symbol}: {parse_error}")
+                return ohlcv_list
+        except Exception as e:
+            logger.error(f"Error fetching historical OHLCV for {symbol}: {e}")
+            return []
+
+    async def fetch_batch_historical_ohlcv_async(
+        self,
+        symbols: List[str],
+        from_date: date,
+        to_date: date,
+        max_concurrent: int = 5,
+        timespan: str = "day",
+        multiplier: int = 1
+    ) -> Dict[str, List[OHLCVData]]:
+        """Async fetch historical OHLCV data for multiple symbols."""
+        connector = aiohttp.TCPConnector(limit=max_concurrent)
+        timeout = aiohttp.ClientTimeout(total=120)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            tasks = [
+                self.fetch_historical_ohlcv_async(session, symbol, from_date, to_date, timespan, multiplier)
+                for symbol in symbols
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            symbol_data: Dict[str, List[OHLCVData]] = {}
+            failed_symbols = []
+            total_records = 0
+
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Exception for {symbol}: {str(result)}")
+                    failed_symbols.append(symbol)
+                    symbol_data[symbol] = []
+                elif result:
+                    symbol_data[symbol] = result
+                    total_records += len(result)
+                else:
+                    failed_symbols.append(symbol)
+                    symbol_data[symbol] = []
+
+            logger.info(f"Historical backfill fetched {total_records:,} records across {len(symbols)} symbols")
+            if failed_symbols:
+                logger.warning(f"Failed symbols ({len(failed_symbols)}): {failed_symbols[:10]}...")
+            return symbol_data
     
     def get_market_status(self) -> Dict[str, Any]:
         """

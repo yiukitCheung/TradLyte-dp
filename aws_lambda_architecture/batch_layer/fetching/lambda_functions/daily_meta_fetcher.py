@@ -15,7 +15,7 @@ from typing import Dict, Any, List, Optional
 
 # Import shared utilities (no layer dependencies)
 from shared.clients.polygon_client import PolygonClient
-from shared.clients.rds_timescale_client import RDSPostgresClient
+from shared.clients.rds_timescale_client import RDSTimescaleClient
 
 # Configure logging
 logger = logging.getLogger()
@@ -125,7 +125,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         
         # Initialize clients
         polygon_client = PolygonClient(api_key=polygon_api_key)
-        rds_client = RDSPostgresClient(
+        rds_client = RDSTimescaleClient(
             endpoint=rds_credentials.get('host') or rds_credentials.get('endpoint'),
             username=rds_credentials['username'],
             password=rds_credentials['password'],
