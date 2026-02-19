@@ -75,6 +75,16 @@ Local development environment for rapid prototyping:
 
 **Current Focus:** Batch Layer testing → Serving Layer implementation
 
+## License And Usage
+
+This repository is published for visibility only. It is **private intellectual property** of the owner and is **not open source**.
+
+- You may view the code on GitHub.
+- You may **not** copy, modify, distribute, sublicense, sell, or use this code for commercial or non-commercial purposes without explicit written permission from the owner.
+- All rights are reserved by the owner.
+
+See the `LICENSE` file for full legal terms.
+
 ## Related Projects
 
 - **[TradLyte Frontend](https://github.com/yiukitCheung/TradLyte-frontend.git)** - React frontend application
@@ -112,6 +122,6 @@ TradLyte-dp/
 
 ---
 
-**Private Commercial Project**  
+**Private Proprietary Project (All Rights Reserved)**  
 **Maintained by:** TradLyte Development Team  
 **Last Updated:** January 2026
