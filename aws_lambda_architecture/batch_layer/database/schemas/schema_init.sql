@@ -214,15 +214,52 @@ COMMENT ON COLUMN data_ingestion_watermark.ingested_at IS 'Timestamp when this r
 COMMENT ON COLUMN data_ingestion_watermark.records_count IS 'Records processed in this specific update';
 COMMENT ON COLUMN data_ingestion_watermark.is_current IS 'TRUE if current watermark (enforced: only 1 per symbol)';
 
+-- ============================================================================
+-- SECTION 5: SCANNER LAYER
+-- ============================================================================
+-- Ranked top picks produced by the daily scanner run
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS stock_picks (
+    scan_date DATE NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank > 0),
+    symbol VARCHAR(50) NOT NULL,
+    strategy_name VARCHAR(255) NOT NULL,
+    signal VARCHAR(10) NOT NULL CHECK (signal IN ('BUY', 'SELL', 'HOLD')),
+    price DECIMAL(12,4) NOT NULL,
+    confidence DECIMAL(5,4) NOT NULL DEFAULT 0.0 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    score DECIMAL(8,6) NOT NULL DEFAULT 0.0,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (scan_date, rank),
+    UNIQUE (scan_date, symbol, strategy_name)
+);
+
+COMMENT ON TABLE stock_picks IS 'Ranked top picks produced by the daily scanner  run';
+COMMENT ON COLUMN stock_picks.scan_date IS 'Market date for this ranked scan output';
+COMMENT ON COLUMN stock_picks.rank IS 'Ranking position (1 = best)';
+COMMENT ON COLUMN stock_picks.symbol IS 'Stock ticker symbol';
+COMMENT ON COLUMN stock_picks.strategy_name IS 'Strategy that generated this pick';
+COMMENT ON COLUMN stock_picks.signal IS 'Signal type from strategy output';
+COMMENT ON COLUMN stock_picks.price IS 'Signal price';
+COMMENT ON COLUMN stock_picks.confidence IS 'Raw model/strategy confidence';
+COMMENT ON COLUMN stock_picks.score IS 'Composite ranking score used for top-pick ordering';
+COMMENT ON COLUMN stock_picks.metadata IS 'Additional ranking and strategy context';
+
+CREATE INDEX IF NOT EXISTS idx_stock_picks_date_rank
+ON stock_picks(scan_date, rank);
+
+CREATE INDEX IF NOT EXISTS idx_stock_picks_symbol_date
+ON stock_picks(symbol, scan_date);
 
 -- ============================================================================
--- SECTION 5: PERFORMANCE INDEXES
+-- SECTION 6: PERFORMANCE INDEXES
 -- ============================================================================
 -- Indexes optimized for time-series queries and Lambda operations
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
--- 5A: Bronze Layer Indexes (raw_ohlcv)
+-- 6A: Bronze Layer Indexes (raw_ohlcv)
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_raw_ohlcv_symbol_timestamp ON raw_ohlcv(symbol, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_raw_ohlcv_timestamp ON raw_ohlcv(timestamp DESC);
@@ -230,7 +267,7 @@ CREATE INDEX IF NOT EXISTS idx_raw_ohlcv_interval ON raw_ohlcv(interval);
 CREATE INDEX IF NOT EXISTS idx_raw_ohlcv_symbol ON raw_ohlcv(symbol);
 
 -- ---------------------------------------------------------------------------
--- 5B: Silver Layer Indexes (Fibonacci resampled tables)
+-- 6B: Silver Layer Indexes (Fibonacci resampled tables)
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_silver_3d_symbol_date ON silver_3d(symbol, date DESC);
 CREATE INDEX IF NOT EXISTS idx_silver_3d_date ON silver_3d(date DESC);
@@ -251,14 +288,14 @@ CREATE INDEX IF NOT EXISTS idx_silver_34d_symbol_date ON silver_34d(symbol, date
 CREATE INDEX IF NOT EXISTS idx_silver_34d_date ON silver_34d(date DESC);
 
 -- ---------------------------------------------------------------------------
--- 5C: Metadata Layer Indexes
+-- 6C: Metadata Layer Indexes
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_symbol_metadata_active ON symbol_metadata(active);
 CREATE INDEX IF NOT EXISTS idx_symbol_metadata_type ON symbol_metadata(type);
 CREATE INDEX IF NOT EXISTS idx_symbol_metadata_market ON symbol_metadata(market);
 
 -- ---------------------------------------------------------------------------
--- 5D: Operational Metadata Indexes
+-- 6D: Operational Metadata Indexes
 -- ---------------------------------------------------------------------------
 -- Batch Jobs indexes
 CREATE INDEX IF NOT EXISTS idx_batch_jobs_job_type ON batch_jobs(job_type);
@@ -284,7 +321,7 @@ WHERE is_current = TRUE;
 
 
 -- ============================================================================
--- SECTION 6: TABLE STATISTICS UPDATE
+-- SECTION 7: TABLE STATISTICS UPDATE
 -- ============================================================================
 -- Update PostgreSQL query planner statistics for optimal query performance
 -- ============================================================================
@@ -302,7 +339,7 @@ ANALYZE data_ingestion_watermark;
 
 
 -- ============================================================================
--- SECTION 7: VERIFICATION QUERIES
+-- SECTION 8: VERIFICATION QUERIES
 -- ============================================================================
 -- Run these queries to verify successful schema creation
 -- ============================================================================
@@ -367,7 +404,7 @@ LIMIT 5;
 
 
 -- ============================================================================
--- SECTION 8: SUCCESS MESSAGE
+-- SECTION 9: SUCCESS MESSAGE
 -- ============================================================================
 
 DO $$

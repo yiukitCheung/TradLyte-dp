@@ -5,9 +5,8 @@ Runs pre-built strategies on all active symbols and generates signals.
 Used by AWS Batch job for daily scanning.
 """
 
-import polars as pl
 from typing import List, Dict, Any, Optional
-from datetime import date, datetime
+from datetime import date, timedelta
 from .models import SignalResult
 from .strategies.base import BaseStrategy
 from .executor import MultiTimeframeExecutor
@@ -23,11 +22,21 @@ class DailyScanner:
     Loads active symbols, runs pre-built strategies, and generates signals.
     """
     
-    def __init__(self, rds_connection_string: Optional[str] = None):
+    def __init__(
+        self,
+        rds_connection_string: Optional[str] = None,
+        s3_bucket: Optional[str] = None,
+        use_s3: bool = False,
+        lookback_days: int = 365
+    ):
         """
         Initialize scanner. Data is loaded from RDS (1d); resampled timeframes
         are computed at use from 1d.
         """
+        # Kept for backward compatibility with existing callers.
+        self.s3_bucket = s3_bucket
+        self.use_s3 = use_s3
+        self.lookback_days = lookback_days
         self.executor = MultiTimeframeExecutor(rds_connection_string=rds_connection_string)
     
     def get_active_symbols(self, rds_client) -> List[str]:
@@ -59,13 +68,34 @@ class DailyScanner:
             VegasChannelStrategy(),
         ]
         return strategies
+
+    def get_required_timeframes(self, strategy: BaseStrategy, base_timeframe: str = "1d") -> List[str]:
+        """
+        Infer required timeframes from strategy definition.
+
+        - Expandable strategies: union of enabled step timeframes + base timeframe
+        - Legacy strategies: use `required_timeframes` if present, otherwise base timeframe only
+        """
+        timeframes = {base_timeframe}
+
+        if getattr(strategy, "_use_expandable_mode", False) and getattr(strategy, "steps", None):
+            for step in strategy.steps:
+                if getattr(step, "enabled", True):
+                    timeframes.add(step.timeframe)
+        elif hasattr(strategy, "required_timeframes"):
+            configured = getattr(strategy, "required_timeframes") or []
+            for tf in configured:
+                timeframes.add(str(tf))
+
+        return sorted(timeframes)
     
     def scan_symbol(
         self,
         symbol: str,
         strategy: BaseStrategy,
         scan_date: date,
-        rds_client
+        rds_client,
+        base_timeframe: str = "1d"
     ) -> Optional[SignalResult]:
         """
         Run a single strategy on a single symbol
@@ -80,12 +110,10 @@ class DailyScanner:
             SignalResult if signal generated, None otherwise
         """
         try:
-            # Determine required timeframes (simplified - use 1d for now)
-            # In practice, strategies could specify their timeframes
-            timeframes = ['1d']
+            timeframes = self.get_required_timeframes(strategy, base_timeframe=base_timeframe)
             
             # Load data (last 200 days for indicators)
-            start_date = date(scan_date.year - 1, scan_date.month, scan_date.day)
+            start_date = scan_date - timedelta(days=self.lookback_days)
             end_date = scan_date
             
             # Execute strategy
@@ -95,7 +123,7 @@ class DailyScanner:
                 timeframes=timeframes,
                 start_date=start_date,
                 end_date=end_date,
-                base_timeframe="1d",
+                base_timeframe=base_timeframe,
             )
             
             if result_df.height == 0:
@@ -118,7 +146,9 @@ class DailyScanner:
                 confidence=self._calculate_confidence(latest_signal),
                 metadata={
                     'strategy_name': strategy.name,
-                    'description': strategy.description
+                    'description': strategy.description,
+                    'timeframes': timeframes,
+                    'base_timeframe': base_timeframe
                 }
             )
             
@@ -131,7 +161,8 @@ class DailyScanner:
         symbols: List[str],
         strategies: List[BaseStrategy],
         scan_date: date,
-        rds_client
+        rds_client,
+        base_timeframe: str = "1d"
     ) -> List[SignalResult]:
         """
         Scan multiple symbols with multiple strategies
@@ -153,13 +184,59 @@ class DailyScanner:
                     symbol=symbol,
                     strategy=strategy,
                     scan_date=scan_date,
-                    rds_client=rds_client
+                    rds_client=rds_client,
+                    base_timeframe=base_timeframe
                 )
                 
                 if signal:
                     signals.append(signal)
         
         return signals
+
+    def rank_signals(
+        self,
+        signals: List[SignalResult],
+        top_k: int = 10,
+        unique_symbol: bool = True
+    ) -> List[SignalResult]:
+        """
+        Rank signals and return top picks.
+
+        Default score (adjustable when your explicit criteria is ready):
+        score = confidence + 0.15*setup_valid + 0.15*trigger_met + 0.1*(signal == BUY)
+        """
+        if not signals:
+            return []
+
+        scored: List[tuple[float, SignalResult]] = []
+        for signal in signals:
+            confidence = float(signal.confidence or 0.0)
+            score = confidence
+            if signal.setup_valid:
+                score += 0.15
+            if signal.trigger_met:
+                score += 0.15
+            if signal.signal == "BUY":
+                score += 0.10
+
+            metadata = dict(signal.metadata or {})
+            metadata["ranking_score"] = min(score, 1.5)
+            signal.metadata = metadata
+            scored.append((score, signal))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        ranked: List[SignalResult] = []
+        seen_symbols: set[str] = set()
+        for _, signal in scored:
+            if unique_symbol and signal.symbol in seen_symbols:
+                continue
+            ranked.append(signal)
+            seen_symbols.add(signal.symbol)
+            if len(ranked) >= top_k:
+                break
+
+        return ranked
     
     def write_signals_to_rds(
         self,
@@ -180,10 +257,8 @@ class DailyScanner:
             return 0
         
         try:
-            # Build INSERT query
-            values = []
-            for signal in signals:
-                values.append((
+            values = [
+                (
                     signal.symbol,
                     signal.date,
                     signal.metadata.get('strategy_name', 'Unknown'),
@@ -193,7 +268,9 @@ class DailyScanner:
                     signal.setup_valid,
                     signal.trigger_met,
                     str(signal.metadata) if signal.metadata else '{}'
-                ))
+                )
+                for signal in signals
+            ]
             
             # Use INSERT ... ON CONFLICT to handle duplicates
             query = """
@@ -211,23 +288,93 @@ class DailyScanner:
                 created_at = CURRENT_TIMESTAMP
             """
             
-            # Execute query (assuming rds_client has execute_query method)
-            if hasattr(rds_client, 'execute_query'):
+            # Prefer bulk execution via connection when available.
+            conn = None
+            if hasattr(rds_client, 'connection'):
+                conn = rds_client.connection
+            elif hasattr(rds_client, 'conn'):
+                conn = rds_client.conn
+
+            if conn:
+                with conn.cursor() as cur:
+                    cur.executemany(query, values)
+                conn.commit()
+            elif hasattr(rds_client, 'execute_query'):
                 for value_tuple in values:
                     rds_client.execute_query(query, value_tuple)
             else:
-                # Fallback: use connection directly
-                import psycopg2
-                conn = rds_client.conn if hasattr(rds_client, 'conn') else None
-                if conn:
-                    with conn.cursor() as cur:
-                        cur.executemany(query, values)
-                    conn.commit()
+                raise ValueError("Unsupported rds_client. Expected connection/conn or execute_query()")
             
             return len(signals)
             
         except Exception as e:
             print(f"Error writing signals to RDS: {str(e)}")
+            raise
+
+    def write_top_picks_to_rds(
+        self,
+        top_picks: List[SignalResult],
+        scan_date: date,
+        rds_client
+    ) -> int:
+        """
+        Persist top picks into `daily_scan_top_picks` for app consumption.
+        """
+        if not top_picks:
+            return 0
+
+        try:
+            values = []
+            for rank, signal in enumerate(top_picks, start=1):
+                strategy_name = signal.metadata.get("strategy_name", "Unknown")
+                score = float((signal.metadata or {}).get("ranking_score", signal.confidence or 0.0))
+                values.append((
+                    signal.date or scan_date.isoformat(),
+                    rank,
+                    signal.symbol,
+                    strategy_name,
+                    signal.signal,
+                    signal.price,
+                    float(signal.confidence or 0.0),
+                    score,
+                    str(signal.metadata) if signal.metadata else "{}"
+                ))
+
+            query = """
+            INSERT INTO daily_scan_top_picks
+            (scan_date, rank, symbol, strategy_name, signal, price, confidence, score, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (scan_date, rank)
+            DO UPDATE SET
+                symbol = EXCLUDED.symbol,
+                strategy_name = EXCLUDED.strategy_name,
+                signal = EXCLUDED.signal,
+                price = EXCLUDED.price,
+                confidence = EXCLUDED.confidence,
+                score = EXCLUDED.score,
+                metadata = EXCLUDED.metadata,
+                created_at = CURRENT_TIMESTAMP
+            """
+
+            conn = None
+            if hasattr(rds_client, "connection"):
+                conn = rds_client.connection
+            elif hasattr(rds_client, "conn"):
+                conn = rds_client.conn
+
+            if conn:
+                with conn.cursor() as cur:
+                    cur.executemany(query, values)
+                conn.commit()
+            elif hasattr(rds_client, "execute_query"):
+                for value_tuple in values:
+                    rds_client.execute_query(query, value_tuple)
+            else:
+                raise ValueError("Unsupported rds_client. Expected connection/conn or execute_query()")
+
+            return len(top_picks)
+        except Exception as e:
+            print(f"Error writing top picks to RDS: {str(e)}")
             raise
     
     def _calculate_confidence(self, signal_data: Dict[str, Any]) -> float:

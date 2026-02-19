@@ -6,11 +6,11 @@ No S3 loading; resampling is done in memory from 1d data.
 """
 
 import polars as pl
-from typing import Optional
+from typing import Optional, Union, List
 from datetime import date
 
 
-def resample_ohlcv_1d_to_nd(df_1d: pl.DataFrame, interval_days: int) -> pl.DataFrame:
+def resample_ohlcv(df_1d: pl.DataFrame, interval_days: int) -> pl.DataFrame:
     """
     Resample 1d OHLCV to Nd (e.g. 3d, 5d) using Polars group_by_dynamic.
 
@@ -38,7 +38,7 @@ def resample_ohlcv_1d_to_nd(df_1d: pl.DataFrame, interval_days: int) -> pl.DataF
     return out
 
 
-def load_ohlcv_from_rds(
+def load_ohlcv(
     symbol: str,
     connection_string: str,
     start_date: Optional[date] = None,
@@ -87,7 +87,7 @@ def load_ohlcv_from_rds(
                 "ts_p": "timestamp",
             })
             if "timestamp" in df.columns:
-                df = df.with_columns(pl.col("ts_p").dt.date().alias("date"))
+                df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
             return df
 
         # Direct table query with date range
@@ -110,65 +110,128 @@ def load_ohlcv_from_rds(
         raise ValueError(f"Error loading {symbol} from RDS: {str(e)}")
 
 # ============================================================================
-# Multi-Timeframe Data Loading (RDS only; resample at use)
+# Multi-Timeframe: single source RDS (1d), map to requested timeframe at use
 # ============================================================================
 
-TIMEFRAME_TABLE_MAP = {'1d': 'raw_ohlcv'}
-RESAMPLED_TIMEFRAMES = ('3d', '5d', '8d', '13d', '21d', '34d')
+RDS_TABLE_1D = "raw_ohlcv"
+RESAMPLED_TIMEFRAMES = ("1d", "3d", "5d", "8d", "13d", "21d", "34d")
+
+# Canonical column order so 1d and resampled outputs can be concatenated safely
+CANONICAL_OHLCV_COLUMNS = ["date", "open", "high", "low", "close", "volume", "symbol"]
+
+
+def _normalize_ohlcv_schema(df: pl.DataFrame, symbol: str) -> pl.DataFrame:
+    """Ensure same columns and order for 1d and resampled paths (avoids vstack errors)."""
+    if df.is_empty():
+        return df
+    if "date" not in df.columns and "timestamp" in df.columns:
+        df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
+    if "symbol" not in df.columns:
+        df = df.with_columns(pl.lit(symbol).alias("symbol"))
+    # Keep only canonical columns in fixed order (drop timestamp if present)
+    existing = [c for c in CANONICAL_OHLCV_COLUMNS if c in df.columns]
+    return df.select(existing)
+
+
+def _load_one_timeframe(
+    symbol: str,
+    timeframe: str,
+    connection_string: str,
+    start_date: Optional[date],
+    end_date: Optional[date],
+    days: Optional[int],
+) -> pl.DataFrame:
+    """Load and return one timeframe as normalized DataFrame (single string only)."""
+    timeframe = timeframe.strip().lower()
+    if timeframe == "1d":
+        df = load_ohlcv(
+            symbol=symbol,
+            connection_string=connection_string,
+            start_date=start_date,
+            end_date=end_date,
+            table_name=RDS_TABLE_1D,
+            days=days,
+        )
+        return _normalize_ohlcv_schema(df, symbol)
+    if timeframe in RESAMPLED_TIMEFRAMES and timeframe != "1d":
+        interval_days = int(timeframe.rstrip("d").strip())
+        if interval_days < 2:
+            raise ValueError(f"Resampled timeframe must be 2d or more; got {timeframe!r}")
+        df = load_ohlcv(
+            symbol=symbol,
+            connection_string=connection_string,
+            start_date=start_date,
+            end_date=end_date,
+            table_name=RDS_TABLE_1D,
+            days=days,
+        )
+        df = resample_ohlcv(df, interval_days)
+        return _normalize_ohlcv_schema(df, symbol)
+    raise ValueError(f"Invalid timeframe: {timeframe!r}; use '1d', '3d', '5d', etc.")
 
 
 def load_ohlcv_by_timeframe(
     symbol: str,
-    timeframe: str,
+    timeframe: Union[str, List[str]],
     connection_string: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     days: Optional[int] = None,
 ) -> pl.DataFrame:
     """
-    Load OHLCV by timeframe: 1d from RDS; 3d, 5d, etc. from RDS 1d then resampled at use.
+    Load OHLCV for one or more timeframes. Source is always RDS (raw 1d); we map to the
+    requested timeframe(s) at use.
 
-    - 1d: loads from RDS raw_ohlcv.
-    - 3d, 5d, 8d, ...: loads 1d from RDS for the range, then resamples in memory.
+    - timeframe: single string (e.g. '1d', '3d') or list of strings (e.g. ['1d', '3d']).
+      When a list is passed, returns one combined DataFrame with an extra "timeframe" column.
+    - Data source: RDS only (table raw_ohlcv, daily bars).
+    - 1d: return 1d from RDS as-is.
+    - 3d, 5d, 8d, ...: load 1d from RDS for the range, then resample in memory.
+
+    Returns a DataFrame with canonical columns: date, open, high, low, close, volume, symbol
+    (and "timeframe" when multiple timeframes are requested).
 
     Args:
         symbol: Stock symbol (e.g., 'AAPL')
-        timeframe: '1d' or '3d', '5d', '8d', '13d', '21d', '34d'
+        timeframe: '1d', '3d', ... or ['1d', '3d', ...]
         connection_string: PostgreSQL connection (required)
-        start_date: Start date (required for resampled; optional for 1d if days set)
-        end_date: End date (required for resampled; optional for 1d if days set)
-        days: If set, fetch last N days (1d only; for resampled use start_date/end_date)
+        start_date: Start date (required for non-1d; optional for 1d if days set)
+        end_date: End date (required for non-1d; optional for 1d if days set)
+        days: Last N days (1d only; ignored for 3d, 5d, etc.)
 
     Returns:
-        Polars DataFrame with OHLCV and date column
+        Polars DataFrame with columns: date, open, high, low, close, volume, symbol [, timeframe]
     """
     if not connection_string:
-        raise ValueError("connection_string (RDS) is required for all timeframes.")
-    if timeframe == "1d":
-        df = load_ohlcv_from_rds(
-            symbol=symbol,
-            connection_string=connection_string,
-            start_date=start_date,
-            end_date=end_date,
-            table_name=TIMEFRAME_TABLE_MAP["1d"],
-            days=days,
-        )
-    else:
-        x = timeframe.rstrip("d") if isinstance(timeframe, str) else str(timeframe)
-        try:
-            interval_days = int(x)
-        except ValueError:
-            raise ValueError(f"Invalid timeframe: {timeframe}")
-        if not start_date or not end_date:
-            raise ValueError("Resampled timeframes require start_date and end_date.")
-        df = load_ohlcv_from_rds(
-            symbol=symbol,
-            connection_string=connection_string,
-            start_date=start_date,
-            end_date=end_date,
-            table_name=TIMEFRAME_TABLE_MAP["1d"],
-        )
-        df = resample_ohlcv_1d_to_nd(df, interval_days)
-    if df.height > 0 and "date" not in df.columns and "timestamp" in df.columns:
-        df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
-    return df
+        raise ValueError("connection_string (RDS) is required.")
+    # Accept single string or list (e.g. notebook passes timeframes = ['1d', '3d'])
+    if isinstance(timeframe, (list, tuple)):
+        if not timeframe:
+            raise ValueError("timeframe list must not be empty")
+        parts = []
+        for t in timeframe:
+            t_str = t.strip().lower() if isinstance(t, str) else str(t).strip().lower()
+            df = _load_one_timeframe(
+                symbol=symbol,
+                timeframe=t_str,
+                connection_string=connection_string,
+                start_date=start_date,
+                end_date=end_date,
+                days=days,
+            )
+            if not df.is_empty():
+                df = df.with_columns(pl.lit(t_str).alias("timeframe"))
+                parts.append(df)
+        if not parts:
+            return pl.DataFrame()
+        return pl.concat(parts, how="vertical")
+    if not isinstance(timeframe, str):
+        raise ValueError("timeframe must be a string or list of strings (e.g. '1d' or ['1d', '3d'])")
+    return _load_one_timeframe(
+        symbol=symbol,
+        timeframe=timeframe.strip().lower(),
+        connection_string=connection_string,
+        start_date=start_date,
+        end_date=end_date,
+        days=days,
+    )

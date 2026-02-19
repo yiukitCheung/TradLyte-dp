@@ -9,12 +9,12 @@ import os
 import sys
 import logging
 from datetime import date, datetime
-from typing import List, Optional
+from typing import Optional
 import boto3
 import json
 
-# Add shared directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
+# Add project root (aws_lambda_architecture) to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../..'))
 
 from shared.analytics_core.scanner import DailyScanner
 from shared.clients.rds_timescale_client import RDSTimescaleClient
@@ -117,6 +117,10 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         )
         
         logger.info(f"   Generated {len(signals)} signals")
+
+        logger.info("🏆 Ranking top picks...")
+        top_picks = scanner.rank_signals(signals=signals, top_k=10, unique_symbol=True)
+        logger.info(f"   Selected {len(top_picks)} top picks")
         
         # Write signals to RDS
         if signals:
@@ -126,6 +130,14 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         else:
             logger.info("   No signals to write")
             written_count = 0
+
+        if top_picks:
+            logger.info("💾 Writing top picks to daily_scan_top_picks table...")
+            picks_written = scanner.write_top_picks_to_rds(top_picks, scan_date, rds_client)
+            logger.info(f"   Wrote {picks_written} ranked picks to database")
+        else:
+            picks_written = 0
+            logger.info("   No ranked picks to write")
         
         # Close RDS connection
         rds_client.close()
@@ -138,6 +150,7 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         logger.info(f"   Strategies run: {len(strategies)}")
         logger.info(f"   Signals generated: {len(signals)}")
         logger.info(f"   Signals written: {written_count}")
+        logger.info(f"   Top picks written: {picks_written}")
         logger.info(f"⏰ End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         return written_count

@@ -21,7 +21,7 @@ __version__ = "0.1.0"
 
 from .strategies.base import BaseStrategy
 from .strategies.builder import CompositeStrategy
-from .inputs import load_ohlcv_from_rds, load_ohlcv_by_timeframe, resample_ohlcv_1d_to_nd
+from .inputs import load_ohlcv, load_ohlcv_by_timeframe, resample_ohlcv
 from .models import (
     StrategyConfig, SetupConfig, TriggerConfig, ExitConfig,
     RequirementsStrategyConfig, ExpandableStrategyConfig, StepConfig,
@@ -41,8 +41,8 @@ __all__ = [
     'Position',
     'DailyScanner',
     # Data loading
-    'resample_ohlcv_1d_to_nd',
-    'load_ohlcv_from_rds',
+    'resample_ohlcv',
+    'load_ohlcv',
     'load_ohlcv_by_timeframe',
     # Models (legacy)
     'StrategyConfig',
