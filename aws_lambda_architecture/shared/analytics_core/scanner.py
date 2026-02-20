@@ -5,8 +5,9 @@ Runs pre-built strategies on all active symbols and generates signals.
 Used by AWS Batch job for daily scanning.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from datetime import date, timedelta
+from collections import defaultdict
 from .models import SignalResult
 from .strategies.base import BaseStrategy
 from .executor import MultiTimeframeExecutor
@@ -68,6 +69,148 @@ class DailyScanner:
             VegasChannelStrategy(),
         ]
         return strategies
+
+    def get_pick_profiles(self) -> List[Dict[str, Any]]:
+        """
+        Active pick profiles (touch strategy intentionally excluded for now):
+        - vegas short-term / long-term
+        - golden-cross short-term / long-term
+        """
+        return [
+            {
+                "pick_type": "vegas_short_term",
+                "strategy_factory": VegasChannelStrategy,
+                "strategy_name": "Vegas Channel",
+                "timeframes": ["1d", "3d", "5d"],
+                "term": "short",
+            },
+            {
+                "pick_type": "vegas_long_term",
+                "strategy_factory": VegasChannelStrategy,
+                "strategy_name": "Vegas Channel",
+                "timeframes": ["8d", "13d", "21d", "34d"],
+                "term": "long",
+            },
+            {
+                "pick_type": "golden_cross_short_term",
+                "strategy_factory": GoldenCrossStrategy,
+                "strategy_name": "Golden Cross",
+                "timeframes": ["1d", "3d", "5d"],
+                "term": "short",
+            },
+            {
+                "pick_type": "golden_cross_long_term",
+                "strategy_factory": GoldenCrossStrategy,
+                "strategy_name": "Golden Cross",
+                "timeframes": ["8d", "13d", "21d", "34d"],
+                "term": "long",
+            },
+        ]
+
+    def _build_term_weights(self, timeframes: List[str]) -> Dict[str, float]:
+        """
+        Rank-based weights: later/higher timeframe in each term gets higher weight.
+        Example short-term ['1d','3d','5d'] => {1d:1, 3d:2, 5d:3}
+        """
+        return {tf: float(idx + 1) for idx, tf in enumerate(timeframes)}
+
+    def _score_multi_timeframe_signal(
+        self,
+        symbol: str,
+        strategy: BaseStrategy,
+        scan_date: date,
+        timeframes: List[str]
+    ) -> Optional[SignalResult]:
+        """
+        Run one strategy over multiple timeframes and combine into one weighted signal.
+
+        Note:
+        - Touch-related logic is intentionally ignored for now (placeholder for later).
+        - Only BUY-side picks are returned for scanner output.
+        """
+        start_date = scan_date - timedelta(days=self.lookback_days)
+        end_date = scan_date
+        weights = self._build_term_weights(timeframes)
+        weighted_score = 0.0
+        weighted_setup = 0.0
+        weighted_trigger = 0.0
+        weighted_price = 0.0
+        total_weight = sum(weights.values())
+        votes: Dict[str, Dict[str, Any]] = {}
+
+        for timeframe in timeframes:
+            try:
+                result_df = self.executor.execute_strategy(
+                    strategy=strategy,
+                    symbol=symbol,
+                    timeframes=[timeframe],
+                    start_date=start_date,
+                    end_date=end_date,
+                    base_timeframe=timeframe,
+                )
+                if result_df.height == 0:
+                    continue
+                latest_signal = strategy.get_latest_signal(result_df)
+                if not latest_signal:
+                    continue
+
+                weight = weights[timeframe]
+                raw_signal = latest_signal.get("signal", "HOLD")
+                setup_valid = bool(latest_signal.get("setup_valid", False))
+                trigger_met = bool(latest_signal.get("trigger_met", False))
+                price = float(latest_signal.get("price") or 0.0)
+
+                # BUY contributes positive score; SELL contributes negative score.
+                if raw_signal == "BUY":
+                    weighted_score += weight
+                elif raw_signal == "SELL":
+                    weighted_score -= weight
+
+                if setup_valid:
+                    weighted_setup += weight
+                if trigger_met and raw_signal == "BUY":
+                    weighted_trigger += weight
+                if price > 0:
+                    weighted_price += weight * price
+
+                votes[timeframe] = {
+                    "signal": raw_signal,
+                    "setup_valid": setup_valid,
+                    "trigger_met": trigger_met,
+                    "price": price,
+                    "weight": weight,
+                }
+            except Exception as timeframe_error:
+                votes[timeframe] = {"error": str(timeframe_error), "weight": weights[timeframe]}
+                continue
+
+        if total_weight <= 0:
+            return None
+
+        # Keep scanner output focused on long picks only (BUY bias).
+        if weighted_score <= 0:
+            return None
+
+        confidence = min(max(weighted_score / total_weight, 0.0), 1.0)
+        avg_price = (weighted_price / total_weight) if weighted_price > 0 else 0.0
+
+        return SignalResult(
+            symbol=symbol,
+            date=scan_date.isoformat(),
+            signal="BUY",
+            price=avg_price,
+            setup_valid=(weighted_setup > 0),
+            trigger_met=(weighted_trigger > 0),
+            confidence=confidence,
+            metadata={
+                "strategy_name": strategy.name,
+                "description": strategy.description,
+                "timeframes": timeframes,
+                "timeframe_votes": votes,
+                "weighted_score": weighted_score,
+                "total_weight": total_weight,
+            },
+        )
 
     def get_required_timeframes(self, strategy: BaseStrategy, base_timeframe: str = "1d") -> List[str]:
         """
@@ -193,6 +336,37 @@ class DailyScanner:
         
         return signals
 
+    def scan_symbols_by_pick_profiles(
+        self,
+        symbols: List[str],
+        pick_profiles: List[Dict[str, Any]],
+        scan_date: date,
+        rds_client,
+    ) -> List[SignalResult]:
+        """
+        Scan symbols using the 4 pick profiles and return aggregated pick signals.
+        """
+        signals: List[SignalResult] = []
+
+        for symbol in symbols:
+            for profile in pick_profiles:
+                strategy_factory: Callable[[], BaseStrategy] = profile["strategy_factory"]
+                strategy = strategy_factory()
+                signal = self._score_multi_timeframe_signal(
+                    symbol=symbol,
+                    strategy=strategy,
+                    scan_date=scan_date,
+                    timeframes=profile["timeframes"],
+                )
+                if signal:
+                    metadata = dict(signal.metadata or {})
+                    metadata["pick_type"] = profile["pick_type"]
+                    metadata["term"] = profile["term"]
+                    signal.metadata = metadata
+                    signals.append(signal)
+
+        return signals
+
     def rank_signals(
         self,
         signals: List[SignalResult],
@@ -237,6 +411,30 @@ class DailyScanner:
                 break
 
         return ranked
+
+    def rank_signals_by_pick_type(
+        self,
+        signals: List[SignalResult],
+        top_k_per_pick_type: int = 10,
+        unique_symbol: bool = True,
+    ) -> Dict[str, List[SignalResult]]:
+        """
+        Rank picks independently per pick_type (e.g. vegas_short_term).
+        """
+        grouped: Dict[str, List[SignalResult]] = defaultdict(list)
+        for signal in signals:
+            pick_type = (signal.metadata or {}).get("pick_type", "unclassified")
+            grouped[pick_type].append(signal)
+
+        ranked_by_group: Dict[str, List[SignalResult]] = {}
+        for pick_type, group_signals in grouped.items():
+            ranked_by_group[pick_type] = self.rank_signals(
+                signals=group_signals,
+                top_k=top_k_per_pick_type,
+                unique_symbol=unique_symbol,
+            )
+
+        return ranked_by_group
     
     def write_signals_to_rds(
         self,
@@ -313,7 +511,7 @@ class DailyScanner:
 
     def write_top_picks_to_rds(
         self,
-        top_picks: List[SignalResult],
+        top_picks: Any,
         scan_date: date,
         rds_client
     ) -> int:
@@ -324,12 +522,24 @@ class DailyScanner:
             return 0
 
         try:
+            if isinstance(top_picks, dict):
+                items: List[tuple[str, SignalResult]] = []
+                for pick_type, picks in top_picks.items():
+                    for signal in picks:
+                        items.append((pick_type, signal))
+            else:
+                items = [((signal.metadata or {}).get("pick_type", "unclassified"), signal) for signal in top_picks]
+
             values = []
-            for rank, signal in enumerate(top_picks, start=1):
+            rank_map: Dict[str, int] = defaultdict(int)
+            for pick_type, signal in items:
+                rank_map[pick_type] += 1
+                rank = rank_map[pick_type]
                 strategy_name = signal.metadata.get("strategy_name", "Unknown")
                 score = float((signal.metadata or {}).get("ranking_score", signal.confidence or 0.0))
                 values.append((
                     signal.date or scan_date.isoformat(),
+                    pick_type,
                     rank,
                     signal.symbol,
                     strategy_name,
@@ -342,9 +552,9 @@ class DailyScanner:
 
             query = """
             INSERT INTO daily_scan_top_picks
-            (scan_date, rank, symbol, strategy_name, signal, price, confidence, score, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (scan_date, rank)
+            (scan_date, pick_type, rank, symbol, strategy_name, signal, price, confidence, score, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (scan_date, pick_type, rank)
             DO UPDATE SET
                 symbol = EXCLUDED.symbol,
                 strategy_name = EXCLUDED.strategy_name,
@@ -372,7 +582,7 @@ class DailyScanner:
             else:
                 raise ValueError("Unsupported rds_client. Expected connection/conn or execute_query()")
 
-            return len(top_picks)
+            return len(items)
         except Exception as e:
             print(f"Error writing top picks to RDS: {str(e)}")
             raise
