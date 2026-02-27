@@ -8,7 +8,7 @@ import json
 import logging
 import psycopg2
 import psycopg2.extras
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from datetime import datetime, date
 from decimal import Decimal
 import os
@@ -126,31 +126,70 @@ class RDSTimescaleClient:
             logger.error(f"Parameters: {parameters}")
             raise
     
-    def get_active_symbols(self) -> List[str]:
-        """Get list of active symbols from symbol_metadata table
-        
-        Returns empty list if table doesn't exist (e.g., local testing without schema)
+    def get_active_symbols(
+        self,
+        types: Optional[List[str]] = None,
+        min_market_cap: Optional[int] = None,
+        max_market_cap: Optional[int] = None,
+        industry_contains: Optional[Union[str, List[str]]] = None,
+    ) -> List[str]:
+        """Get list of active symbols from symbol_metadata with optional filters.
+
+        Active means LOWER(TRIM(active)) = 'true'. All filters are optional.
+
+        Args:
+            types: Include only these asset types (e.g. ['CS', 'ETF', 'ETV', 'UNIT', 'PFD', 'ADRC']).
+                   Polygon types: CS (common stock), ETF, ETV, UNIT, PFD, ADRC, etc.
+            min_market_cap: Minimum market cap (inclusive). Column: marketcap.
+            max_market_cap: Maximum market cap (inclusive). Column: marketcap.
+            industry_contains: Match industry by substring (case-insensitive).
+                              Single string: industry ILIKE '%term%'.
+                              List of strings: symbol matches if industry contains any of the terms (OR).
+
+        Returns:
+            List of symbol tickers. Empty list if table doesn't exist (e.g. local testing).
         """
-        sql = """
-            SELECT symbol 
-            FROM symbol_metadata 
-            WHERE active = 'true'
+        conditions = ["LOWER(TRIM(active)) = 'true'"]
+        parameters: List[Any] = []
+
+        if types:
+            conditions.append(f"type IN ({','.join('%s' for _ in types)})")
+            parameters.extend(types)
+        if min_market_cap is not None:
+            conditions.append("marketcap >= %s")
+            parameters.append(min_market_cap)
+        if max_market_cap is not None:
+            conditions.append("marketcap <= %s")
+            parameters.append(max_market_cap)
+        if industry_contains is not None:
+            terms = [industry_contains] if isinstance(industry_contains, str) else industry_contains
+            terms = [t for t in terms if t is not None and str(t).strip()]
+            if terms:
+                placeholders = " OR ".join(
+                    "industry ILIKE %s" for _ in terms
+                )
+                conditions.append(f"({placeholders})")
+                parameters.extend(f"%{str(t).strip()}%" for t in terms)
+
+        where_clause = " AND ".join(conditions)
+        sql = f"""
+            SELECT symbol
+            FROM symbol_metadata
+            WHERE {where_clause}
             ORDER BY symbol
         """
-        
         try:
-            results = self.execute_query(sql)
+            results = self.execute_query(sql, tuple(parameters) if parameters else None)
             symbols = [row['symbol'] for row in results]
-            
-            logger.info(f"Retrieved {len(symbols)} active symbols")
+            logger.info(
+                f"Retrieved {len(symbols)} active symbols"
+                + (f" (types={types}, industry_contains={industry_contains})" if types or industry_contains else "")
+            )
             return symbols
-            
         except psycopg2.errors.UndefinedTable as e:
-            # Table doesn't exist - expected in local testing
             logger.warning(f"symbol_metadata table not found (expected in local testing): {str(e)}")
             return []
         except Exception as e:
-            # Other database errors - log as error
             logger.error(f"Error getting active symbols: {str(e)}")
             raise
     

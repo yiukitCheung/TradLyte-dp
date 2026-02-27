@@ -70,13 +70,23 @@ class DailyScanner:
         ]
         return strategies
 
-    def get_pick_profiles(self) -> List[Dict[str, Any]]:
+    def get_pick_profiles(
+        self,
+        include_pick_types: Optional[List[str]] = None,
+        exclude_pick_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Active pick profiles (touch strategy intentionally excluded for now):
         - vegas short-term / long-term
         - golden-cross short-term / long-term
+
+        Args:
+            include_pick_types: If provided, only profiles whose ``pick_type`` is in this
+                list will be returned (case-insensitive).
+            exclude_pick_types: If provided, profiles whose ``pick_type`` is in this
+                list will be excluded (case-insensitive).
         """
-        return [
+        profiles: List[Dict[str, Any]] = [
             {
                 "pick_type": "vegas_short_term",
                 "strategy_factory": VegasChannelStrategy,
@@ -106,6 +116,16 @@ class DailyScanner:
                 "term": "long",
             },
         ]
+
+        # Optional filtering by pick_type
+        if include_pick_types:
+            include_set = {p.lower() for p in include_pick_types}
+            profiles = [p for p in profiles if p["pick_type"].lower() in include_set]
+        if exclude_pick_types:
+            exclude_set = {p.lower() for p in exclude_pick_types}
+            profiles = [p for p in profiles if p["pick_type"].lower() not in exclude_set]
+
+        return profiles
 
     def _build_term_weights(self, timeframes: List[str]) -> Dict[str, float]:
         """
@@ -342,14 +362,44 @@ class DailyScanner:
         pick_profiles: List[Dict[str, Any]],
         scan_date: date,
         rds_client,
+        include_pick_types: Optional[List[str]] = None,
+        exclude_pick_types: Optional[List[str]] = None,
     ) -> List[SignalResult]:
         """
-        Scan symbols using the 4 pick profiles and return aggregated pick signals.
+        Scan symbols using pick profiles and return aggregated pick signals.
+
+        You can optionally restrict which pick profiles run by ``pick_type``.
+
+        Args:
+            symbols: Symbols to scan.
+            pick_profiles: Profile definitions from ``get_pick_profiles()``.
+            scan_date: Date to scan.
+            rds_client: RDS client (not currently used here, but kept for parity).
+            include_pick_types: If provided, only profiles whose ``pick_type`` is in this
+                list will be executed (case-insensitive).
+            exclude_pick_types: If provided, profiles whose ``pick_type`` is in this
+                list will be skipped (case-insensitive).
         """
         signals: List[SignalResult] = []
 
+        # Apply same filtering rules used by get_pick_profiles (by pick_type)
+        effective_profiles = pick_profiles
+        if include_pick_types:
+            include_set = {p.lower() for p in include_pick_types}
+            effective_profiles = [
+                p for p in effective_profiles if p["pick_type"].lower() in include_set
+            ]
+        if exclude_pick_types:
+            exclude_set = {p.lower() for p in exclude_pick_types}
+            effective_profiles = [
+                p for p in effective_profiles if p["pick_type"].lower() not in exclude_set
+            ]
+
+        if not effective_profiles:
+            return signals
+
         for symbol in symbols:
-            for profile in pick_profiles:
+            for profile in effective_profiles:
                 strategy_factory: Callable[[], BaseStrategy] = profile["strategy_factory"]
                 strategy = strategy_factory()
                 signal = self._score_multi_timeframe_signal(

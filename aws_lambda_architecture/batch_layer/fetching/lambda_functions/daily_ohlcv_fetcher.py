@@ -3,9 +3,9 @@ AWS Lambda function for daily OHLCV data fetching
 Replaces the Prefect bronze pipeline with serverless AWS approach
 Now with async support for 10x faster fetching!
 
-NEW ARCHITECTURE:
-1. Write to S3 bronze layer (SOURCE OF TRUTH, all historical data)
-2. Write to RDS (FAST QUERY CACHE, last 5 years only)
+Architecture:
+- Writes to RDS (primary store for querying; last 5 years retention).
+- S3 bronze writes are optional (set WRITE_TO_S3_BRONZE=true to enable); disabled by default to reduce Lambda workload.
 """
 
 import json
@@ -31,9 +31,10 @@ from shared.models.data_models import OHLCVData, BatchProcessingJob
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# S3 Configuration
+# S3 Configuration (optional - disable to reduce Lambda workload if RDS is the only consumer)
 S3_BUCKET = os.environ.get('S3_DATALAKE_BUCKET', 'dev-condvest-datalake')
 S3_BRONZE_PREFIX = 'bronze/raw_ohlcv'
+WRITE_TO_S3_BRONZE = os.environ.get('WRITE_TO_S3_BRONZE', 'false').lower() in ('true', '1', 'yes')
 
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
@@ -157,6 +158,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         )
         
         logger.info(f"Starting OHLCV fetch for {len(dates_to_fetch)} date(s), job_id: {job_id}")
+        if not WRITE_TO_S3_BRONZE:
+            logger.info("📌 S3 bronze write disabled (WRITE_TO_S3_BRONZE); writing to RDS only to reduce workload")
         
         # Get symbols to process
         if symbols is None:
@@ -196,11 +199,12 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     )
                     
                     if ohlcv_data:
-                        # NEW ARCHITECTURE: Write to S3 first (SOURCE OF TRUTH)
-                        s3_records = write_to_s3_bronze(ohlcv_data, fetch_date)
-                        logger.info(f"  ✅ Wrote {s3_records} records to S3 bronze layer")
+                        # Write to S3 only if enabled (adds workload; skip if RDS is sole consumer)
+                        if WRITE_TO_S3_BRONZE:
+                            s3_records = write_to_s3_bronze(ohlcv_data, fetch_date)
+                            logger.info(f"  ✅ Wrote {s3_records} records to S3 bronze layer")
                         
-                        # Then write to RDS (FAST QUERY CACHE - last 5 years only)
+                        # Write to RDS (primary store for querying; last 5 years retention)
                         records_inserted = write_to_rds_with_retention(
                             rds_client, 
                             ohlcv_data, 
@@ -541,9 +545,8 @@ def write_to_rds_with_retention(
         
     except Exception as e:
         logger.error(f"❌ Error writing to RDS: {str(e)}")
-        # Don't fail Lambda if RDS write fails (S3 is source of truth)
-        # But log it prominently for monitoring
-        logger.error("⚠️  RDS write failed, but S3 write succeeded (data not lost)")
+        # Don't fail Lambda if RDS write fails (data may be in S3 if WRITE_TO_S3_BRONZE is set)
+        logger.error("⚠️  RDS write failed; check RDS connectivity and schema")
         return 0
 
 
@@ -696,9 +699,10 @@ def handle_historical_backfill(
                     logger.warning(f"⚠️  No data returned for {symbol}")
                     continue
                 
-                # Write to S3 (grouped by date)
-                s3_records = write_historical_to_s3(ohlcv_list, symbol)
-                
+                # Write to S3 only if enabled (skip to reduce workload when RDS is sole consumer)
+                if WRITE_TO_S3_BRONZE:
+                    write_historical_to_s3(ohlcv_list, symbol)
+
                 # Write to RDS (with 5-year retention filter)
                 rds_records = write_to_rds_with_retention(rds_client, ohlcv_list, retention_years=5)
                 
