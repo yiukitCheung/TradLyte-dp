@@ -108,15 +108,19 @@ class VegasChannelStrategy(BaseStrategy):
         df = self._calculate_velocity_status(df)
 
         df = df.with_columns([
+            # Count velocity loss and maintained in the last obs_window
             pl.col("velocity_status").map_elements(
                 lambda s: 1 if s in ["velocity_loss", "velocity_weak", "velocity_negotiating"] else 0,
                 return_dtype=pl.Int32
             ).alias("loss_flag"),
+            # Count velocity maintained in the last obs_window
             pl.col("velocity_status").map_elements(
                 lambda s: 1 if s == "velocity_maintained" else 0,
                 return_dtype=pl.Int32
             ).alias("maintain_flag")
         ])
+
+        # Sum the velocity loss and maintained in the last obs_window
         df = df.with_columns([
             pl.col("loss_flag").rolling_sum(window_size=obs_window).alias("count_velocity_loss"),
             pl.col("maintain_flag").rolling_sum(window_size=obs_window).alias("count_velocity_maintained")
@@ -195,13 +199,7 @@ class VegasChannelStrategy(BaseStrategy):
             df = self._calculate_momentum_signal(df)
         if "velocity_status" not in df.columns:
             df = self._calculate_velocity_status(df)
-        part1 = (pl.col("momentum_signal") == "accelerated") & (pl.col("open") < pl.col("close"))
-        part2 = (
-            (pl.col("ema_touch_type") == "support") & (pl.col("velocity_status") == "velocity_maintained")
-            if "ema_touch_type" in df.columns
-            else pl.lit(False)
-        )
-        trigger_condition = part1 | part2
+        trigger_condition = (pl.col("momentum_signal") == "accelerated") & (pl.col("open") < pl.col("close"))
         return df.with_columns(
             pl.when(pl.col("setup_valid") & trigger_condition)
             .then(pl.lit("BUY"))

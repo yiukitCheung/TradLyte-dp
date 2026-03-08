@@ -21,12 +21,7 @@ __version__ = "0.1.0"
 
 from .strategies.base import BaseStrategy
 from .strategies.builder import CompositeStrategy
-from .inputs import load_ohlcv, load_ohlcv_by_timeframe, resample_ohlcv
-from .models import (
-    StrategyConfig, SetupConfig, TriggerConfig, ExitConfig,
-    RequirementsStrategyConfig, ExpandableStrategyConfig, StepConfig,
-    SignalResult
-)
+from .inputs import load_ohlcv, load_ohlcv_multi_timeframe, resample_ohlcv
 from .executor import MultiTimeframeExecutor
 from .backtester import Backtester, BacktestResult, Position
 from .scanner import DailyScanner
@@ -43,7 +38,8 @@ __all__ = [
     # Data loading
     'resample_ohlcv',
     'load_ohlcv',
-    'load_ohlcv_by_timeframe',
+    'load_ohlcv_multi_timeframe',
+    'load_ohlcv_by_timeframe',  # backward compat
     # Models (legacy)
     'StrategyConfig',
     'SetupConfig',

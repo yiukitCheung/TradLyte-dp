@@ -109,7 +109,7 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         
         # Scan symbols
         logger.info("🔎 Scanning symbols with multi-timeframe pick profiles...")
-        signals = scanner.scan_symbols_by_pick_profiles(
+        signals = scanner.run(
             symbols=symbols,
             pick_profiles=pick_profiles,
             scan_date=scan_date,
@@ -119,30 +119,20 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         logger.info(f"   Generated {len(signals)} signals")
 
         logger.info("🏆 Ranking top picks by pick type...")
-        top_picks_by_type = scanner.rank_signals_by_pick_type(
-            signals=signals,
-            top_k_per_pick_type=10,
-            unique_symbol=True
+        ranked = scanner.rank(
+            signals,
+            by_pick_type=True,
+            top_k=10,
+            unique_symbol=True,
         )
-        total_top_picks = sum(len(v) for v in top_picks_by_type.values())
-        logger.info(f"   Selected {total_top_picks} top picks across {len(top_picks_by_type)} pick types")
-        
-        # Write signals to RDS
-        if signals:
-            logger.info("💾 Writing signals to daily_signals table...")
-            written_count = scanner.write_signals_to_rds(signals, rds_client)
-            logger.info(f"   Wrote {written_count} signals to database")
-        else:
-            logger.info("   No signals to write")
-            written_count = 0
+        total_top_picks = sum(len(v) for v in ranked.values())
+        logger.info(f"   Selected {total_top_picks} top picks across {len(ranked)} pick types")
 
-        if total_top_picks:
-            logger.info("💾 Writing top picks to daily_scan_top_picks table...")
-            picks_written = scanner.write_top_picks_to_rds(top_picks_by_type, scan_date, rds_client)
-            logger.info(f"   Wrote {picks_written} ranked picks to database")
-        else:
-            picks_written = 0
-            logger.info("   No ranked picks to write")
+        logger.info("💾 Writing signals and top picks to RDS...")
+        total_written = scanner.write(ranked, rds_client, scan_date, all_signals=signals if signals else None)
+        signals_written = len(signals) if signals else 0
+        picks_written = total_written - signals_written
+        logger.info(f"   Wrote {signals_written} signals, {picks_written} top picks")
         
         # Close RDS connection
         rds_client.close()
@@ -154,7 +144,7 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         logger.info(f"   Symbols scanned: {len(symbols)}")
         logger.info(f"   Pick profiles run: {len(pick_profiles)}")
         logger.info(f"   Signals generated: {len(signals)}")
-        logger.info(f"   Signals written: {written_count}")
+        logger.info(f"   Signals written: {signals_written}")
         logger.info(f"   Top picks written: {picks_written}")
         logger.info(f"⏰ End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         

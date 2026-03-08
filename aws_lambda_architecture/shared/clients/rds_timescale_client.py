@@ -193,6 +193,33 @@ class RDSTimescaleClient:
             logger.error(f"Error getting active symbols: {str(e)}")
             raise
     
+    def fetch_symbol_range(self, symbol: str, days: int) -> List[OHLCVData]:
+        """Fetch symbol range from the raw_ohlcv table"""
+        sql = """
+        SELECT Fetch_Symbol_Range(%s, %s)
+        """
+        parameters = (symbol, days)
+        results = self.execute_query(sql, parameters)
+        return [OHLCVData(**row) for row in results]
+
+    def fetch_symbol_period(self, symbol: str, period: str) -> List[OHLCVData]:
+        """Fetch symbol period from the raw_ohlcv table"""
+        sql = """
+        SELECT Fetch_Symbol_Period(%s, %s)
+        """
+        parameters = (symbol, period)
+        results = self.execute_query(sql, parameters)
+        return [OHLCVData(**row) for row in results]
+
+    def fetch_growth(self, symbol: str, days: int) -> List[OHLCVData]:
+        """Fetch growth from the raw_ohlcv table"""
+        sql = """
+        SELECT Growth(%s, %s)
+        """
+        parameters = (symbol, days)
+        results = self.execute_query(sql, parameters)
+        return [OHLCVData(**row) for row in results]
+        
     def insert_ohlcv_data(self, ohlcv_data: List[OHLCVData]) -> int:
         """Insert OHLCV data into the raw_ohlcv table (TimescaleDB optimized)"""
         if not ohlcv_data:
