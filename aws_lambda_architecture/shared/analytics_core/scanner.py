@@ -79,7 +79,6 @@ class DailyScanner:
         symbol_data_dict: Dict[str, Any],
     ) -> Optional[SignalResult]:
         """Score one symbol across timeframes with pre-loaded data; return BUY signal or None."""
-        print(f"Score Signal: Starting _score_signal for symbol={symbol}, strategy={getattr(strategy, 'name', str(strategy))}, scan_date={scan_date}, start_date={symbol_data_dict[timeframes[0]]['date'].min()}, end_date={symbol_data_dict[timeframes[0]]['date'].max()}, timeframes={timeframes}")
         higher_tf_buy_lookback_candles = 5
 
         def _timeframe_to_days(tf: str) -> int:
@@ -93,7 +92,6 @@ class DailyScanner:
         ordered_timeframes = sorted(timeframes, key=_timeframe_to_days)
         anchor_timeframe = ordered_timeframes[0] if ordered_timeframes else None
         if not anchor_timeframe:
-            print(f"Score Signal: No anchor timeframe available, returning None.")
             return None
 
         weights = {tf: float(idx + 1) for idx, tf in enumerate(timeframes)}
@@ -114,33 +112,21 @@ class DailyScanner:
                     print(f"Score Signal: No data for timeframe '{timeframe}'.")
                     votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
                     continue
-                print(f"Score Signal: Preparing dataframe for timeframe '{timeframe}'.")
-                print(tf_df)
                 tf_df = self.executor.prepare_dataframe(tf_df, timeframe)
                 # Run Strategy
                 tf_df = strategy.run(tf_df)
-                print(tf_df)
-                print(tf_df.select('signal').unique())
                 # Get Signals
                 tf_df = strategy.get_signals(tf_df)
-                print(tf_df)
                 if tf_df.height == 0:
-                    print(f"Score Signal: Dataframe empty after preparation/strategy for '{timeframe}'.")
                     votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
                     continue
-                print(f"Score Signal: Dataframe for '{timeframe}' processed and strategy executed.")
                 prepared_by_timeframe[timeframe] = tf_df
-                print(tf_df)
                 
             except Exception as timeframe_error:
-                print(f"Score Signal: Exception while processing timeframe '{timeframe}': {timeframe_error}")
                 votes[timeframe] = {"error": str(timeframe_error), "weight": weights[timeframe]}
                 continue
-        print(f"Score Signal: Prepared by timeframe keys: {list(prepared_by_timeframe.keys())}")    
         # 1) Anchor rule: the lowest timeframe must be BUY exactly on scan_date.
         anchor_df = prepared_by_timeframe.get(anchor_timeframe)
-        print(f"Score Signal: Anchor dataframe for '{anchor_timeframe}': {anchor_df.shape}")
-        print(anchor_df)
         if anchor_df is None or anchor_df.height == 0:
             print(f"Score Signal: No data for anchor timeframe '{anchor_timeframe}' on scan date.")
             votes[anchor_timeframe] = {"signal": "NO_DATA_ON_SCAN_DATE", "weight": weights.get(anchor_timeframe, 0.0)}
@@ -151,9 +137,7 @@ class DailyScanner:
             votes[anchor_timeframe] = {"signal": "NO_DATA_ON_SCAN_DATE", "weight": weights.get(anchor_timeframe, 0.0)}
             return None
         anchor_row = anchor_scan_day_df.sort("date", descending=True).head(1)
-        print(anchor_row)
         anchor_signal = anchor_row["signal"][0] if "signal" in anchor_row.columns else "HOLD"
-        print(f"Score Signal: Anchor signal for '{anchor_timeframe}' on {scan_date}: {anchor_signal}")
         if anchor_signal != "BUY":
             print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' signal is not BUY ({anchor_signal}), returning None.")
             votes[anchor_timeframe] = {"signal": str(anchor_signal), "weight": weights.get(anchor_timeframe, 0.0)}
@@ -168,7 +152,6 @@ class DailyScanner:
             setup_value = anchor_row["setup_valid"][0]
             anchor_setup_valid = bool(setup_value) if setup_value is not None else False
         if anchor_setup_valid:
-            print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' setup is valid.")
             weighted_setup += anchor_weight
         if "close" in anchor_row.columns:
             close_value = anchor_row["close"][0]
