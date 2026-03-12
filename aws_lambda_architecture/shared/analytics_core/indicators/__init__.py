@@ -14,6 +14,7 @@ from .technicals import (
     calculate_stochastic,
     calculate_all_indicators,
 )
+from .patterns import detect_all_patterns
 
 __all__ = [
     'calculate_rsi',
@@ -24,4 +25,5 @@ __all__ = [
     'calculate_atr',
     'calculate_stochastic',
     'calculate_all_indicators',
+    'detect_all_patterns',
 ]

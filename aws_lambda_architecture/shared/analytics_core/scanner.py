@@ -9,6 +9,7 @@ outputs daily suggested symbols. Used by AWS Batch job for daily scanning.
 from typing import List, Dict, Any, Optional, Callable, Union
 from datetime import date, timedelta
 from collections import defaultdict
+import polars as pl
 from .models import SignalResult
 from .strategies.base import BaseStrategy
 from .executor import MultiTimeframeExecutor
@@ -78,87 +79,174 @@ class DailyScanner:
         symbol_data_dict: Dict[str, Any],
     ) -> Optional[SignalResult]:
         """Score one symbol across timeframes with pre-loaded data; return BUY signal or None."""
-        weights = {tf: float(idx + 1) for idx, tf in enumerate(timeframes)} # Weights by position: first=1, second=2, ... (higher timeframe = higher weight).
+        print(f"Score Signal: Starting _score_signal for symbol={symbol}, strategy={getattr(strategy, 'name', str(strategy))}, scan_date={scan_date}, start_date={symbol_data_dict[timeframes[0]]['date'].min()}, end_date={symbol_data_dict[timeframes[0]]['date'].max()}, timeframes={timeframes}")
+        higher_tf_buy_lookback_candles = 5
+
+        def _timeframe_to_days(tf: str) -> int:
+            tf_str = str(tf).strip().lower()
+            if tf_str.endswith("d"):
+                numeric = tf_str[:-1].strip()
+                if numeric.isdigit():
+                    return int(numeric)
+            return 10**9
+
+        ordered_timeframes = sorted(timeframes, key=_timeframe_to_days)
+        anchor_timeframe = ordered_timeframes[0] if ordered_timeframes else None
+        if not anchor_timeframe:
+            print(f"Score Signal: No anchor timeframe available, returning None.")
+            return None
+
+        weights = {tf: float(idx + 1) for idx, tf in enumerate(timeframes)}
+        print(f"Score Signal: Weights per timeframe: {weights}")
         weighted_score = 0.0
         weighted_setup = 0.0
         weighted_trigger = 0.0
-        weighted_price = 0.0
         total_weight = sum(weights.values())
         votes: Dict[str, Dict[str, Any]] = {}
-        # For each timeframe, score the symbolre and calculate the confidence
+        selected_price: Optional[float] = None
+        prepared_by_timeframe: Dict[str, pl.DataFrame] = {}
+
+        # Run strategy per timeframe first.
         for timeframe in timeframes:
             try:
                 tf_df = symbol_data_dict.get(timeframe)
                 if tf_df is None or (hasattr(tf_df, "height") and tf_df.height == 0):
+                    print(f"Score Signal: No data for timeframe '{timeframe}'.")
+                    votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
                     continue
-                # Add indicators and patterns to the dataframe
+                print(f"Score Signal: Preparing dataframe for timeframe '{timeframe}'.")
+                print(tf_df)
                 tf_df = self.executor.prepare_dataframe(tf_df, timeframe)
-                # Execute the strategy on the dataframe
+                # Run Strategy
                 tf_df = strategy.run(tf_df)
-                # If the dataframe is empty, continue
+                print(tf_df)
+                print(tf_df.select('signal').unique())
+                # Get Signals
+                tf_df = strategy.get_signals(tf_df)
+                print(tf_df)
                 if tf_df.height == 0:
+                    print(f"Score Signal: Dataframe empty after preparation/strategy for '{timeframe}'.")
+                    votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
                     continue
-
-                # Get the latest signal from the dataframe
-                latest_signal = strategy.get_latest_signal(tf_df)
+                print(f"Score Signal: Dataframe for '{timeframe}' processed and strategy executed.")
+                prepared_by_timeframe[timeframe] = tf_df
+                print(tf_df)
                 
-                # If the latest signal is not valid, continue
-                if not latest_signal:
-                    continue
-                # Calculate the weight for the timeframe
-                weight = weights[timeframe]
-                raw_signal = latest_signal.get("signal", "HOLD")
-                setup_valid = bool(latest_signal.get("setup_valid", False))
-                trigger_met = bool(latest_signal.get("trigger_met", False))
-                price = float(latest_signal.get("price") or 0.0)
-
-                # If the signal is a buy, add the weight to the weighted score
-                if raw_signal == "BUY":
-                    weighted_score += weight
-                # If the signal is a sell, subtract the weight from the weighted score
-                elif raw_signal == "SELL":
-                    weighted_score -= weight
-                # If the setup is valid, add the weight to the weighted setup
-                if setup_valid:
-                    weighted_setup += weight
-                # If the trigger is met and the signal is a buy, add the weight to the weighted trigger
-                if trigger_met and raw_signal == "BUY":
-                    weighted_trigger += weight
-                # If the price is greater than 0, add the weight to the weighted price
-                if price > 0:
-                    weighted_price += weight * price
-
-                # Add the signal to the votes dictionary
-                votes[timeframe] = {
-                    "signal": raw_signal,
-                    "setup_valid": setup_valid,
-                    "trigger_met": trigger_met,
-                    "price": price,
-                    "weight": weight,
-                }
             except Exception as timeframe_error:
+                print(f"Score Signal: Exception while processing timeframe '{timeframe}': {timeframe_error}")
                 votes[timeframe] = {"error": str(timeframe_error), "weight": weights[timeframe]}
                 continue
-
-        # If the total weight is less than or equal to 0 or the weighted score is less than or equal to 0, return None
-        if total_weight <= 0 or weighted_score <= 0:
+        print(f"Score Signal: Prepared by timeframe keys: {list(prepared_by_timeframe.keys())}")    
+        # 1) Anchor rule: the lowest timeframe must be BUY exactly on scan_date.
+        anchor_df = prepared_by_timeframe.get(anchor_timeframe)
+        print(f"Score Signal: Anchor dataframe for '{anchor_timeframe}': {anchor_df.shape}")
+        print(anchor_df)
+        if anchor_df is None or anchor_df.height == 0:
+            print(f"Score Signal: No data for anchor timeframe '{anchor_timeframe}' on scan date.")
+            votes[anchor_timeframe] = {"signal": "NO_DATA_ON_SCAN_DATE", "weight": weights.get(anchor_timeframe, 0.0)}
+            return None
+        anchor_scan_day_df = anchor_df.filter(pl.col("date") == scan_date)
+        if anchor_scan_day_df.height == 0:
+            print(f"Score Signal: No row for anchor timeframe '{anchor_timeframe}' matching scan date.")
+            votes[anchor_timeframe] = {"signal": "NO_DATA_ON_SCAN_DATE", "weight": weights.get(anchor_timeframe, 0.0)}
+            return None
+        anchor_row = anchor_scan_day_df.sort("date", descending=True).head(1)
+        print(anchor_row)
+        anchor_signal = anchor_row["signal"][0] if "signal" in anchor_row.columns else "HOLD"
+        print(f"Score Signal: Anchor signal for '{anchor_timeframe}' on {scan_date}: {anchor_signal}")
+        if anchor_signal != "BUY":
+            print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' signal is not BUY ({anchor_signal}), returning None.")
+            votes[anchor_timeframe] = {"signal": str(anchor_signal), "weight": weights.get(anchor_timeframe, 0.0)}
             return None
 
-        # Calculate the confidence
+        print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' confirmed as BUY.")
+        anchor_weight = weights.get(anchor_timeframe, 0.0)
+        weighted_score += anchor_weight
+        weighted_trigger += anchor_weight
+        anchor_setup_valid = False
+        if "setup_valid" in anchor_row.columns:
+            setup_value = anchor_row["setup_valid"][0]
+            anchor_setup_valid = bool(setup_value) if setup_value is not None else False
+        if anchor_setup_valid:
+            print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' setup is valid.")
+            weighted_setup += anchor_weight
+        if "close" in anchor_row.columns:
+            close_value = anchor_row["close"][0]
+            if close_value is not None:
+                selected_price = float(close_value)
+        votes[anchor_timeframe] = {
+            "signal": "BUY",
+            "weight": anchor_weight,
+            "match_mode": "exact_scan_date",
+            "matched_date": str(scan_date),
+        }
+
+        # 2) Higher timeframe rule: count BUY if found within the last N candles up to anchor day.
+        for timeframe in timeframes:
+            if timeframe == anchor_timeframe:
+                continue
+            tf_df = prepared_by_timeframe.get(timeframe)
+            if tf_df is None or tf_df.height == 0:
+                print(f"Score Signal: No data for higher timeframe '{timeframe}'.")
+                votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
+                continue
+
+            candles_up_to_anchor = tf_df.filter(pl.col("date") <= scan_date).sort("date", descending=True)
+            if candles_up_to_anchor.height == 0:
+                print(f"Score Signal: No candles found up to anchor for timeframe '{timeframe}'.")
+                votes[timeframe] = {"signal": "NO_DATA_UP_TO_SCAN_DATE", "weight": weights[timeframe]}
+                continue
+
+            recent_window = candles_up_to_anchor.head(higher_tf_buy_lookback_candles)
+            buy_rows = recent_window.filter(pl.col("signal") == "BUY")
+            weight = weights[timeframe]
+
+            if buy_rows.height > 0:
+                matched_buy = buy_rows.sort("date", descending=True).head(1)
+                print(f"Score Signal: BUY found in higher timeframe '{timeframe}' in last {higher_tf_buy_lookback_candles} candles on {matched_buy['date'][0]}.")
+                weighted_score += weight
+                weighted_trigger += weight
+
+                setup_valid = False
+                if "setup_valid" in matched_buy.columns:
+                    setup_value = matched_buy["setup_valid"][0]
+                    setup_valid = bool(setup_value) if setup_value is not None else False
+                if setup_valid:
+                    print(f"Score Signal: Higher timeframe '{timeframe}' setup is valid.")
+                    weighted_setup += weight
+
+                votes[timeframe] = {
+                    "signal": "BUY",
+                    "weight": weight,
+                    "match_mode": "buy_within_lookback_candles",
+                    "lookback_candles": higher_tf_buy_lookback_candles,
+                    "matched_date": str(matched_buy["date"][0]),
+                }
+            else:
+                print(f"Score Signal: No BUY signals found in higher timeframe '{timeframe}' in last {higher_tf_buy_lookback_candles} candles.")
+                votes[timeframe] = {
+                    "signal": "HOLD",
+                    "weight": weight,
+                    "match_mode": "buy_within_lookback_candles",
+                    "lookback_candles": higher_tf_buy_lookback_candles,
+                }
+
+        if total_weight <= 0 or weighted_score <= 0:
+            print(f"Score Signal: Weighted score or total weight <= 0 (weighted_score={weighted_score}, total_weight={total_weight}), returning None.")
+            return None
+
         confidence = min(max(weighted_score / total_weight, 0.0), 1.0)
-        avg_price = (weighted_price / total_weight) if weighted_price > 0 else 0.0
-        # Return the signal result
+        print(f"Score Signal: Final weighted_score={weighted_score}, total_weight={total_weight}, confidence={confidence}")
         return SignalResult(
             symbol=symbol,
             date=scan_date.isoformat(),
             signal="BUY",
-            price=avg_price,
+            price=selected_price if selected_price is not None else 0.0,
             setup_valid=(weighted_setup > 0),
             trigger_met=(weighted_trigger > 0),
             confidence=confidence,
             metadata={
                 "strategy_name": strategy.name,
-                "description": strategy.description,
                 "timeframes": timeframes,
                 "timeframe_votes": votes,
                 "weighted_score": weighted_score,
@@ -177,23 +265,30 @@ class DailyScanner:
         batch_size: int = 100,
     ) -> List[SignalResult]:
         """Batch-load 1d from RDS, resample in memory, run profiles; return list of signals."""
+        import logging
+        logger = logging.getLogger(__name__)
+
         # Initialize the signals list
         signals: List[SignalResult] = []
+        print(f"Starting run: {len(symbols)} symbols, scan_date={scan_date}")
 
         # Filter the pick profiles
         selected_strategy_metadata = strategy_metadata
         if include_strategy_names:
             include_set = {p.lower() for p in include_strategy_names}
+            print(f"Including strategies: {', '.join(include_set)}")
             selected_strategy_metadata = [
                 p for p in selected_strategy_metadata if p["strategy_name"].lower() in include_set
             ]
         if exclude_strategy_names:
             exclude_set = {p.lower() for p in exclude_strategy_names}
+            print(f"Excluding strategies: {', '.join(exclude_set)}")
             selected_strategy_metadata = [
                 p for p in selected_strategy_metadata if p["strategy_name"].lower() not in exclude_set
             ]
 
         if not selected_strategy_metadata:
+            print("No strategies selected after filtering, returning empty signals list.")
             return signals
 
         # Get all the timeframes required for the strategy scanning
@@ -202,14 +297,17 @@ class DailyScanner:
             for tf in strategy_metadata.get("timeframes", []):
                 if tf not in all_timeframes:
                     all_timeframes.append(tf)
+        print(f"All timeframes required: {', '.join(all_timeframes)}")
 
         # Define the start and end dates
-        start_date = scan_date - timedelta(days=self.lookback_days)
+        start_date = scan_date - timedelta(days=365 * 5)
         end_date = scan_date
+        print(f"Data window: {start_date} to {end_date}")
 
         # Step 1: Batch-load the symbols
         for i in range(0, len(symbols), batch_size):
             batch_symbols = symbols[i : i + batch_size]
+            print(f"Processing batch {i}-{min(i+batch_size, len(symbols))} ({len(batch_symbols)} symbols)")
             # Step 1: Load the data by symbol
             batch_symbols_dict = self.executor.load(
                 symbols=batch_symbols,
@@ -217,17 +315,20 @@ class DailyScanner:
                 start_date=start_date,
                 end_date=end_date,
             )
+            print(f"Loaded symbol data for {sum(1 for s in batch_symbols if s in batch_symbols_dict)}/{len(batch_symbols)} batch symbols.")
 
             # Step 2: For each symbol, score the signals for each strategy
             for symbol in batch_symbols:
                 symbol_data_dict = batch_symbols_dict.get(symbol, {})
                 if not symbol_data_dict:
+                    print(f"No data found for symbol: {symbol}")
                     continue
                 # Step 3: For each profile, score the signals
                 for strategy_metadata in selected_strategy_metadata:
                     strategy_factory: Callable[[], BaseStrategy] = strategy_metadata["strategy_factory"]
                     strategy = strategy_factory()
                     timeframes = strategy_metadata.get("timeframes", [])
+                    print(f"Scoring {symbol} for strategy {strategy_metadata['strategy_name']} on tfs {timeframes}")
                     signal = self._score_signal(
                         symbol=symbol,
                         strategy=strategy,
@@ -239,11 +340,12 @@ class DailyScanner:
                     if signal:
                         metadata = dict(signal.metadata or {})
                         metadata["strategy_name"] = strategy_metadata["strategy_name"]
-                        metadata["description"] = strategy_metadata["description"]
                         metadata["timeframes"] = strategy_metadata["timeframes"]
                         signal.metadata = metadata
                         signals.append(signal)
+                        print(f"Added signal for symbol: {symbol}, strategy: {strategy_metadata['strategy_name']}")
 
+        print(f"Run complete. Total signals generated: {len(signals)}")
         # Return the signals list
         return signals
 

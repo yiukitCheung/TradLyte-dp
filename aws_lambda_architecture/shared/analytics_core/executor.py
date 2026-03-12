@@ -95,6 +95,9 @@ class MultiTimeframeExecutor:
         
         # Detect candle patterns
         df = detect_all_patterns(df)
+
+        # Keep explicit timeframe context for timeframe-aware strategy logic.
+        df = df.with_columns(pl.lit(timeframe).alias("timeframe"))
         
         return df
     

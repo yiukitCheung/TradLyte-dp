@@ -7,7 +7,7 @@ No S3 loading; resampling is done in memory from 1d data.
 
 import polars as pl
 from typing import Optional, Union, List, Dict
-from datetime import date
+from datetime import date, timedelta
 from sqlalchemy import create_engine
 
 def load_ohlcv(
@@ -42,18 +42,22 @@ def load_ohlcv(
         engine = create_engine(connection_string)
     except Exception as e:
         raise ValueError(f"Error connecting to RDS: {str(e)}")
+    # Use exclusive end bound to reliably include all rows on end_date when
+    # source column is a timestamp (date params are often interpreted as 00:00:00).
+    end_exclusive = (end_date + timedelta(days=1)) if end_date is not None else None
+
     if len(symbols) > 1:
         query = (
-            f"SELECT * FROM {table_name} WHERE symbol = ANY(%s) AND timestamp >= %s AND timestamp <= %s "
+            f"SELECT * FROM {table_name} WHERE symbol = ANY(%s) AND timestamp >= %s AND timestamp < %s "
             "ORDER BY symbol, timestamp ASC"
         )
-        params = [symbols, start_date, end_date]
+        params = [symbols, start_date, end_exclusive]
     else:
         query = (
-            f"SELECT * FROM {table_name} WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s "
+            f"SELECT * FROM {table_name} WHERE symbol = %s AND timestamp >= %s AND timestamp < %s "
             "ORDER BY timestamp ASC"
         )
-        params = [symbols[0], start_date, end_date]
+        params = [symbols[0], start_date, end_exclusive]
 
     try:
         df = pl.read_database(

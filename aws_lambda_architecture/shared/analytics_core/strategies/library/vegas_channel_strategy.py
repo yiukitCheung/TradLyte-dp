@@ -92,18 +92,59 @@ class VegasChannelStrategy(BaseStrategy):
             .otherwise(pl.lit("velocity_negotiating")) # Neutral/transitioning
             .alias("velocity_status")
         ])
+
+    def _resolve_obs_window(self, df: pl.DataFrame) -> int:
+        """
+        Resolve momentum observation window.
+
+        Priority:
+        1) Explicit self.obs_window override.
+        2) Timeframe-aware mapping (matches notebook archive logic).
+        3) Backward-compatible fallback to 30 when timeframe is unavailable.
+        """
+        if self.obs_window is not None:
+            return self.obs_window
+
+        base_window = 28
+        window_dict = {
+            1: base_window,       # 1d
+            3: base_window - 8,   # 3d
+            5: base_window - 8,   # 5d
+            8: base_window - 14,  # 8d
+            13: base_window - 14  # 13d
+        }
+
+        if "timeframe" not in df.columns or df.height == 0:
+            return 30
+
+        tf_value = df["timeframe"][0]
+        if tf_value is None:
+            return 30
+
+        tf_str = str(tf_value).strip().lower()
+        interval_days: Optional[int] = None
+        if tf_str.endswith("d"):
+            numeric = tf_str[:-1].strip()
+            if numeric.isdigit():
+                interval_days = int(numeric)
+
+        if interval_days is None:
+            return 30
+
+        return max(2, window_dict.get(interval_days, base_window // 4))
     
     def _calculate_momentum_signal(self, df: pl.DataFrame) -> pl.DataFrame:
         """
         First label each candle as maintain, loss, weak, neutral (velocity_status).
-        Then count maintain vs loss in the last obs_window (default 30) candles.
+        Then count maintain vs loss in the last obs_window candles.
         - Accelerated: loss count > maintain count in window AND
           lng_term_max <= short_term_max < open < close (green candle above short-term band).
         - Decelerated (sell): same count (loss > maintain) AND
           close < short_term_min <= lng_term_min (notebook sell logic). Cooldown: no decelerated in previous 30.
-        Interval-agnostic: obs_window is self.obs_window or 30.
+        Timeframe-aware default mapping (when obs_window is not explicitly set):
+        1d->28, 3d->20, 5d->20, 8d->14, 13d->14; unknown defaults to 7.
         """
-        obs_window = self.obs_window if self.obs_window is not None else 30
+        obs_window = self._resolve_obs_window(df)
 
         df = self._calculate_velocity_status(df)
 
@@ -166,7 +207,6 @@ class VegasChannelStrategy(BaseStrategy):
         ])
         return df
 
-    
     MIN_CANDLES = 169  # Longest EMA period; need at least this many candles.
 
     def setup(self, df: pl.DataFrame) -> pl.DataFrame:
