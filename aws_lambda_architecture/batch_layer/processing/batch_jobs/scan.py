@@ -1,7 +1,7 @@
 """
 Daily Scanner AWS Batch Job
 
-Runs pre-built strategies on all active symbols and writes signals to daily_signals table.
+ Runs pre-built strategies on all active symbols and writes ranked top picks to RDS.
 Triggered daily after data pipeline completes (4:30 PM ET).
 """
 
@@ -51,15 +51,19 @@ def get_rds_connection_string() -> str:
         raise
 
 
-def run_scanner_job(scan_date: Optional[date] = None) -> int:
+def run_scanner_job(
+    scan_date: Optional[date] = None,
+    strategy_name: str = "vegas_channel_short_term",
+) -> int:
     """
     Run daily scanner job
     
     Args:
         scan_date: Date to scan (default: today)
+        strategy_name: Strategy name to run (default: vegas_channel_short_term)
         
     Returns:
-        Number of signals generated
+        Number of top picks written
     """
     if scan_date is None:
         scan_date = date.today()
@@ -68,6 +72,7 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
     logger.info("🚀 STARTING DAILY SCANNER JOB")
     logger.info("=" * 80)
     logger.info(f"📅 Scan date: {scan_date}")
+    logger.info(f"🎯 Strategy name: {strategy_name}")
     logger.info(f"⏰ Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
@@ -76,8 +81,8 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         s3_bucket = os.environ.get('S3_BUCKET_NAME')
         use_s3 = os.environ.get('USE_S3', 'false').lower() == 'true'
         
-        logger.info(f"📊 Configuration:")
-        logger.info(f"   RDS: Connected")
+        logger.info("📊 Configuration:")
+        logger.info("   RDS: Connected")
         logger.info(f"   S3 Bucket: {s3_bucket if s3_bucket else 'Not used'}")
         logger.info(f"   Use S3: {use_s3}")
         
@@ -93,46 +98,48 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         
         # Get active symbols
         logger.info("📋 Loading active symbols...")
-        symbols = scanner.get_active_symbols(rds_client)
+        symbols = rds_client.get_active_symbols()
         logger.info(f"   Found {len(symbols)} active symbols")
         
         if not symbols:
             logger.warning("⚠️  No active symbols found. Exiting.")
             return 0
         
-        # Get pre-built strategies
-        logger.info("🔍 Loading pick profiles...")
-        pick_profiles = scanner.get_pick_profiles()
-        logger.info(f"   Loaded {len(pick_profiles)} pick profiles:")
-        for profile in pick_profiles:
-            logger.info(f"     - {profile['pick_type']} ({profile['strategy_name']}, {profile['term']})")
+        # Get strategy metadata and validate strategy_name
+        logger.info("🔍 Loading strategy metadata...")
+        strategy_metadata = scanner.get_strategy_metadata()
+        available_strategy_names = [s.get("strategy_name") for s in strategy_metadata]
+        if strategy_name not in available_strategy_names:
+            raise ValueError(
+                f"Unknown strategy_name '{strategy_name}'. "
+                f"Available: {', '.join([n for n in available_strategy_names if n])}"
+            )
+        logger.info(f"   Loaded {len(strategy_metadata)} strategies")
         
         # Scan symbols
-        logger.info("🔎 Scanning symbols with multi-timeframe pick profiles...")
+        logger.info("🔎 Scanning symbols...")
         signals = scanner.run(
             symbols=symbols,
-            pick_profiles=pick_profiles,
+            strategy_metadata=strategy_metadata,
             scan_date=scan_date,
-            rds_client=rds_client
+            include_strategy_names=[strategy_name],
         )
         
         logger.info(f"   Generated {len(signals)} signals")
 
-        logger.info("🏆 Ranking top picks by pick type...")
+        logger.info("🏆 Ranking top picks...")
         ranked = scanner.rank(
             signals,
-            by_pick_type=True,
+            by_pick_type=False,
             top_k=10,
             unique_symbol=True,
         )
-        total_top_picks = sum(len(v) for v in ranked.values())
-        logger.info(f"   Selected {total_top_picks} top picks across {len(ranked)} pick types")
+        total_top_picks = len(ranked)
+        logger.info(f"   Selected {total_top_picks} top picks")
 
-        logger.info("💾 Writing signals and top picks to RDS...")
-        total_written = scanner.write(ranked, rds_client, scan_date, all_signals=signals if signals else None)
-        signals_written = len(signals) if signals else 0
-        picks_written = total_written - signals_written
-        logger.info(f"   Wrote {signals_written} signals, {picks_written} top picks")
+        logger.info("💾 Writing top picks to RDS...")
+        picks_written = scanner.write(ranked, rds_client, scan_date)
+        logger.info(f"   Wrote {picks_written} top picks")
         
         # Close RDS connection
         rds_client.close()
@@ -140,15 +147,14 @@ def run_scanner_job(scan_date: Optional[date] = None) -> int:
         logger.info("=" * 80)
         logger.info("✅ DAILY SCANNER JOB COMPLETED SUCCESSFULLY")
         logger.info("=" * 80)
-        logger.info(f"📊 Summary:")
+        logger.info("📊 Summary:")
         logger.info(f"   Symbols scanned: {len(symbols)}")
-        logger.info(f"   Pick profiles run: {len(pick_profiles)}")
+        logger.info(f"   Strategy run: {strategy_name}")
         logger.info(f"   Signals generated: {len(signals)}")
-        logger.info(f"   Signals written: {signals_written}")
         logger.info(f"   Top picks written: {picks_written}")
         logger.info(f"⏰ End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        return written_count
+        return picks_written
         
     except Exception as e:
         logger.error("=" * 80)
@@ -167,6 +173,7 @@ def main():
     # Get configuration from environment variables
     aws_region = os.environ.get('AWS_REGION', 'ca-west-1')
     scan_date_str = os.environ.get('SCAN_DATE')  # Optional: override scan date
+    strategy_name = os.environ.get('STRATEGY_NAME', 'vegas_channel_short_term')
     
     # Parse scan date if provided
     scan_date = None
@@ -176,15 +183,19 @@ def main():
         except ValueError:
             logger.warning(f"Invalid SCAN_DATE format: {scan_date_str}. Using today.")
     
-    logger.info(f"📋 CONFIGURATION:")
+    logger.info("📋 CONFIGURATION:")
     logger.info(f"   AWS_REGION: {aws_region}")
     logger.info(f"   SCAN_DATE: {scan_date or 'Today (default)'}")
+    logger.info(f"   STRATEGY_NAME: {strategy_name}")
     
     try:
         logger.info("\n✅ Starting Daily Scanner...")
-        signals_written = run_scanner_job(scan_date=scan_date)
+        picks_written = run_scanner_job(
+            scan_date=scan_date,
+            strategy_name=strategy_name,
+        )
         
-        logger.info(f"\n✅ Scanner completed successfully. Wrote {signals_written} signals.")
+        logger.info(f"\n✅ Scanner completed successfully. Wrote {picks_written} top picks.")
         sys.exit(0)
         
     except Exception as e:

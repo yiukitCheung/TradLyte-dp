@@ -9,6 +9,7 @@ outputs daily suggested symbols. Used by AWS Batch job for daily scanning.
 from typing import List, Dict, Any, Optional, Callable, Union
 from datetime import date, timedelta
 from collections import defaultdict
+import json
 import polars as pl
 from .models import SignalResult
 from .strategies.base import BaseStrategy
@@ -248,9 +249,6 @@ class DailyScanner:
         batch_size: int = 100,
     ) -> List[SignalResult]:
         """Batch-load 1d from RDS, resample in memory, run profiles; return list of signals."""
-        import logging
-        logger = logging.getLogger(__name__)
-
         # Initialize the signals list
         signals: List[SignalResult] = []
         print(f"Starting run: {len(symbols)} symbols, scan_date={scan_date}")
@@ -283,7 +281,7 @@ class DailyScanner:
         print(f"All timeframes required: {', '.join(all_timeframes)}")
 
         # Define the start and end dates
-        start_date = scan_date - timedelta(days=365 * 5)
+        start_date = scan_date - timedelta(days=365 * 3)
         end_date = scan_date
         print(f"Data window: {start_date} to {end_date}")
 
@@ -340,12 +338,12 @@ class DailyScanner:
         unique_symbol: bool = True,
     ) -> Union[List[SignalResult], Dict[str, List[SignalResult]]]:
         """
-        Rank signals by confidence + setup/trigger.
+        Rank signals by confidence only (dense rank).
         
         Args:
             signals: List of SignalResult to rank.
-            top_k: Max signals to return (per pick_type if by_pick_type=True).
-            by_pick_type: If True, group by pick_type and return dict; else return flat list.
+            top_k: Maximum dense-rank bucket to include (per strategy_name if by_pick_type=True).
+            by_pick_type: If True, group by strategy_name and return dict; else return flat list.
             unique_symbol: If True, only one signal per symbol.
         
         Returns:
@@ -354,68 +352,63 @@ class DailyScanner:
         if not signals:
             return {} if by_pick_type else []
 
-        scored: List[tuple[float, SignalResult]] = []
-        for signal in signals:
-            confidence = float(signal.confidence or 0.0)
-            score = confidence
-            if signal.setup_valid:
-                score += 0.15
-            if signal.trigger_met:
-                score += 0.15
-            if signal.signal == "BUY":
-                score += 0.10
+        def rank_dense_confidence(items: List[SignalResult]) -> List[SignalResult]:
+            scored: List[tuple[float, SignalResult]] = [
+                (float(signal.confidence or 0.0), signal) for signal in items
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
 
-            metadata = dict(signal.metadata or {})
-            metadata["ranking_score"] = min(score, 1.5)
-            signal.metadata = metadata
-            scored.append((score, signal))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
+            ranked_items: List[SignalResult] = []
+            seen_symbols: set[str] = set()
+            current_rank = 0
+            previous_confidence: Optional[float] = None
+            for confidence, signal in scored:
+                if previous_confidence is None or confidence != previous_confidence:
+                    current_rank += 1
+                    previous_confidence = confidence
+                if current_rank > top_k:
+                    break
+                if unique_symbol and signal.symbol in seen_symbols:
+                    continue
+                metadata = dict(signal.metadata or {})
+                metadata["ranking_score"] = confidence
+                metadata["dense_rank"] = current_rank
+                signal.metadata = metadata
+                ranked_items.append(signal)
+                seen_symbols.add(signal.symbol)
+            return ranked_items
 
         if by_pick_type:
-            grouped: Dict[str, List[SignalResult]] = defaultdict(list)
-            seen_by_type: Dict[str, set] = defaultdict(set)
-            for _, signal in scored:
-                pick_type = (signal.metadata or {}).get("pick_type", "unclassified")
-                if unique_symbol and signal.symbol in seen_by_type[pick_type]:
-                    continue
-                if len(grouped[pick_type]) >= top_k:
-                    continue
-                grouped[pick_type].append(signal)
-                seen_by_type[pick_type].add(signal.symbol)
-            return dict(grouped)
+            grouped_input: Dict[str, List[SignalResult]] = defaultdict(list)
+            for signal in signals:
+                pick_type = (signal.metadata or {}).get("strategy_name", "unclassified")
+                grouped_input[pick_type].append(signal)
+            return {
+                pick_type: rank_dense_confidence(group_signals)
+                for pick_type, group_signals in grouped_input.items()
+            }
 
-        ranked: List[SignalResult] = []
-        seen_symbols: set[str] = set()
-        for _, signal in scored:
-            if unique_symbol and signal.symbol in seen_symbols:
-                continue
-            ranked.append(signal)
-            seen_symbols.add(signal.symbol)
-            if len(ranked) >= top_k:
-                break
-        return ranked
+        return rank_dense_confidence(signals)
 
     def write(
         self,
         ranked: Union[List[SignalResult], Dict[str, List[SignalResult]]],
         rds_client: Any,
         scan_date: date,
-        all_signals: Optional[List[SignalResult]] = None,
     ) -> int:
         """
-        Write signals to RDS.
+        Write ranked top picks to RDS.
         
         Args:
-            ranked: Output from rank(). List writes to daily_signals; dict writes to daily_scan_top_picks.
+            ranked: Output from rank(). Dict writes grouped pick types;
+                list is written as pick_type='unclassified'.
             rds_client: RDS client with connection/conn or execute_query().
             scan_date: Date for the scan (used for top_picks table).
-            all_signals: If provided (and ranked is dict), also write these to daily_signals.
         
         Returns:
             Total rows written.
         """
-        if not ranked and not all_signals:
+        if not ranked:
             return 0
 
         conn = None
@@ -424,69 +417,12 @@ class DailyScanner:
         elif hasattr(rds_client, "conn"):
             conn = rds_client.conn
 
-        total = 0
-
-        if all_signals:
-            total += self._write_signals_internal(all_signals, conn, rds_client)
-
         if isinstance(ranked, dict):
-            total += self._write_top_picks_internal(ranked, scan_date, conn, rds_client)
-        elif ranked:
-            total += self._write_signals_internal(ranked, conn, rds_client)
-
-        return total
-
-    def _write_signals_internal(
-        self,
-        signals: List[SignalResult],
-        conn: Any,
-        rds_client: Any,
-    ) -> int:
-        """Internal: write signals to daily_signals."""
-        if not signals:
-            return 0
-
-        values = [
-            (
-                signal.symbol,
-                signal.date,
-                (signal.metadata or {}).get("strategy_name", "Unknown"),
-                signal.signal,
-                signal.price,
-                signal.confidence or 0.0,
-                signal.setup_valid,
-                signal.trigger_met,
-                str(signal.metadata) if signal.metadata else "{}",
-            )
-            for signal in signals
-        ]
-
-        query = """
-        INSERT INTO daily_signals 
-        (symbol, date, strategy_name, signal, price, confidence, setup_valid, trigger_met, metadata)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (symbol, date, strategy_name) 
-        DO UPDATE SET
-            signal = EXCLUDED.signal,
-            price = EXCLUDED.price,
-            confidence = EXCLUDED.confidence,
-            setup_valid = EXCLUDED.setup_valid,
-            trigger_met = EXCLUDED.trigger_met,
-            metadata = EXCLUDED.metadata,
-            created_at = CURRENT_TIMESTAMP
-        """
-
-        if conn:
-            with conn.cursor() as cur:
-                cur.executemany(query, values)
-            conn.commit()
-        elif hasattr(rds_client, "execute_query"):
-            for v in values:
-                rds_client.execute_query(query, v)
+            ranked_dict = ranked
         else:
-            raise ValueError("Unsupported rds_client")
+            ranked_dict = {"unclassified": ranked}
 
-        return len(signals)
+        return self._write_top_picks_internal(ranked_dict, scan_date, conn, rds_client)
 
     def _write_top_picks_internal(
         self,
@@ -500,37 +436,31 @@ class DailyScanner:
             return 0
 
         values = []
-        for pick_type, picks in ranked.items():
+        for strategy_name, picks in ranked.items():
             for rank_idx, signal in enumerate(picks, start=1):
-                strategy_name = (signal.metadata or {}).get("strategy_name", "Unknown")
-                score = float((signal.metadata or {}).get("ranking_score", signal.confidence or 0.0))
+                metadata_json = json.dumps(signal.metadata or {})
                 values.append((
                     signal.date or scan_date.isoformat(),
-                    pick_type,
-                    rank_idx,
                     signal.symbol,
                     strategy_name,
                     signal.signal,
                     signal.price,
                     float(signal.confidence or 0.0),
-                    score,
-                    str(signal.metadata) if signal.metadata else "{}",
+                    metadata_json,
+                    rank_idx
                 ))
 
         query = """
-        INSERT INTO daily_scan_top_picks
-        (scan_date, pick_type, rank, symbol, strategy_name, signal, price, confidence, score, metadata)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (scan_date, pick_type, rank)
-        DO UPDATE SET
-            symbol = EXCLUDED.symbol,
-            strategy_name = EXCLUDED.strategy_name,
+        INSERT INTO stock_picks
+        (scan_date, symbol, strategy_name, signal, price, confidence, metadata, rank)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+        ON CONFLICT (scan_date, symbol, strategy_name)
+        DO UPDATE SET   
             signal = EXCLUDED.signal,
             price = EXCLUDED.price,
             confidence = EXCLUDED.confidence,
-            score = EXCLUDED.score,
             metadata = EXCLUDED.metadata,
-            created_at = CURRENT_TIMESTAMP
+            rank = EXCLUDED.rank
         """
 
         if conn:
@@ -545,14 +475,5 @@ class DailyScanner:
 
         return len(values)
     
-    def _calculate_confidence(self, signal_data: Dict[str, Any]) -> float:
-        """Confidence 0.5 + 0.2 if setup_valid + 0.3 if trigger_met (cap 1.0)."""
-        confidence = 0.5
-        if signal_data.get("setup_valid", False):
-            confidence += 0.2
-        if signal_data.get("trigger_met", False):
-            confidence += 0.3
-        return min(confidence, 1.0)
-
     # Backward-compatible alias
     scan = run
