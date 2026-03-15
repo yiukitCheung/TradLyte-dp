@@ -1,0 +1,4 @@
+# scan_partitioner Lambda dependencies
+# boto3 is pre-installed in the Lambda runtime — not listed here.
+# psycopg2-binary is needed by shared/clients/rds_timescale_client.py
+psycopg2-binary>=2.9.9

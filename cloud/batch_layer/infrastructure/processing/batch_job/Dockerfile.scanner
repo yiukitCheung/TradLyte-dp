@@ -1,0 +1,45 @@
+# Scanner Batch Job Container
+# Handles both scanner_worker (Array Job) and scanner_aggregator (single job).
+# JOB_TYPE env var set by Step Functions ContainerOverrides selects the mode.
+#
+# Build context must be cloud/batch_layer/ — build script handles this.
+# Shared analytics_core modules are copied to processing/shared/ before build.
+
+FROM python:3.11-slim
+
+ARG BUILD_DATE
+ARG VCS_REF
+
+LABEL org.label-schema.build-date=$BUILD_DATE \
+      org.label-schema.name="scanner-batch" \
+      org.label-schema.description="Daily scanner: symbol chunking → strategy execution → global ranking" \
+      org.label-schema.vcs-ref=$VCS_REF
+
+WORKDIR /app
+
+# System deps: gcc for psycopg2 compilation, libpq-dev for PostgreSQL client
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (scanner-specific, lean set)
+COPY processing/batch_jobs/requirements.scanner.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy shared analytics_core modules (copied to processing/shared/ by build script)
+COPY processing/shared/ ./shared/
+
+# Copy scanner entry point only
+COPY processing/batch_jobs/scan.py .
+
+ENV PYTHONPATH=/app
+# Default mode — Step Functions overrides this per submission
+ENV JOB_TYPE=scanner_worker
+
+RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
+USER app
+
+# Always runs scan.py; JOB_TYPE env var controls worker vs aggregator path
+CMD ["python", "scan.py"]

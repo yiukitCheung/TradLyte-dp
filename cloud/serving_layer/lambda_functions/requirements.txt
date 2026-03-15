@@ -1,0 +1,10 @@
+# Quote Service Lambda Dependencies
+
+# Polygon.io REST client
+polygon-api-client>=1.13.0
+
+# Redis client for caching
+redis>=5.0.0
+
+# AWS SDK (boto3) is included in Lambda runtime
+# No need to include here

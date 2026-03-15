@@ -1,0 +1,6 @@
+# scan_partitioner Lambda dependencies
+# boto3 is pre-installed in the Lambda runtime — not listed here.
+# psycopg2-binary  → shared/clients/rds_timescale_client.py
+# pydantic         → shared/models/data_models.py (imported by rds_timescale_client)
+psycopg2-binary>=2.9.9
+pydantic>=2.0.0

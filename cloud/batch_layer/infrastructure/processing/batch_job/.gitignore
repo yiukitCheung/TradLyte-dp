@@ -1,0 +1,7 @@
+# Docker build artifacts
+*.tar
+*.tar.gz
+
+# Temporary files
+shared/
+

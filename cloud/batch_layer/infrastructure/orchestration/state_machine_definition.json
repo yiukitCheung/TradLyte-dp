@@ -1,0 +1,214 @@
+{
+  "Comment": "Daily pipeline: parallel fetch → partition symbols → 10 parallel scanner workers → global aggregator → done",
+  "StartAt": "ParallelFetchers",
+  "States": {
+
+    "ParallelFetchers": {
+      "Type": "Parallel",
+      "Comment": "Fetch OHLCV data and symbol metadata in parallel so neither blocks the other.",
+      "Branches": [
+        {
+          "StartAt": "FetchOHLCV",
+          "States": {
+            "FetchOHLCV": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-ohlcv-fetcher",
+                "Payload": {
+                  "skip_market_check": false,
+                  "backfill_missing": true,
+                  "max_backfill_days": 7
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "End": true,
+              "ResultPath": "$.ohlcvResult"
+            }
+          }
+        },
+        {
+          "StartAt": "FetchMetadata",
+          "States": {
+            "FetchMetadata": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-meta-fetcher",
+                "Payload": {}
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "End": true,
+              "ResultPath": "$.metadataResult"
+            }
+          }
+        }
+      ],
+      "Next": "PartitionSymbols",
+      "ResultPath": "$.fetcherResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "PartitionSymbols": {
+      "Type": "Task",
+      "Comment": "Tiny Lambda: queries RDS for active symbols once, splits into 10 chunks, writes chunk_N.json files to S3. Workers download their file — zero full-universe RDS hits inside Batch.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-scan-partitioner",
+        "Payload": {
+          "scan_date.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)",
+          "array_size": 10
+        }
+      },
+      "ResultPath": "$.partitionResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "RunScannerWorkers"
+    },
+
+    "RunScannerWorkers": {
+      "Type": "Task",
+      "Comment": "Array Job (10 children). Each container downloads its S3 chunk, queries RDS for only its ~500 symbols, runs strategies, writes raw signals to daily_scan_signals. Step Functions waits for all 10 to finish.",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName.$": "States.Format('scanner-workers-{}', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "JobQueue": "arn:aws:batch:ca-west-1:471112909340:job-queue/dev-batch-scanner",
+        "JobDefinition": "arn:aws:batch:ca-west-1:471112909340:job-definition/dev-batch-scanner-worker",
+        "ArrayProperties": {
+          "Size": 10
+        },
+        "ContainerOverrides": {
+          "Environment": [
+            {
+              "Name": "JOB_TYPE",
+              "Value": "scanner_worker"
+            },
+            {
+              "Name": "SCAN_DATE",
+              "Value.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
+            }
+          ]
+        }
+      },
+      "ResultPath": "$.scannerWorkersResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Batch.BatchException", "States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "RunScannerAggregator"
+    },
+
+    "RunScannerAggregator": {
+      "Type": "Task",
+      "Comment": "Single container: reads every signal from daily_scan_signals for today, ranks globally across the full universe, writes final top picks to stock_picks, then cleans up the staging table.",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName.$": "States.Format('scanner-aggregator-{}', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0))",
+        "JobQueue": "arn:aws:batch:ca-west-1:471112909340:job-queue/dev-batch-scanner",
+        "JobDefinition": "arn:aws:batch:ca-west-1:471112909340:job-definition/dev-batch-scanner-aggregator",
+        "ContainerOverrides": {
+          "Environment": [
+            {
+              "Name": "JOB_TYPE",
+              "Value": "scanner_aggregator"
+            },
+            {
+              "Name": "SCAN_DATE",
+              "Value.$": "States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0)"
+            }
+          ]
+        }
+      },
+      "ResultPath": "$.scannerAggregatorResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Batch.BatchException", "States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PipelineComplete"
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Comment": "Publish SNS alert on any pipeline failure.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:ca-west-1:471112909340:condvest-pipeline-alerts",
+        "Subject": "Daily Pipeline Failed",
+        "Message.$": "States.Format('Pipeline execution {} failed. Error: {}', $$.Execution.Name, $.error)"
+      },
+      "Next": "PipelineFailed",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed"
+        }
+      ]
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineExecutionFailed",
+      "Cause": "One or more pipeline stages failed"
+    },
+
+    "PipelineComplete": {
+      "Type": "Succeed",
+      "Comment": "All stages completed successfully."
+    }
+  }
+}

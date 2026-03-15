@@ -1,0 +1,20 @@
+# DuckDB + S3 Data Lake Batch Jobs Dependencies
+# Requirements for AWS Batch + Fargate deployment (Resampler + Consolidator)
+
+# DuckDB for S3 data processing
+duckdb>=1.2.2
+
+# Data processing and analysis
+pandas>=2.1.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# AWS SDK
+boto3>=1.34.0
+
+# Date/time handling
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# PostgreSQL client for RDS watermark queries (consolidator)
+psycopg2-binary>=2.9.9

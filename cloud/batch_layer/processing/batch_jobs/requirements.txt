@@ -1,0 +1,29 @@
+# AWS Batch Jobs Dependencies
+# Covers: Resampler, Consolidator, Scanner (worker + aggregator)
+
+# DuckDB for S3 data processing (resampler / consolidator)
+duckdb>=1.2.2
+
+# Data processing
+pandas>=2.1.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# Polars — scanner engine uses polars for in-memory resampling
+polars>=0.20.0
+
+# Pydantic — SignalResult and strategy models
+pydantic>=2.0.0
+
+# AWS SDK
+boto3>=1.34.0
+
+# PostgreSQL driver
+psycopg2-binary>=2.9.9
+
+# Date/time handling
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# Async HTTP (historical backfill)
+aiohttp>=3.9.0

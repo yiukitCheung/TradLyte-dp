@@ -1,0 +1,8 @@
+# connect to the timescaledb container (CORRECTED)
+docker exec -it batch-timescaledb psql -U yiukitcheung -d condvest
+
+# down the container (CORRECTED)
+docker-compose -f cloud/batch_layer/local_dev/docker-compose.yml down
+
+# Alternative: if running from batch_layer/local_dev directory
+# docker-compose down

@@ -1,0 +1,10 @@
+# Terraform state and providers
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+terraform.tfvars
+
+# Old/deprecated files
+batch_trigger.*
+

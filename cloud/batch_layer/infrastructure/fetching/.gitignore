@@ -1,0 +1,11 @@
+# Lambda deployment build artifacts
+deployment_packages/package/
+deployment_packages/*.zip
+deployment_packages/python/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
