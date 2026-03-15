@@ -1,5 +1,0 @@
-# Daily Meta Fetcher Logs
-aws logs tail /aws/lambda/dev-batch-daily-meta-fetcher --follow --region ca-west-1
-
-# Daily OHLCV Fetcher Logs
-aws logs tail /aws/lambda/dev-batch-daily-ohlcv-fetcher --follow --region ca-west-1
