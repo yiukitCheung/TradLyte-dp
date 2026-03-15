@@ -11,7 +11,7 @@ This directory contains the AWS Step Functions state machine that orchestrates t
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                                                                            │
 │   ┌──────────────────────────────────────────────────────────────────┐    │
-│   │              STAGE 1: PARALLEL FETCHERS                          │    │
+│   │  STAGE 1: PARALLEL FETCHERS                          (~3 min)    │    │
 │   │  ┌─────────────────────────┐   ┌─────────────────────────┐      │    │
 │   │  │   Lambda: OHLCV Fetcher │   │  Lambda: Meta Fetcher   │      │    │
 │   │  │   (2 retries)           │   │  (2 retries)            │      │    │
@@ -19,11 +19,37 @@ This directory contains the AWS Step Functions state machine that orchestrates t
 │   │              └─────────────┬───────────────┘                     │    │
 │   └────────────────────────────┼─────────────────────────────────────┘    │
 │                                ▼                                           │
-│                          ┌─────────────────────┐                          │
-│                          │  ✅ Pipeline Complete │                          │
-│                          └─────────────────────┘                          │
+│   ┌──────────────────────────────────────────────────────────────────┐    │
+│   │  STAGE 2: PARTITION SYMBOLS                          (~30 sec)   │    │
+│   │  Lambda: scan_partitioner                                        │    │
+│   │  → queries RDS once for active symbols                           │    │
+│   │  → writes 10 chunk_N.json files to S3                            │    │
+│   └──────────────────────────────┬───────────────────────────────────┘    │
+│                                  ▼                                         │
+│   ┌──────────────────────────────────────────────────────────────────┐    │
+│   │  STAGE 3: SCANNER WORKERS (Array Job x10)         (~10–20 min)   │    │
+│   │  Batch: dev-batch-scanner-worker  (4 vCPU / 8 GB each)          │    │
+│   │  Each container:                                                 │    │
+│   │    1. Downloads its S3 chunk (≈500 symbols)                      │    │
+│   │    2. Loads OHLCV from RDS                                       │    │
+│   │    3. Runs trading strategies                                    │    │
+│   │    4. Writes signals → daily_scan_signals (staging)              │    │
+│   └──────────────────────────────┬───────────────────────────────────┘    │
+│                                  ▼                                         │
+│   ┌──────────────────────────────────────────────────────────────────┐    │
+│   │  STAGE 4: SCANNER AGGREGATOR                         (~1–2 min)  │    │
+│   │  Batch: dev-batch-scanner-aggregator  (2 vCPU / 4 GB)           │    │
+│   │    1. Reads all signals from daily_scan_signals                  │    │
+│   │    2. Global rank across full universe                           │    │
+│   │    3. Writes top picks → stock_picks                             │    │
+│   │    4. Cleans up daily_scan_signals for today                     │    │
+│   └──────────────────────────────┬───────────────────────────────────┘    │
+│                                  ▼                                         │
+│                    ┌─────────────────────────┐                             │
+│                    │  ✅ Pipeline Complete     │  (~15–25 min total)        │
+│                    └─────────────────────────┘                             │
 │                                                                            │
-│   ON FAILURE → SNS: condvest-pipeline-alerts → Email Notification         │
+│   ON FAILURE (any stage) → SNS: condvest-pipeline-alerts → Email          │
 │                                                                            │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -36,31 +62,45 @@ This directory contains the AWS Step Functions state machine that orchestrates t
 | **IAM Role** | `condvest-pipeline-step-functions-role` | Permissions for Lambda/Batch/SNS |
 | **EventBridge Rule** | `condvest-daily-pipeline-trigger` | Daily trigger at 21:05 UTC |
 | **SNS Topic** | `condvest-pipeline-alerts` | Failure notifications |
+| **Lambda** | `dev-batch-scan-partitioner` | Symbol partitioner (Stage 2) |
+| **Batch Job Queue** | `dev-batch-scanner` | Fargate queue for scanner jobs |
+| **Batch Job Def** | `dev-batch-scanner-worker` | Array Job child (4 vCPU / 8 GB) |
+| **Batch Job Def** | `dev-batch-scanner-aggregator` | Single aggregator job (2 vCPU / 4 GB) |
+| **CloudWatch Log Group** | `/aws/batch/dev-batch-scanner` | Scanner job logs |
 
 ## Schedule
 
 | Component | Time (UTC) | Time (ET) |
 |-----------|------------|-----------|
 | Pipeline Trigger | 21:05 | 4:05 PM |
-| Expected Completion | ~21:08 | ~4:08 PM |
+| Expected Completion | ~21:25–21:30 | ~4:25–4:30 PM |
 
-**Total Duration:** ~2–5 minutes (fetchers only; no consolidator/resampler)
+**Total Duration:** ~15–25 minutes (fetchers ~3 min + partitioner ~30 sec + scanner array job ~10–20 min + aggregator ~1–2 min)
 
 ## Key Benefits
 
-- **⚡ Parallel Execution:** OHLCV and Metadata fetchers run in parallel
-- **🔄 Automatic Retries:** Lambda (2 retries each)
-- **📧 Failure Alerts:** SNS notification with full error details on any failure
-- **📊 Visual Monitoring:** AWS Console shows real-time execution graph
-- **Resampling:** Done on-the-fly in backtester from raw 1d (consolidator/resampler Batch jobs archived)
+- **⚡ Parallel Execution:** OHLCV and Metadata fetchers run in parallel (Stage 1); 10 scanner workers run simultaneously (Stage 3)
+- **🔄 Automatic Retries:** Lambda stages (2 retries); Batch stages (2 retries with backoff)
+- **📧 Failure Alerts:** SNS notification with full error details on any stage failure
+- **📊 Visual Monitoring:** AWS Console shows real-time execution graph per stage
+- **💾 Efficient RDS Access:** Partitioner queries symbols once; each worker only touches its ~500-symbol slice
+- **🏆 Global Ranking:** Aggregator ranks across the full 5,000+ symbol universe after all workers finish
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `state_machine_definition.json` | Step Functions ASL definition |
+| `state_machine_definition.json` | Step Functions ASL definition (4-stage pipeline) |
 | `deploy_step_functions.sh` | Deployment script for state machine + IAM + EventBridge |
 | `README.md` | This documentation |
+
+## Related Deployment Scripts
+
+| Script | Location | Description |
+|--------|----------|-------------|
+| `deploy_processing_lambda.sh` | `infrastructure/processing/lambda_functions/` | Deploys `scan_partitioner` Lambda |
+| `build_scanner_container.sh` | `infrastructure/processing/batch_job/` | Builds + pushes scanner Docker image to ECR |
+| `deploy_scanner_batch_jobs.sh` | `infrastructure/processing/batch_job/` | Registers worker + aggregator job definitions |
 
 ## Manual Operations
 
@@ -122,11 +162,12 @@ The `condvest-pipeline-alerts` SNS topic sends notifications when any stage fail
 
 ## Retry Logic
 
-| Stage | Component | Max Retries | Backoff |
-|-------|-----------|-------------|---------|
-| 1 | Lambda Fetchers | 2 | 3s exponential |
-| 2 | Batch Consolidator | 1 | 60s interval |
-| 3 | Batch Resamplers | 0 | N/A (fail fast) |
+| Stage | Component | Max Retries | Timeout | Backoff |
+|-------|-----------|-------------|---------|---------|
+| 1 | Lambda Fetchers (x2 parallel) | 2 | 15 min each | 60s exponential |
+| 2 | Partition Symbols Lambda | 2 | 5 min | 30s exponential |
+| 3 | Scanner Workers (Array x10) | 2 | 60 min | 60s interval |
+| 4 | Scanner Aggregator | 2 | 20 min | 30s interval |
 
 ## Troubleshooting
 
@@ -164,5 +205,5 @@ The script will:
 
 ---
 
-**Last Updated:** December 10, 2025
+**Last Updated:** March 2026
 
