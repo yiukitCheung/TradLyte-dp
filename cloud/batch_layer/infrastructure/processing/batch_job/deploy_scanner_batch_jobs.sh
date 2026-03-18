@@ -32,7 +32,7 @@ WORKER_JOB_NAME="${ENVIRONMENT}-batch-scanner-worker"
 AGGREGATOR_JOB_NAME="${ENVIRONMENT}-batch-scanner-aggregator"
 
 S3_BUCKET="${S3_BUCKET:-dev-condvest-datalake}"
-RDS_SECRET_ARN="${RDS_SECRET_ARN:-arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:dev-rds-credentials}"
+RDS_SECRET_ARN="${RDS_SECRET_ARN:-arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:dev-batch-postgres-credentials}"
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 DEPLOY_TARGET="all"
