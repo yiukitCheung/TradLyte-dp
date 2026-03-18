@@ -19,6 +19,7 @@ import os
 import sys
 import logging
 import json
+from collections import Counter
 from datetime import date, datetime
 from typing import List, Optional
 
@@ -64,6 +65,66 @@ def get_rds_connection_string() -> str:
     user = secret['username']
     pwd = secret['password']
     return f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+
+
+def ensure_daily_scan_signals_table(rds_client: RDSTimescaleClient) -> None:
+    """
+    Ensure scanner staging table exists.
+
+    Workers fan out and write raw signals here; aggregator reads and then
+    clears same-day rows after final top picks are written.
+    """
+    ddl = """
+    CREATE TABLE IF NOT EXISTS daily_scan_signals (
+        scan_date     DATE         NOT NULL,
+        worker_idx    SMALLINT     NOT NULL,
+        symbol        VARCHAR(50)  NOT NULL,
+        strategy_name VARCHAR(255) NOT NULL,
+        signal        VARCHAR(10)  NOT NULL CHECK (signal IN ('BUY', 'SELL', 'HOLD')),
+        price         DECIMAL(12,4) NOT NULL,
+        confidence    DECIMAL(5,4),
+        metadata      JSONB        DEFAULT '{}'::jsonb,
+        created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (scan_date, symbol, strategy_name)
+    );
+    """
+    idx = """
+    CREATE INDEX IF NOT EXISTS idx_daily_scan_signals_date
+    ON daily_scan_signals(scan_date);
+    """
+    rds_client.execute_query(ddl)
+    rds_client.execute_query(idx)
+
+
+def _log_signal_summary(signals: List[SignalResult], context: str) -> None:
+    """Emit compact signal diagnostics to CloudWatch for fast debugging."""
+    if not signals:
+        logger.warning(f"{context}: no signals generated.")
+        return
+
+    strategy_counts = Counter((s.metadata or {}).get("strategy_name", "unknown") for s in signals)
+    confidences = [float(s.confidence) for s in signals if s.confidence is not None]
+    min_conf = min(confidences) if confidences else None
+    max_conf = max(confidences) if confidences else None
+    sample = [
+        {
+            "symbol": s.symbol,
+            "strategy": (s.metadata or {}).get("strategy_name", "unknown"),
+            "signal": s.signal,
+            "confidence": s.confidence,
+        }
+        for s in signals[:5]
+    ]
+
+    logger.info(
+        "%s: total=%s strategies=%s confidence_range=(%s,%s) sample=%s",
+        context,
+        len(signals),
+        dict(strategy_counts),
+        min_conf,
+        max_conf,
+        sample,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +174,7 @@ def run_worker(
 
     rds_conn_str = get_rds_connection_string()
     rds_client   = RDSTimescaleClient(secret_arn=os.environ.get('RDS_SECRET_ARN'))
+    ensure_daily_scan_signals_table(rds_client)
 
     # ----- symbol slice comes from S3, not from a full RDS query -----
     symbol_slice = _load_symbols_from_s3(scan_date, array_index)
@@ -125,7 +187,9 @@ def run_worker(
 
     # ----- scan -----
     scanner = DailyScanner(rds_connection_string=rds_conn_str)
-    strategy_metadata = scanner.get_strategy_metadata(include_strategy_names=['vegas_channel_short_term'])
+    # get_strategy_metadata() accepts pick-type filters, not strategy-name filters.
+    # Strategy-name filtering is applied below via scanner.run(include_strategy_names=...).
+    strategy_metadata = scanner.get_strategy_metadata()
     available_names   = [s['strategy_name'] for s in strategy_metadata]
 
     if strategy_names:
@@ -143,8 +207,15 @@ def run_worker(
         include_strategy_names=include,
     )
     logger.info(f"Generated {len(signals)} signals from {len(symbol_slice)} symbols")
+    _log_signal_summary(signals, f"WORKER[{array_index}] signal summary")
 
     if not signals:
+        logger.warning(
+            "WORKER[%s] produced zero signals from %s symbols. "
+            "This is valid if no symbols met BUY criteria.",
+            array_index,
+            len(symbol_slice),
+        )
         return 0
 
     # ----- write raw signals to staging table -----
@@ -183,8 +254,23 @@ def run_worker(
                 """,
                 rows,
             )
+            cur.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM daily_scan_signals
+                WHERE scan_date = %s AND worker_idx = %s
+                """,
+                (scan_date.isoformat(), array_index),
+            )
+            staging_count = cur.fetchone()[0]
         conn.commit()
         logger.info(f"Wrote {len(rows)} signal rows to daily_scan_signals")
+        logger.info(
+            "WORKER[%s] staging rows present for %s: %s",
+            array_index,
+            scan_date,
+            staging_count,
+        )
     except Exception:
         conn.rollback()
         raise
@@ -216,6 +302,7 @@ def run_aggregator(
 
     rds_conn_str = get_rds_connection_string()
     rds_client   = RDSTimescaleClient(secret_arn=os.environ.get('RDS_SECRET_ARN'))
+    ensure_daily_scan_signals_table(rds_client)
 
     # ----- read raw signals -----
     filter_clause = ""
@@ -241,6 +328,13 @@ def run_aggregator(
         return 0
 
     logger.info(f"Read {len(rows)} raw signals from staging table")
+    strategy_counts = Counter(r["strategy_name"] for r in rows)
+    distinct_symbols = len({r["symbol"] for r in rows})
+    logger.info(
+        "AGGREGATOR input summary: distinct_symbols=%s strategy_counts=%s",
+        distinct_symbols,
+        dict(strategy_counts),
+    )
 
     # Reconstruct SignalResult objects so scanner.rank() can process them
     signals: List[SignalResult] = [
@@ -267,10 +361,45 @@ def run_aggregator(
         if isinstance(ranked, dict) else len(ranked)
     )
     logger.info(f"Ranked {total} top picks across {len(ranked)} strategy group(s)")
+    if isinstance(ranked, dict):
+        preview = {
+            k: [
+                {
+                    "symbol": s.symbol,
+                    "confidence": s.confidence,
+                    "strategy_name": (s.metadata or {}).get("strategy_name"),
+                }
+                for s in v[:3]
+            ]
+            for k, v in ranked.items()
+        }
+    else:
+        preview = [
+            {
+                "symbol": s.symbol,
+                "confidence": s.confidence,
+                "strategy_name": (s.metadata or {}).get("strategy_name"),
+            }
+            for s in ranked[:10]
+        ]
+    logger.info("AGGREGATOR ranked preview: %s", preview)
 
     # ----- write stock_picks -----
     picks_written = scanner.write(ranked, rds_client, scan_date)
     logger.info(f"Wrote {picks_written} rows to stock_picks")
+    stock_picks_count = rds_client.execute_query(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM stock_picks
+        WHERE scan_date = %s
+        """,
+        (scan_date.isoformat(),),
+    )[0]["cnt"]
+    logger.info(
+        "AGGREGATOR post-write stock_picks rows for %s: %s",
+        scan_date,
+        stock_picks_count,
+    )
 
     # ----- clean up staging rows for today -----
     try:

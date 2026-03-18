@@ -23,8 +23,18 @@ from .strategies.base import BaseStrategy
 from .strategies.builder import CompositeStrategy
 from .inputs import load_ohlcv, load_ohlcv_multi_timeframe, resample_ohlcv
 from .executor import MultiTimeframeExecutor
-from .backtester import Backtester, BacktestResult, Position
 from .scanner import DailyScanner
+
+# Backtester is only used by the serving layer — import lazily so the scanner
+# Batch image (which omits numpy) does not fail on package load.
+def __getattr__(name):
+    if name in ('Backtester', 'BacktestResult', 'Position'):
+        from .backtester import Backtester, BacktestResult, Position
+        globals()['Backtester'] = Backtester
+        globals()['BacktestResult'] = BacktestResult
+        globals()['Position'] = Position
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Core classes
