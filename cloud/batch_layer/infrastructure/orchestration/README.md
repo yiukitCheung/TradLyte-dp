@@ -60,7 +60,7 @@ This directory contains the AWS Step Functions state machine that orchestrates t
 |----------|------|-------------|
 | **State Machine** | `condvest-daily-ohlcv-pipeline` | Main orchestration workflow |
 | **IAM Role** | `condvest-pipeline-step-functions-role` | Permissions for Lambda/Batch/SNS |
-| **EventBridge Rule** | `condvest-daily-pipeline-trigger` | Daily trigger at 21:05 UTC |
+| **EventBridge Scheduler** | `dev-daily-ohlcv-pipeline-schedule` | Daily trigger at 4:05 PM America/New_York |
 | **SNS Topic** | `condvest-pipeline-alerts` | Failure notifications |
 | **Lambda** | `dev-batch-scan-partitioner` | Symbol partitioner (Stage 2) |
 | **Batch Job Queue** | `dev-batch-scanner` | Fargate queue for scanner jobs |
@@ -70,12 +70,12 @@ This directory contains the AWS Step Functions state machine that orchestrates t
 
 ## Schedule
 
-| Component | Time (UTC) | Time (ET) |
-|-----------|------------|-----------|
-| Pipeline Trigger | 21:05 | 4:05 PM |
-| Expected Completion | ~21:25–21:30 | ~4:25–4:30 PM |
+| Component | Time (America/New_York) |
+|-----------|--------------------------|
+| Pipeline Trigger | 4:05 PM (Mon-Fri) |
+| Expected Completion | ~4:25–4:30 PM |
 
-**Total Duration:** ~15–25 minutes (fetchers ~3 min + partitioner ~30 sec + scanner array job ~10–20 min + aggregator ~1–2 min)
+**Total Duration:** ~15–25 minutes (fetchers ~3 min + partitioner ~30 sec + scanner array job ~10–20 min + aggregator ~1–2 min). Using `America/New_York` keeps the trigger time stable across DST changes.
 
 ## Key Benefits
 

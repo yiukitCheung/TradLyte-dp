@@ -188,7 +188,7 @@ else
     echo "✅ Updated: $STATE_MACHINE_ARN"
 fi
 
-# Step 6: Create EventBridge Schedule (daily at 21:00 UTC)
+# Step 6: Create EventBridge Schedule (daily at 4:05 PM America/New_York)
 echo ""
 echo "⏰ Creating EventBridge schedule..."
 
@@ -240,11 +240,13 @@ fi
 
 # Create EventBridge Scheduler schedule
 SCHEDULE_NAME="dev-daily-ohlcv-pipeline-schedule"
+SCHEDULE_EXPRESSION="cron(5 16 ? * MON-FRI *)"
+SCHEDULE_TIMEZONE="America/New_York"
 
 aws scheduler create-schedule \
     --name "$SCHEDULE_NAME" \
-    --schedule-expression "cron(0 21 ? * MON-FRI *)" \
-    --schedule-expression-timezone "UTC" \
+    --schedule-expression "$SCHEDULE_EXPRESSION" \
+    --schedule-expression-timezone "$SCHEDULE_TIMEZONE" \
     --flexible-time-window '{"Mode": "OFF"}' \
     --target "{
         \"Arn\": \"$STATE_MACHINE_ARN\",
@@ -255,8 +257,8 @@ aws scheduler create-schedule \
     --region "$AWS_REGION" 2>/dev/null || \
 aws scheduler update-schedule \
     --name "$SCHEDULE_NAME" \
-    --schedule-expression "cron(0 21 ? * MON-FRI *)" \
-    --schedule-expression-timezone "UTC" \
+    --schedule-expression "$SCHEDULE_EXPRESSION" \
+    --schedule-expression-timezone "$SCHEDULE_TIMEZONE" \
     --flexible-time-window '{"Mode": "OFF"}' \
     --target "{
         \"Arn\": \"$STATE_MACHINE_ARN\",
@@ -266,7 +268,7 @@ aws scheduler update-schedule \
     --state "ENABLED" \
     --region "$AWS_REGION"
 
-echo "✅ Schedule created: $SCHEDULE_NAME (21:00 UTC, Mon-Fri)"
+echo "✅ Schedule created: $SCHEDULE_NAME (4:05 PM America/New_York, Mon-Fri)"
 
 # Restore original state machine definition
 mv "$SCRIPT_DIR/state_machine_definition.json.bak" "$SCRIPT_DIR/state_machine_definition.json" 2>/dev/null || true
@@ -280,7 +282,7 @@ echo "📋 Resources Created:"
 echo "   • State Machine: $STATE_MACHINE_ARN"
 echo "   • IAM Role: $ROLE_ARN"
 echo "   • SNS Topic: $SNS_TOPIC_ARN"
-echo "   • Schedule: $SCHEDULE_NAME (21:00 UTC, Mon-Fri)"
+echo "   • Schedule: $SCHEDULE_NAME (4:05 PM America/New_York, Mon-Fri)"
 echo ""
 echo "🔗 AWS Console Links:"
 echo "   • Step Functions: https://$AWS_REGION.console.aws.amazon.com/states/home?region=$AWS_REGION#/statemachines/view/$STATE_MACHINE_ARN"
