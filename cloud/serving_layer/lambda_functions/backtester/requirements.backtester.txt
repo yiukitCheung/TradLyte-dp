@@ -1,0 +1,7 @@
+# Minimal deps for containerized Backtester Lambda (ARM64).
+# Align versions with cloud/requirements.txt where practical.
+
+polars>=1.29.0,<2
+psycopg2-binary>=2.9.9
+numpy>=2.0,<3
+pydantic>=2.0,<3

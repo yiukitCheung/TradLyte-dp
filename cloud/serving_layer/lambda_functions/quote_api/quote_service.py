@@ -48,6 +48,23 @@ def get_redis_client():
     return redis_client
 
 
+def _field(obj: Any, *names: str, default: Any = 0) -> Any:
+    """Read attribute or dict key from Polygon SDK objects or plain dicts."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        for n in names:
+            if n in obj:
+                return obj[n]
+        return default
+    for n in names:
+        if hasattr(obj, n):
+            val = getattr(obj, n, None)
+            if val is not None:
+                return val
+    return default
+
+
 def get_polygon_api_key() -> str:
     """Get Polygon API key from Secrets Manager"""
     try:
@@ -84,22 +101,25 @@ def get_quote_from_polygon(symbol: str, api_key: str) -> Dict[str, Any]:
         # Extract relevant data
         if snapshot and hasattr(snapshot, 'ticker'):
             ticker_data = snapshot.ticker
+            lq = getattr(ticker_data, 'last_quote', None)
+            lt = getattr(ticker_data, 'last_trade', None)
+            pd = getattr(ticker_data, 'prev_day', None)
             quote = {
                 'symbol': symbol,
                 'last_quote': {
-                    'price': getattr(ticker_data, 'last_quote', {}).get('p', 0),
-                    'timestamp': getattr(ticker_data, 'last_quote', {}).get('t', 0)
+                    'price': _field(lq, 'p', 'price', default=0),
+                    'timestamp': _field(lq, 't', 'timestamp', 'sip_timestamp', default=0),
                 },
                 'last_trade': {
-                    'price': getattr(ticker_data, 'last_trade', {}).get('p', 0),
-                    'timestamp': getattr(ticker_data, 'last_trade', {}).get('t', 0)
+                    'price': _field(lt, 'p', 'price', default=0),
+                    'timestamp': _field(lt, 't', 'timestamp', 'sip_timestamp', default=0),
                 },
                 'prev_day': {
-                    'close': getattr(ticker_data, 'prev_day', {}).get('c', 0),
-                    'high': getattr(ticker_data, 'prev_day', {}).get('h', 0),
-                    'low': getattr(ticker_data, 'prev_day', {}).get('l', 0),
-                    'open': getattr(ticker_data, 'prev_day', {}).get('o', 0),
-                    'volume': getattr(ticker_data, 'prev_day', {}).get('v', 0)
+                    'close': _field(pd, 'c', 'close', default=0),
+                    'high': _field(pd, 'h', 'high', default=0),
+                    'low': _field(pd, 'l', 'low', default=0),
+                    'open': _field(pd, 'o', 'open', default=0),
+                    'volume': _field(pd, 'v', 'volume', default=0),
                 },
                 'fetched_at': datetime.utcnow().isoformat()
             }

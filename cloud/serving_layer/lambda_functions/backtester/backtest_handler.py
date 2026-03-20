@@ -9,9 +9,11 @@ import json
 import os
 import logging
 import boto3
-from datetime import date, datetime
-from typing import Dict, Any, Optional
-
+from datetime import datetime
+from typing import Dict, Any, List
+from analytics_core.strategies.builder import CompositeStrategy
+from analytics_core.executor import MultiTimeframeExecutor
+from analytics_core.backtester import Backtester
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -33,7 +35,7 @@ def get_rds_connection_string() -> str:
         # Build connection string
         host = secret.get('host')
         port = secret.get('port', 5432)
-        database = secret.get('database', 'postgres')
+        database = secret.get('database', secret.get('dbname', 'postgres'))
         username = secret.get('username')
         password = secret.get('password')
         
@@ -41,6 +43,16 @@ def get_rds_connection_string() -> str:
     except Exception as e:
         logger.error(f"Error retrieving RDS credentials: {str(e)}")
         raise
+
+def _collect_timeframes_from_components(components: Dict[str, Any], base_tf: str) -> List[str]:
+    """Collect unique timeframes from strategy component dicts (JSON payloads)."""
+    tfs = {base_tf}
+    if not isinstance(components, dict):
+        return list(tfs)
+    for comp in components.values():
+        if isinstance(comp, dict) and comp.get("timeframe"):
+            tfs.add(str(comp["timeframe"]).strip().lower() or base_tf)
+    return sorted(tfs)
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -95,8 +107,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
         # Extract parameters
         strategy_name = body['strategy_name']
-        symbol = body['symbol']
-        timeframe = body.get('timeframe', '1d')
+        symbol = str(body['symbol']).strip().upper()
+        timeframe = str(body.get('timeframe', '1d')).strip().lower() or '1d'
         start_date_str = body.get('start_date')
         end_date_str = body.get('end_date')
         initial_capital = body.get('initial_capital', 10000.0)
@@ -113,19 +125,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     'error': 'start_date and end_date are required'
                 })
             }
-        
-        # Import analytics core (assumes it's installed in Lambda layer or package)
-        try:
-            from analytics_core.strategies.builder import CompositeStrategy
-            from analytics_core.executor import MultiTimeframeExecutor
-            from analytics_core.backtester import Backtester
-        except ImportError as e:
-            logger.error(f"Error importing analytics_core: {str(e)}")
+        if start_date > end_date:
             return {
-                'statusCode': 500,
+                'statusCode': 400,
+                'body': json.dumps({'error': 'start_date must be on or before end_date'}),
+            }
+        max_days = int(os.environ.get('BACKTEST_MAX_LOOKBACK_DAYS', '1825'))  # ~5 years
+        if (end_date - start_date).days > max_days:
+            return {
+                'statusCode': 400,
                 'body': json.dumps({
-                    'error': 'Analytics core not available. Ensure analytics_core is installed.'
-                })
+                    'error': f'Date range exceeds maximum of {max_days} days (~5 years)',
+                }),
             }
         
         # Get RDS connection string
@@ -159,29 +170,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 })
             }
         
-        # Initialize executor and load data
-        executor = MultiTimeframeExecutor(
-            rds_connection_string=rds_connection_string,
-            s3_bucket=os.environ.get('S3_BUCKET_NAME')
-        )
-        
-        # Determine required timeframes from components
-        timeframes = set(['1d'])  # Base timeframe
-        for component in components.values():
-            if hasattr(component, 'timeframe'):
-                timeframes.add(component.get('timeframe', '1d'))
-        timeframes = list(timeframes)
-        
-        # Execute strategy
+        executor = MultiTimeframeExecutor(rds_connection_string=rds_connection_string)
+        timeframes = _collect_timeframes_from_components(components, timeframe)
+
         try:
-            result_df = executor.execute_strategy(
+            result_df = executor.execute(
                 strategy=strategy,
                 symbol=symbol,
                 timeframes=timeframes,
                 start_date=start_date,
                 end_date=end_date,
                 base_timeframe=timeframe,
-                use_s3=False  # Use RDS for Lambda (faster)
             )
         except Exception as e:
             logger.error(f"Error executing strategy: {str(e)}")

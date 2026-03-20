@@ -64,7 +64,7 @@ def get_rds_connection_string() -> str:
     db = secret.get('database', secret.get('dbname', 'postgres'))
     user = secret['username']
     pwd = secret['password']
-    return f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+    return f"postgresql://{user}:{pwd}@{host}:{port}/{db}?sslmode=require"
 
 
 def ensure_daily_scan_signals_table(rds_client: RDSTimescaleClient) -> None:

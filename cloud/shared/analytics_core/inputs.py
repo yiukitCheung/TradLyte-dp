@@ -5,10 +5,11 @@ Load OHLCV from RDS (raw 1d) and resample at use for multi-timeframe (3d, 5d, et
 No S3 loading; resampling is done in memory from 1d data.
 """
 
+import psycopg2
 import polars as pl
 from typing import Optional, Union, List, Dict
 from datetime import date, timedelta
-from sqlalchemy import create_engine
+
 
 def load_ohlcv(
     symbols: Union[str, List[str]],
@@ -26,7 +27,8 @@ def load_ohlcv(
 
     Args:
         symbols: List of ticker symbols (e.g. ['AAPL', 'MSFT'])
-        connection_string: PostgreSQL connection string
+        connection_string: PostgreSQL connection string (URI format, e.g.
+                           postgresql://user:pwd@host:5432/db?sslmode=require)
         start_date: Filter start date (inclusive)
         end_date: Filter end date (inclusive)
         table_name: Table name (default: raw_ohlcv)
@@ -38,41 +40,49 @@ def load_ohlcv(
         symbols = [symbols]
     if not symbols:
         return pl.DataFrame()
-    try:
-        engine = create_engine(connection_string)
-    except Exception as e:
-        raise ValueError(f"Error connecting to RDS: {str(e)}")
+
     # Use exclusive end bound to reliably include all rows on end_date when
     # source column is a timestamp (date params are often interpreted as 00:00:00).
     end_exclusive = (end_date + timedelta(days=1)) if end_date is not None else None
 
     if len(symbols) > 1:
         query = (
-            f"SELECT * FROM {table_name} WHERE symbol = ANY(%s) AND timestamp >= %s AND timestamp < %s "
+            f"SELECT * FROM {table_name} "
+            "WHERE symbol = ANY(%s) AND timestamp >= %s AND timestamp < %s "
             "ORDER BY symbol, timestamp ASC"
         )
-        params = [symbols, start_date, end_exclusive]
+        params = (symbols, start_date, end_exclusive)
     else:
         query = (
-            f"SELECT * FROM {table_name} WHERE symbol = %s AND timestamp >= %s AND timestamp < %s "
+            f"SELECT * FROM {table_name} "
+            "WHERE symbol = %s AND timestamp >= %s AND timestamp < %s "
             "ORDER BY timestamp ASC"
         )
-        params = [symbols[0], start_date, end_exclusive]
+        params = (symbols[0], start_date, end_exclusive)
 
     try:
-        df = pl.read_database(
-            query, engine.connect(), execute_options={"parameters": params}
-        )
-        if df.is_empty():
-            return pl.DataFrame()
-        if "date" not in df.columns and "timestamp" in df.columns:
-            df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
-        if "symbol" not in df.columns:
-            raise ValueError("Batch load must return symbol column")
-        df = df.sort("symbol", "date")
-        return df
+        # psycopg2 accepts the full URI directly, including ?sslmode=require
+        conn = psycopg2.connect(connection_string)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                col_names = [desc[0] for desc in cur.description]
+        finally:
+            conn.close()
     except Exception as e:
         raise ValueError(f"Error batch-loading OHLCV from RDS: {str(e)}")
+
+    if not rows:
+        return pl.DataFrame()
+
+    df = pl.DataFrame([dict(zip(col_names, row)) for row in rows])
+    if "date" not in df.columns and "timestamp" in df.columns:
+        df = df.with_columns(pl.col("timestamp").dt.date().alias("date"))
+    if "symbol" not in df.columns:
+        raise ValueError("Batch load must return symbol column")
+    df = df.sort("symbol", "date")
+    return df
 
 def build_multi_timeframe_from_batch_1d(
     batch_1d: pl.DataFrame,

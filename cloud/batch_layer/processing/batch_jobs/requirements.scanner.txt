@@ -5,9 +5,6 @@
 # OHLCV loading and in-memory resampling (inputs.py)
 polars>=0.20.0
 
-# Database connection — inputs.py uses SQLAlchemy create_engine for Polars read_database
-sqlalchemy>=2.0.0
-
 # Pydantic — SignalResult and strategy models
 pydantic>=2.0.0
 
