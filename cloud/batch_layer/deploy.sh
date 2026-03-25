@@ -59,11 +59,21 @@ build_artifacts() {
     echo "📦 Building deployment artifacts..."
     
     # Build Lambda packages
-    if [ -f "infrastructure/fetching/deployment_packages/deploy_lambda.sh" ]; then
-        echo "🔧 Building and deploying Lambda packages..."
-        cd infrastructure/fetching/deployment_packages
+    FETCH_DEPLOY="infrastructure/fetching/deploy_lambda.sh"
+    if [ ! -f "$FETCH_DEPLOY" ] && [ -f "infrastructure/fetching/deployment_packages/deploy_lambda.sh" ]; then
+        FETCH_DEPLOY="infrastructure/fetching/deployment_packages/deploy_lambda.sh"
+    fi
+    if [ -f "$FETCH_DEPLOY" ]; then
+        echo "🔧 Building and deploying Lambda packages (fetching)..."
+        cd "$(dirname "$FETCH_DEPLOY")"
         ./deploy_lambda.sh
-        cd ../../..
+        cd ../..
+    fi
+    if [ -f "infrastructure/ingesting/deploy_lambda.sh" ]; then
+        echo "🔧 Building and deploying Lambda packages (ingesting)..."
+        cd infrastructure/ingesting
+        ./deploy_lambda.sh
+        cd ../..
     fi
     
     # Build container images (but only push to ECR if not skipping)
@@ -163,14 +173,26 @@ case $COMPONENT in
         deploy_all
         show_summary
         ;;
+    "ingesting")
+        validate_prerequisites
+        if [ -f "infrastructure/ingesting/deploy_lambda.sh" ]; then
+            cd infrastructure/ingesting
+            ./deploy_lambda.sh
+            cd ../..
+        fi
+        show_summary
+        ;;
     "fetching"|"processing"|"database")
         validate_prerequisites
         if [ "$COMPONENT" = "fetching" ]; then
-            # Build and deploy Lambda packages for fetching
-            if [ -f "infrastructure/fetching/deployment_packages/deploy_lambda.sh" ]; then
-                cd infrastructure/fetching/deployment_packages
+            FETCH_DEPLOY="infrastructure/fetching/deploy_lambda.sh"
+            if [ ! -f "$FETCH_DEPLOY" ] && [ -f "infrastructure/fetching/deployment_packages/deploy_lambda.sh" ]; then
+                FETCH_DEPLOY="infrastructure/fetching/deployment_packages/deploy_lambda.sh"
+            fi
+            if [ -f "$FETCH_DEPLOY" ]; then
+                cd "$(dirname "$FETCH_DEPLOY")"
                 ./deploy_lambda.sh
-                cd ../../..
+                cd ../..
             fi
         elif [ "$COMPONENT" = "processing" ]; then
             # Build container for processing
@@ -233,7 +255,8 @@ case $COMPONENT in
         echo "Environments: dev, staging, prod"
         echo "Components:"
         echo "  all           - Deploy entire batch layer (default)"
-        echo "  fetching      - Deploy Lambda functions"
+        echo "  fetching      - Deploy fetcher Lambda functions (Polygon → S3)"
+        echo "  ingesting     - Deploy OHLCV ingest + planner Lambdas (VPC → RDS)"
         echo "  processing    - Deploy AWS Batch jobs (container + job definitions)"
         echo "  database      - Deploy database infrastructure"
         echo "  orchestration - Deploy Step Functions pipeline"
@@ -245,6 +268,7 @@ case $COMPONENT in
         echo "Examples:"
         echo "  ./deploy.sh dev all                    # Deploy everything to dev"
         echo "  ./deploy.sh dev fetching               # Deploy only Lambda fetchers"
+        echo "  ./deploy.sh dev ingesting              # Deploy OHLCV ingest + planner Lambdas"
         echo "  ./deploy.sh dev processing             # Deploy only Batch jobs"
         echo "  ./deploy.sh dev orchestration          # Deploy only Step Functions"
         exit 1

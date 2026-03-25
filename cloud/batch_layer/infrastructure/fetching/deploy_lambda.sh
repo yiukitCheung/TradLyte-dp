@@ -6,7 +6,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Point to batch_layer/fetching (application code) not infrastructure/fetching
 INFRA_FETCHING_DIR="$(dirname "$SCRIPT_DIR")"
-BATCH_LAYER_DIR="$(dirname "$(dirname "$INFRA_FETCHING_DIR")")"
+BATCH_LAYER_DIR="$(dirname "$INFRA_FETCHING_DIR")"
 AWS_ARCH_DIR="$(dirname "$BATCH_LAYER_DIR")"
 FETCHING_DIR="$BATCH_LAYER_DIR/fetching"
 SHARED_DIR="$AWS_ARCH_DIR/shared"  # Canonical shared package
@@ -19,8 +19,12 @@ echo "🚀 Building and deploying Lambda functions..."
 echo "Region: $AWS_REGION"
 
 # Function to build and deploy a Lambda package
+# Args: function_name [requirements_file] [shared_mode]
+#   shared_mode: ohlcv (Polygon + models only) | meta (Polygon + RDS + models + utils market_calendar)
 build_and_deploy_lambda() {
     local function_name=$1
+    local req_file="${2:-$FETCHING_DIR/requirements.txt}"
+    local shared_mode="${3:-meta}"
     local file_name=$(echo "$function_name" | tr '-' '_')  # Convert dashes to underscores for file name
     local package_dir="$SCRIPT_DIR/package/$function_name"
     
@@ -36,14 +40,14 @@ build_and_deploy_lambda() {
     echo "📥 Installing dependencies for Linux x86_64..."
     # Use pip3 if available, otherwise fall back to pip
     PIP_CMD=$(command -v pip3 || command -v pip || echo "pip3")
-    $PIP_CMD install -r "$FETCHING_DIR/requirements.txt" -t "$package_dir" \
+    $PIP_CMD install -r "$req_file" -t "$package_dir" \
         --platform manylinux2014_x86_64 \
         --only-binary=:all: \
         --python-version 3.11 \
         --implementation cp \
         --no-cache-dir \
         --quiet 2>/dev/null || \
-    $PIP_CMD install -r "$FETCHING_DIR/requirements.txt" -t "$package_dir" \
+    $PIP_CMD install -r "$req_file" -t "$package_dir" \
         --no-cache-dir \
         --quiet
     
@@ -57,18 +61,24 @@ build_and_deploy_lambda() {
     mkdir -p "$package_dir/shared/models"
     mkdir -p "$package_dir/shared/utils"
     
-    # Copy only required clients (not redis, kinesis, aurora)
     cp "$SHARED_DIR/clients/polygon_client.py" "$package_dir/shared/clients/"
-    cp "$SHARED_DIR/clients/rds_timescale_client.py" "$package_dir/shared/clients/"
-    
-    # Create minimal __init__.py for Lambda (only what we need)
-    cat > "$package_dir/shared/clients/__init__.py" << 'EOF'
+    if [ "$shared_mode" = "ohlcv" ]; then
+        cat > "$package_dir/shared/clients/__init__.py" << 'EOF'
+"""Client modules for Lambda functions"""
+from .polygon_client import PolygonClient
+
+__all__ = ['PolygonClient']
+EOF
+    else
+        cp "$SHARED_DIR/clients/rds_timescale_client.py" "$package_dir/shared/clients/"
+        cat > "$package_dir/shared/clients/__init__.py" << 'EOF'
 """Client modules for Lambda functions"""
 from .polygon_client import PolygonClient
 from .rds_timescale_client import RDSTimescaleClient
 
 __all__ = ['PolygonClient', 'RDSTimescaleClient']
 EOF
+    fi
     
     # Copy models and utils
     cp -r "$SHARED_DIR/models/"* "$package_dir/shared/models/" 2>/dev/null || true
@@ -183,8 +193,9 @@ mkdir -p "$SCRIPT_DIR"/package
 
 # Build and deploy Lambda functions (fetchers only)
 # Note: Consolidation moved to AWS Batch (see processing/batch_jobs/)
-build_and_deploy_lambda "daily-ohlcv-fetcher"
-build_and_deploy_lambda "daily-meta-fetcher"
+# OHLCV fetcher: S3 bronze only (no psycopg2); metadata fetcher still uses RDS
+build_and_deploy_lambda "daily-ohlcv-fetcher" "$FETCHING_DIR/requirements-ohlcv.txt" "ohlcv"
+build_and_deploy_lambda "daily-meta-fetcher" "$FETCHING_DIR/requirements.txt" "meta"
 
 # Clean up package directory
 rm -rf "$SCRIPT_DIR"/package/
@@ -215,5 +226,5 @@ echo "  - Test function: aws lambda invoke --function-name daily_ohlcv_fetcher r
 echo ""
 echo "📦 Lambda packages stored in S3: s3://${LAMBDA_DEPLOY_BUCKET:-dev-condvest-lambda-deploy}/lambda-packages/"
 echo ""
-echo "📝 Note: Consolidator/resampler Batch jobs are archived. Pipeline is fetchers only."
-echo "   See batch_layer/archive_scripts/README_ARCHIVED_BATCH_JOBS.md"
+echo "📝 OHLCV path: Polygon → S3 (this Lambda); RDS via batch_layer/ingesting + S3 trigger."
+echo "   Consolidator/resampler Batch jobs: archive_scripts/README_ARCHIVED_BATCH_JOBS.md"

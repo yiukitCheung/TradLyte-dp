@@ -166,7 +166,7 @@ COMMENT ON TABLE silver_34d IS 'Silver layer: 34-day Fibonacci resampled OHLCV d
 -- 4A: Batch Jobs Table (Job Execution Tracking)
 -- ---------------------------------------------------------------------------
 -- Tracks execution of Lambda batch jobs for monitoring and debugging
--- Used by: daily_ohlcv_fetcher, daily_meta_fetcher, and other Lambda functions
+-- Used by: daily_meta_fetcher, optional job metadata writers, and other Lambda functions
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS batch_jobs (
