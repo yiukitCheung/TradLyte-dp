@@ -24,9 +24,8 @@ from ..indicators.technicals import (
     calculate_rsi, calculate_sma, calculate_ema, calculate_macd
 )
 
-
 class CompositeStrategy(BaseStrategy):
-    """
+    """                            
     Composite Strategy - Built from user configuration
     
     Combines Setup, Trigger, and Exit configurations into a single strategy.
