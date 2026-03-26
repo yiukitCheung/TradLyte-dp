@@ -2,6 +2,7 @@
 # Build and deploy Lambda functions to AWS
 
 set -e
+export AWS_PAGER=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Point to batch_layer/fetching (application code) not infrastructure/fetching
@@ -193,9 +194,9 @@ mkdir -p "$SCRIPT_DIR"/package
 
 # Build and deploy Lambda functions (fetchers only)
 # Note: Consolidation moved to AWS Batch (see processing/batch_jobs/)
-# OHLCV fetcher: S3 bronze only (no psycopg2); metadata fetcher still uses RDS
+# OHLCV fetcher: S3 bronze only (no psycopg2); meta fetcher is now fetch-only (Polygon -> S3 manifest)
 build_and_deploy_lambda "daily-ohlcv-fetcher" "$FETCHING_DIR/requirements-ohlcv.txt" "ohlcv"
-build_and_deploy_lambda "daily-meta-fetcher" "$FETCHING_DIR/requirements.txt" "meta"
+build_and_deploy_lambda "daily-meta-fetcher" "$FETCHING_DIR/requirements-ohlcv.txt" "ohlcv"
 
 # Clean up package directory
 rm -rf "$SCRIPT_DIR"/package/

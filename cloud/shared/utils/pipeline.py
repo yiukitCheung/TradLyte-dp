@@ -1,8 +1,11 @@
 """
-RDS-side OHLCV pipeline helpers (planner + ingest Lambdas in VPC).
+RDS-side pipeline helpers used by VPC Lambdas.
 
-Extracted from the former monolithic daily_ohlcv_fetcher so fetch can stay
-off-VPC while ingest/planning talk to RDS.
+This file exists to provide a stable import path (`shared.utils.pipeline`) for:
+- `daily_ohlcv_planner`
+- `daily_ohlcv_ingest_handler`
+
+It was extracted from the monolithic OHLCV fetcher and/or packaged artifacts.
 """
 
 from __future__ import annotations
@@ -44,19 +47,12 @@ def get_missing_dates(rds_client: RDSTimescaleClient, max_days_back: int = 30) -
         today_et = now_et.date()
 
         if not result or result[0]["max_date"] is None:
-            logger.info(
-                "No watermark data found, starting fresh backfill from %s days ago",
-                max_days_back,
-            )
+            logger.info("No watermark data found, starting fresh backfill from %s days ago", max_days_back)
             from_date = today_et - timedelta(days=max_days_back)
         else:
             max_date = result[0]["max_date"]
             symbol_count = result[0]["symbol_count"]
-            logger.info(
-                "Found watermark: %s symbols, latest date: %s",
-                symbol_count,
-                max_date,
-            )
+            logger.info("Found watermark: %s symbols, latest date: %s", symbol_count, max_date)
             from_date = max_date + timedelta(days=1)
 
         market_close_today = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -83,11 +79,7 @@ def get_missing_dates(rds_client: RDSTimescaleClient, max_days_back: int = 30) -
             current_date += timedelta(days=1)
 
         if len(missing_dates) > max_days_back:
-            logger.warning(
-                "Found %s missing dates, limiting to %s most recent",
-                len(missing_dates),
-                max_days_back,
-            )
+            logger.warning("Found %s missing dates, limiting to %s most recent", len(missing_dates), max_days_back)
             missing_dates = missing_dates[-max_days_back:]
 
         logger.info("Missing dates to fetch: %s", len(missing_dates))
@@ -121,7 +113,6 @@ def write_to_rds_with_retention(
         return 0
 
     retention_threshold = date.today() - timedelta(days=365 * retention_years + 30)
-
     filtered_data = [o for o in ohlcv_data if o.timestamp.date() >= retention_threshold]
 
     if len(filtered_data) < len(ohlcv_data):
@@ -169,11 +160,7 @@ def update_watermark(rds_client: RDSTimescaleClient, symbols: List[str], fetch_d
                 )
 
             conn.commit()
-            logger.info(
-                "Updated watermark for %s symbols (date: %s, SCD Type 2)",
-                len(symbols),
-                fetch_date,
-            )
+            logger.info("Updated watermark for %s symbols (date: %s, SCD Type 2)", len(symbols), fetch_date)
 
         except Exception:
             conn.rollback()
@@ -189,7 +176,8 @@ def update_watermark(rds_client: RDSTimescaleClient, symbols: List[str], fetch_d
 def get_new_symbols(rds_client: RDSTimescaleClient, days_threshold: int = 7) -> List[str]:
     """
     Symbols that need historical backfill (not in watermark or limited history).
-    days_threshold is kept for API compatibility; selection uses watermark counts.
+
+    `days_threshold` is kept for API compatibility; selection uses watermark counts.
     """
     _ = days_threshold
 
@@ -243,3 +231,4 @@ def get_new_symbols(rds_client: RDSTimescaleClient, days_threshold: int = 7) -> 
     except Exception as e:
         logger.error("Error finding new symbols: %s", e)
         return []
+
