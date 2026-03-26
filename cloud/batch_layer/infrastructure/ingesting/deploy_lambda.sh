@@ -2,6 +2,7 @@
 # Build and deploy OHLCV ingest + planner Lambdas (VPC; RDS + S3 read)
 
 set -e
+export AWS_PAGER=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BATCH_LAYER_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
@@ -34,7 +35,7 @@ build_and_deploy_lambda() {
         --implementation cp \
         --no-cache-dir \
         --quiet 2>/dev/null || \
-    $PIP_CMD install -r "$INGESTING_DIR/requirements.txt" -t "$package_dir" \   
+    $PIP_CMD install -r "$INGESTING_DIR/requirements.txt" -t "$package_dir" \
         --no-cache-dir \
         --quiet
 
@@ -120,11 +121,12 @@ mkdir -p "$SCRIPT_DIR/package"
 
 build_and_deploy_lambda "daily-ohlcv-ingest-handler"
 build_and_deploy_lambda "daily-ohlcv-planner"
+build_and_deploy_lambda "daily-meta-ingest-handler"
 
 rm -rf "$SCRIPT_DIR/package"
 rm -f "$SCRIPT_DIR"/*.zip
 
 echo ""
 echo "🎉 Ingesting Lambdas packaged and deployed (if functions exist)."
-echo "💡 Wire S3 → SQS → daily-ohlcv-ingest-handler; EventBridge → daily-ohlcv-planner."
+echo "💡 Wire S3 → SQS → daily-ohlcv-ingest-handler; S3 manifest -> daily-meta-ingest-handler; EventBridge → daily-ohlcv-planner."
 echo "💡 Set OHLCV_FETCHER_FUNCTION_NAME on the planner (e.g. ${FUNCTION_PREFIX}daily-ohlcv-fetcher)."
