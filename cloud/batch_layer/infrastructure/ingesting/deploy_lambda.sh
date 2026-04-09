@@ -120,7 +120,6 @@ rm -rf "$SCRIPT_DIR/package"
 mkdir -p "$SCRIPT_DIR/package"
 
 build_and_deploy_lambda "daily-ohlcv-ingest-handler"
-build_and_deploy_lambda "daily-ohlcv-planner"
 build_and_deploy_lambda "daily-meta-ingest-handler"
 
 rm -rf "$SCRIPT_DIR/package"
@@ -128,5 +127,5 @@ rm -f "$SCRIPT_DIR"/*.zip
 
 echo ""
 echo "🎉 Ingesting Lambdas packaged and deployed (if functions exist)."
-echo "💡 Wire S3 → SQS → daily-ohlcv-ingest-handler; S3 manifest -> daily-meta-ingest-handler; EventBridge → daily-ohlcv-planner."
-echo "💡 Set OHLCV_FETCHER_FUNCTION_NAME on the planner (e.g. ${FUNCTION_PREFIX}daily-ohlcv-fetcher)."
+echo "💡 Wire S3 → SQS → daily-ohlcv-ingest-handler; S3 *_manifest.json → daily-meta-ingest-handler."
+echo "💡 OHLCV planner is built from batch_layer/fetching (see infrastructure/fetching/deploy_lambda.sh); set RDS_SECRET_ARN + OHLCV_FETCHER_FUNCTION_NAME on that Lambda."

@@ -84,6 +84,7 @@ LAMBDA_POLICY='{
             ],
             "Resource": [
                 "arn:aws:lambda:'$AWS_REGION':'$AWS_ACCOUNT_ID':function:dev-batch-daily-ohlcv-fetcher",
+                "arn:aws:lambda:'$AWS_REGION':'$AWS_ACCOUNT_ID':function:dev-batch-daily-ohlcv-planner",
                 "arn:aws:lambda:'$AWS_REGION':'$AWS_ACCOUNT_ID':function:dev-batch-daily-meta-fetcher"
             ]
         }

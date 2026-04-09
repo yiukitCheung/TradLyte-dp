@@ -2,7 +2,7 @@
 RDS-side pipeline helpers used by VPC Lambdas.
 
 This file exists to provide a stable import path (`shared.utils.pipeline`) for:
-- `daily_ohlcv_planner`
+- `daily_ohlcv_planner` (under `batch_layer/fetching/lambda_functions/`)
 - `daily_ohlcv_ingest_handler`
 
 It was extracted from the monolithic OHLCV fetcher and/or packaged artifacts.

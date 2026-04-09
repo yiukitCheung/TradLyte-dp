@@ -192,10 +192,12 @@ echo "🧹 Cleaning previous builds..."
 rm -rf "$SCRIPT_DIR"/package/
 mkdir -p "$SCRIPT_DIR"/package
 
-# Build and deploy Lambda functions (fetchers only)
+# Build and deploy Lambda functions (fetchers + OHLCV planner)
 # Note: Consolidation moved to AWS Batch (see processing/batch_jobs/)
-# OHLCV fetcher: S3 bronze only (no psycopg2); meta fetcher is now fetch-only (Polygon -> S3 manifest)
+# OHLCV fetcher: S3 bronze only (Polygon); planner: VPC/RDS reads missing dates → async-invokes fetcher
+# Meta fetcher: Polygon → S3 manifest (no RDS on fetcher)
 build_and_deploy_lambda "daily-ohlcv-fetcher" "$FETCHING_DIR/requirements-ohlcv.txt" "ohlcv"
+build_and_deploy_lambda "daily-ohlcv-planner" "$BATCH_LAYER_DIR/ingesting/requirements.txt" "meta"
 build_and_deploy_lambda "daily-meta-fetcher" "$FETCHING_DIR/requirements-ohlcv.txt" "ohlcv"
 
 # Clean up package directory
@@ -227,5 +229,6 @@ echo "  - Test function: aws lambda invoke --function-name daily_ohlcv_fetcher r
 echo ""
 echo "📦 Lambda packages stored in S3: s3://${LAMBDA_DEPLOY_BUCKET:-dev-condvest-lambda-deploy}/lambda-packages/"
 echo ""
-echo "📝 OHLCV path: Polygon → S3 (this Lambda); RDS via batch_layer/ingesting + S3 trigger."
+echo "📝 OHLCV path: planner (VPC) → fetcher → S3 bronze; ingest handler (VPC) ← S3 trigger → RDS."
+echo "📝 daily-ohlcv-planner needs env: RDS_SECRET_ARN, OHLCV_FETCHER_FUNCTION_NAME (e.g. ${FUNCTION_PREFIX}daily-ohlcv-fetcher), VPC to RDS."
 echo "   Consolidator/resampler Batch jobs: archive_scripts/README_ARCHIVED_BATCH_JOBS.md"

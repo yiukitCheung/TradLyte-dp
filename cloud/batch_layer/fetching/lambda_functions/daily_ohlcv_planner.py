@@ -1,8 +1,11 @@
 """
 VPC Lambda: reads RDS for symbols / missing dates, then async-invokes daily_ohlcv_fetcher (no VPC).
 
-Wire EventBridge (or manual invoke) to this function for production backfill modes that need
-watermarks. Simple single-day runs can invoke the fetcher directly with an empty event.
+Lives under fetching/lambda_functions/ (orchestrates fetch; built via infrastructure/fetching/deploy_lambda.sh).
+
+Wire Step Functions, EventBridge, or manual invoke. For production gap fill, pass backfill_missing
+and optional skip_market_check (forwarded to the fetcher payload). Single-day runs can invoke the
+fetcher directly without this Lambda.
 """
 
 import json

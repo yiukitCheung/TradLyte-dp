@@ -143,7 +143,7 @@ show_summary() {
     if [ "$COMPONENT" = "all" ]; then
         echo ""
         echo "📋 Deployed Components:"
-        echo "  ✅ Lambda Fetchers (OHLCV + Meta)"
+        echo "  ✅ Lambda Fetchers (OHLCV + Meta + OHLCV planner)"
         echo "  ✅ AWS Batch Jobs (Consolidator + Resampler)"
         echo "  ✅ Step Functions Pipeline"
         echo "  ✅ EventBridge Schedule (21:00 UTC Mon-Fri)"
@@ -256,7 +256,7 @@ case $COMPONENT in
         echo "Components:"
         echo "  all           - Deploy entire batch layer (default)"
         echo "  fetching      - Deploy fetcher Lambda functions (Polygon → S3)"
-        echo "  ingesting     - Deploy OHLCV ingest + planner Lambdas (VPC → RDS)"
+        echo "  ingesting     - Deploy OHLCV + meta ingest Lambdas (VPC → RDS; planner is under fetching)"
         echo "  processing    - Deploy AWS Batch jobs (container + job definitions)"
         echo "  database      - Deploy database infrastructure"
         echo "  orchestration - Deploy Step Functions pipeline"

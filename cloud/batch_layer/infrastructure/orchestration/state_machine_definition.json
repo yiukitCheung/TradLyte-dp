@@ -8,17 +8,18 @@
       "Comment": "Fetch OHLCV data and symbol metadata in parallel so neither blocks the other.",
       "Branches": [
         {
-          "StartAt": "FetchOHLCV",
+          "StartAt": "PlanOHLCVFetch",
           "States": {
-            "FetchOHLCV": {
+            "PlanOHLCVFetch": {
               "Type": "Task",
+              "Comment": "VPC Lambda: reads RDS gaps, async-invokes daily-ohlcv-fetcher with dates. skip_market_check forwarded so post-close runs still fetch. OHLCV lands in S3 then S3→ingest→RDS.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-ohlcv-fetcher",
+                "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-ohlcv-planner",
                 "Payload": {
-                  "skip_market_check": false,
                   "backfill_missing": true,
-                  "max_backfill_days": 7
+                  "max_backfill_days": 21,
+                  "skip_market_check": true
                 }
               },
               "Retry": [
@@ -39,6 +40,7 @@
           "States": {
             "FetchMetadata": {
               "Type": "Task",
+              "Comment": "Polygon → S3 bronze/raw_meta. RDS updates require S3 event → daily-meta-ingest-handler (not this state machine).",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-meta-fetcher",
