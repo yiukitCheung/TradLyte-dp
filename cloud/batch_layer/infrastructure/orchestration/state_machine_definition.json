@@ -12,7 +12,7 @@
           "States": {
             "PlanOHLCVFetch": {
               "Type": "Task",
-              "Comment": "VPC Lambda: reads RDS gaps, async-invokes daily-ohlcv-fetcher with dates. skip_market_check forwarded so post-close runs still fetch. OHLCV lands in S3 then S3→ingest→RDS.",
+              "Comment": "VPC Lambda: reads RDS gaps and fan-out async-invokes daily-ohlcv-fetcher (one Event invoke per missing date). Returns in seconds (no synchronous wait). OHLCV parquet -> S3 -> SQS -> daily-ohlcv-ingest-handler hydrates RDS out-of-band. Pipeline must Wait before scanner.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-ohlcv-planner",
@@ -60,7 +60,7 @@
           }
         }
       ],
-      "Next": "PartitionSymbols",
+      "Next": "NormalizeAfterFetch",
       "ResultPath": "$.fetcherResults",
       "Catch": [
         {
@@ -69,6 +69,125 @@
           "ResultPath": "$.error"
         }
       ]
+    },
+
+    "NormalizeAfterFetch": {
+      "Type": "Pass",
+      "Comment": "Parse Lambda proxy bodies so Choice/Task steps can use ohlcv.* and meta.*.",
+      "Parameters": {
+        "ohlcv.$": "States.StringToJson($.fetcherResults[0].ohlcvResult.Payload.body)",
+        "meta.$": "States.StringToJson($.fetcherResults[1].metadataResult.Payload.body)"
+      },
+      "Next": "MaybeIngestOHLCV"
+    },
+
+    "MaybeIngestOHLCV": {
+      "Type": "Choice",
+      "Comment": "Planner now fan-outs the fetcher asynchronously and returns num_dates=0, so this branch is intentionally a no-op for the standard daily run. Kept for ad-hoc executions that pre-stage parquet in S3 and explicitly set ohlcv.num_dates>0 + ohlcv.dates_processed in the input.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.ohlcv.num_dates",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ohlcv.num_dates",
+              "NumericGreaterThan": 0
+            }
+          ],
+          "Next": "IngestOHLCVToRDS"
+        }
+      ],
+      "Default": "MaybeIngestMeta"
+    },
+
+    "IngestOHLCVToRDS": {
+      "Type": "Task",
+      "Comment": "Manual sync ingest path. Standard daily run skips this (S3 -> SQS -> daily-ohlcv-ingest-handler handles RDS load).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-ohlcv-ingest-handler",
+        "Payload": {
+          "s3_bucket": "dev-condvest-datalake",
+          "ingest_dates.$": "$.ohlcv.dates_processed"
+        }
+      },
+      "ResultPath": "$.ingestOhlcvResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "MaybeIngestMeta"
+    },
+
+    "MaybeIngestMeta": {
+      "Type": "Choice",
+      "Comment": "Sync manifest to RDS (async S3→SQS path can still run separately).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.meta.manifest_key",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.meta.metadata_count",
+              "NumericGreaterThan": 0
+            }
+          ],
+          "Next": "IngestMetaToRDS"
+        }
+      ],
+      "Default": "WaitForAsyncOHLCVIngest"
+    },
+
+    "IngestMetaToRDS": {
+      "Type": "Task",
+      "Comment": "Sync manifest load for scanner ordering. If you also use wire_meta_ingest_s3_sqs.sh, the same manifest may be processed twice unless RDS upserts dedupe.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-daily-meta-ingest-handler",
+        "Payload": {
+          "s3_bucket": "dev-condvest-datalake",
+          "s3_key.$": "$.meta.manifest_key"
+        }
+      },
+      "ResultPath": "$.ingestMetaResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "WaitForAsyncOHLCVIngest"
+    },
+
+    "WaitForAsyncOHLCVIngest": {
+      "Type": "Wait",
+      "Comment": "Planner fan-outs the fetcher async; fetcher writes parquet to S3; S3 -> SQS -> daily-ohlcv-ingest-handler hydrates RDS. Real-volume runs (~5k symbols, 1-21 dates) take 10-15 min end-to-end. We pad to 15 min before scanner workers query RDS so they never see stale data. Tune via SCANNER_RDS_HYDRATION_WAIT_SECONDS during deploy if observed runtimes shift.",
+      "Seconds": 900,
+      "Next": "PartitionSymbols"
     },
 
     "PartitionSymbols": {

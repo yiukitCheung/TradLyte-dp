@@ -9,12 +9,110 @@ BATCH_LAYER_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 AWS_ARCH_DIR="$(dirname "$BATCH_LAYER_DIR")"
 INGESTING_DIR="$BATCH_LAYER_DIR/ingesting"
 SHARED_DIR="$AWS_ARCH_DIR/shared"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/../common/pip_for_lambda.sh"
 
 AWS_REGION="${AWS_REGION:-ca-west-1}"
 FUNCTION_PREFIX="${FUNCTION_PREFIX:-dev-batch-}"
+LAMBDA_RUNTIME="${LAMBDA_RUNTIME:-python3.11}"
 
 echo "🚀 Building and deploying ingesting Lambdas..."
 echo "Region: $AWS_REGION"
+
+cleanup_artifacts() {
+    rm -rf "$SCRIPT_DIR/package" 2>/dev/null || true
+    rm -f "$SCRIPT_DIR"/*.zip 2>/dev/null || true
+}
+trap cleanup_artifacts EXIT INT TERM
+
+set_lambda_python_handler() {
+    local deployed_name=$1
+    local module_base=$2
+    local handler="${module_base}.lambda_handler"
+    if ! aws lambda get-function --function-name "$deployed_name" --region "$AWS_REGION" &>/dev/null; then
+        return 0
+    fi
+    echo "⚙️  Setting handler on $deployed_name → $handler"
+    aws lambda wait function-updated-v2 --function-name "$deployed_name" --region "$AWS_REGION" 2>/dev/null || sleep 5
+    aws lambda update-function-configuration \
+        --function-name "$deployed_name" \
+        --handler "$handler" \
+        --region "$AWS_REGION" \
+        --output json >/dev/null
+}
+
+ensure_lambda_runtime() {
+    local deployed_name=$1
+    if ! aws lambda get-function --function-name "$deployed_name" --region "$AWS_REGION" &>/dev/null; then
+        return 0
+    fi
+    aws lambda wait function-updated-v2 --function-name "$deployed_name" --region "$AWS_REGION" 2>/dev/null || sleep 5
+    local current_runtime
+    current_runtime=$(aws lambda get-function-configuration \
+        --function-name "$deployed_name" \
+        --region "$AWS_REGION" \
+        --query 'Runtime' \
+        --output text)
+    if [ "$current_runtime" != "$LAMBDA_RUNTIME" ]; then
+        echo "⚙️  Updating runtime on $deployed_name: $current_runtime -> $LAMBDA_RUNTIME"
+        aws lambda update-function-configuration \
+            --function-name "$deployed_name" \
+            --runtime "$LAMBDA_RUNTIME" \
+            --region "$AWS_REGION" \
+            --output json >/dev/null
+        aws lambda wait function-updated-v2 --function-name "$deployed_name" --region "$AWS_REGION" 2>/dev/null || sleep 5
+    fi
+}
+
+get_timeout_for_function() {
+    local fn=$1
+    case "$fn" in
+        daily-ohlcv-ingest-handler) echo "${TIMEOUT_DAILY_OHLCV_INGEST_HANDLER:-300}" ;;
+        daily-meta-ingest-handler) echo "${TIMEOUT_DAILY_META_INGEST_HANDLER:-180}" ;;
+        *) echo "${TIMEOUT_DEFAULT:-60}" ;;
+    esac
+}
+
+get_memory_for_function() {
+    local fn=$1
+    case "$fn" in
+        daily-ohlcv-ingest-handler) echo "${MEMORY_DAILY_OHLCV_INGEST_HANDLER:-1024}" ;;
+        daily-meta-ingest-handler) echo "${MEMORY_DAILY_META_INGEST_HANDLER:-1024}" ;;
+        *) echo "${MEMORY_DEFAULT:-512}" ;;
+    esac
+}
+
+ensure_lambda_perf_config() {
+    local deployed_name=$1
+    local function_name=$2
+    if ! aws lambda get-function --function-name "$deployed_name" --region "$AWS_REGION" &>/dev/null; then
+        return 0
+    fi
+    aws lambda wait function-updated-v2 --function-name "$deployed_name" --region "$AWS_REGION" 2>/dev/null || sleep 5
+    local desired_timeout desired_memory current_timeout current_memory
+    desired_timeout=$(get_timeout_for_function "$function_name")
+    desired_memory=$(get_memory_for_function "$function_name")
+    current_timeout=$(aws lambda get-function-configuration \
+        --function-name "$deployed_name" \
+        --region "$AWS_REGION" \
+        --query 'Timeout' \
+        --output text)
+    current_memory=$(aws lambda get-function-configuration \
+        --function-name "$deployed_name" \
+        --region "$AWS_REGION" \
+        --query 'MemorySize' \
+        --output text)
+    if [ "$current_timeout" != "$desired_timeout" ] || [ "$current_memory" != "$desired_memory" ]; then
+        echo "⚙️  Updating perf on $deployed_name: timeout ${current_timeout}s -> ${desired_timeout}s, memory ${current_memory}MB -> ${desired_memory}MB"
+        aws lambda update-function-configuration \
+            --function-name "$deployed_name" \
+            --timeout "$desired_timeout" \
+            --memory-size "$desired_memory" \
+            --region "$AWS_REGION" \
+            --output json >/dev/null
+        aws lambda wait function-updated-v2 --function-name "$deployed_name" --region "$AWS_REGION" 2>/dev/null || sleep 5
+    fi
+}
 
 build_and_deploy_lambda() {
     local function_name=$1
@@ -27,17 +125,7 @@ build_and_deploy_lambda() {
 
     mkdir -p "$package_dir"
 
-    PIP_CMD=$(command -v pip3 || command -v pip || echo "pip3")
-    $PIP_CMD install -r "$INGESTING_DIR/requirements.txt" -t "$package_dir" \
-        --platform manylinux2014_x86_64 \
-        --only-binary=:all: \
-        --python-version 3.11 \
-        --implementation cp \
-        --no-cache-dir \
-        --quiet 2>/dev/null || \
-    $PIP_CMD install -r "$INGESTING_DIR/requirements.txt" -t "$package_dir" \
-        --no-cache-dir \
-        --quiet
+    pip_for_lambda_x86_64 "$INGESTING_DIR/requirements.txt" "$package_dir"
 
     cp "$INGESTING_DIR/lambda_functions/${file_name}.py" "$package_dir/${file_name}.py"
 
@@ -87,6 +175,9 @@ EOF
                 --s3-key "$s3_key" \
                 --region "$AWS_REGION" \
                 --output json
+            ensure_lambda_runtime "$aws_function_name"
+            ensure_lambda_perf_config "$aws_function_name" "$function_name"
+            set_lambda_python_handler "$aws_function_name" "$file_name"
         elif aws lambda get-function --function-name "$function_name" --region "$AWS_REGION" &>/dev/null; then
             aws lambda update-function-code \
                 --function-name "$function_name" \
@@ -94,6 +185,9 @@ EOF
                 --s3-key "$s3_key" \
                 --region "$AWS_REGION" \
                 --output json
+            ensure_lambda_runtime "$function_name"
+            ensure_lambda_perf_config "$function_name" "$function_name"
+            set_lambda_python_handler "$function_name" "$file_name"
         else
             echo "❌ Function not found: $aws_function_name (create in console first)"
         fi
@@ -104,12 +198,18 @@ EOF
                 --zip-file "fileb://$SCRIPT_DIR/$function_name.zip" \
                 --region "$AWS_REGION" \
                 --output json
+            ensure_lambda_runtime "$aws_function_name"
+            ensure_lambda_perf_config "$aws_function_name" "$function_name"
+            set_lambda_python_handler "$aws_function_name" "$file_name"
         elif aws lambda get-function --function-name "$function_name" --region "$AWS_REGION" &>/dev/null; then
             aws lambda update-function-code \
                 --function-name "$function_name" \
                 --zip-file "fileb://$SCRIPT_DIR/$function_name.zip" \
                 --region "$AWS_REGION" \
                 --output json
+            ensure_lambda_runtime "$function_name"
+            ensure_lambda_perf_config "$function_name" "$function_name"
+            set_lambda_python_handler "$function_name" "$file_name"
         else
             echo "❌ Function not found: $aws_function_name (create in console first)"
         fi
@@ -122,10 +222,8 @@ mkdir -p "$SCRIPT_DIR/package"
 build_and_deploy_lambda "daily-ohlcv-ingest-handler"
 build_and_deploy_lambda "daily-meta-ingest-handler"
 
-rm -rf "$SCRIPT_DIR/package"
-rm -f "$SCRIPT_DIR"/*.zip
-
 echo ""
 echo "🎉 Ingesting Lambdas packaged and deployed (if functions exist)."
-echo "💡 Wire S3 → SQS → daily-ohlcv-ingest-handler; S3 *_manifest.json → daily-meta-ingest-handler."
+echo "💡 Wire S3 → SQS → daily-ohlcv-ingest-handler."
+echo "💡 Optional async meta path: infrastructure/ingesting/wire_meta_ingest_s3_sqs.sh (skip if Step Functions already sync-ingests meta; avoid duplicate RDS writes unless upserts are idempotent)."
 echo "💡 OHLCV planner is built from batch_layer/fetching (see infrastructure/fetching/deploy_lambda.sh); set RDS_SECRET_ARN + OHLCV_FETCHER_FUNCTION_NAME on that Lambda."
