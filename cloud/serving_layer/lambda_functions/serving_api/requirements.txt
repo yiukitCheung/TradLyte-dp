@@ -1,0 +1,6 @@
+fastapi
+mangum
+pydantic
+psycopg2-binary
+cachetools
+boto3

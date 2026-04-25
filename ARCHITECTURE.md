@@ -179,11 +179,12 @@ flowchart TB
 
 | Component | AWS Resource | Code | Status |
 |---|---|---|---|
-| Quote API | Lambda (zip) behind API Gateway `GET /quote` | `cloud/serving_layer/lambda_functions/quote_service.py` | Code written; AWS resources not deployed |
+| Serving API (MVP) | Lambda (zip) behind HTTP API Gateway (`GET /v1/screener/quotes`, `GET /v1/picks/today`, `GET /v1/picks/{scan_date}/returns`) | `cloud/serving_layer/lambda_functions/serving_api/` | Code + deploy scripts written; AWS resources not deployed |
+| Quote API | Lambda (zip) behind API Gateway `GET /quote` | `cloud/serving_layer/lambda_functions/quote_api/quote_service.py` | Code written; AWS resources not deployed |
 | Backtest API | Lambda (container, ARM64) behind API Gateway `POST /backtest` | `cloud/serving_layer/lambda_functions/backtester/backtest_handler.py` + `Dockerfile` | Code + Docker written; ECR/Lambda/APIGW not deployed |
 | Redis | ElastiCache (cluster mode disabled, TLS) | — | Not deployed |
-| RDS Proxy | `raw_ohlcv` read path for backtester | — | Not deployed |
-| API Gateway | REST API + Usage Plans + API keys | — | Not deployed |
+| RDS Proxy | `raw_ohlcv` read path for serving/backtester | `cloud/serving_layer/infrastructure/serving_api/create_rds_proxy.sh` | Not deployed |
+| API Gateway | HTTP API + throttling + CORS (MVP), REST API + usage plans optional later | `cloud/serving_layer/infrastructure/serving_api/deploy_http_api.sh` | Not deployed |
 
 ### 3.4 Storage
 

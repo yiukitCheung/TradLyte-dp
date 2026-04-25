@@ -220,7 +220,7 @@ COMMENT ON COLUMN data_ingestion_watermark.is_current IS 'TRUE if current waterm
 -- Ranked top picks produced by the daily scanner run
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS stock_picks (
+CREATE TABLE IF NOT EXISTS daily_scan_signals (
     scan_date DATE NOT NULL,
     rank INTEGER NOT NULL CHECK (rank > 0),
     symbol VARCHAR(50) NOT NULL,
