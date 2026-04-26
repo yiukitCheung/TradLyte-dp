@@ -21,7 +21,7 @@ SERVING_API_KEY=replace-me \
 Create this manually in the AWS Console:
 
 1. Open **RDS > Proxies > Create proxy**.
-2. Name: `dev-rds-proxy`; Engine: **PostgreSQL**.
+2. Name: `dev-rds-proxy-v2`; Engine: **PostgreSQL**.
 3. Attach the same VPC and private subnets used by `dev-serving-api`.
 4. Authentication: **Secrets Manager**, choose your existing `RDS_SECRET_ARN`.
 5. IAM role: select/create the role that allows proxy access to that secret.
@@ -31,6 +31,12 @@ Create this manually in the AWS Console:
 7. Create proxy, wait until status is **Available**.
 8. Register your DB instance/cluster in target group `default`.
 9. Copy proxy endpoint and update the secret `host` value to that endpoint.
+
+Known-good SG matrix:
+
+- Lambda SG -> Proxy SG: outbound TCP 5432.
+- Proxy SG -> Lambda SG: inbound TCP 5432.
+- DB SG -> Proxy SG: inbound TCP 5432 (source = Proxy SG).
 
 ## 3) Deploy HTTP API
 
@@ -52,3 +58,10 @@ Set on `dev-serving-api` Lambda:
 - `ALLOWED_ORIGIN` - frontend origin for CORS.
 - `SCREENER_CACHE_TTL_S` - default `60`.
 - `RETURNS_CACHE_TTL_S` - default `300`.
+
+## Troubleshooting notes
+
+- If endpoints return 500 with `AccessDeniedException` on `GetSecretValue`, the Lambda role policy does not include the configured `RDS_SECRET_ARN`.
+- If health works but data routes timeout/503, verify proxy target health first:
+  `aws rds describe-db-proxy-targets --db-proxy-name dev-rds-proxy-v2 --target-group-name default --region ca-west-1`
+- For HTTP API stage `v1`, keep app base path handling aligned (`API_GATEWAY_BASE_PATH=/v1`) to avoid route-level 404.
