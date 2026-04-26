@@ -34,7 +34,6 @@ def load_rds_secret() -> Dict[str, Any]:
         "password": secret["password"],
     }
 
-
 def get_connection() -> psycopg2.extensions.connection:
     global _connection
 
@@ -56,7 +55,6 @@ def get_connection() -> psycopg2.extensions.connection:
     logger.info("Established serving API PostgreSQL connection")
     return _connection
 
-
 def execute_query(sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
@@ -71,7 +69,6 @@ def execute_query(sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dic
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(sql, params or {})
             return [dict(row) for row in cursor.fetchall()]
-
 
 def execute_one(sql: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     rows = execute_query(sql, params=params)

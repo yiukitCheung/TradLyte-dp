@@ -9,7 +9,7 @@ from fastapi import APIRouter, Query
 from serving_api.cache import PICKS_CACHE, RETURNS_CACHE, make_cache_key
 from serving_api.db import execute_query
 
-router = APIRouter(prefix="/v1/picks", tags=["picks"])
+router = APIRouter(prefix="/picks", tags=["picks"])
 
 
 def _to_return(pick_price: Optional[Decimal], close_price: Optional[Decimal]) -> Optional[float]:
@@ -55,7 +55,6 @@ def get_picks_today(limit: int = Query(default=25, ge=1, le=200)) -> Dict[str, A
                signal,
                price,
                confidence,
-               score,
                metadata
         FROM stock_picks
         WHERE scan_date = (SELECT d FROM latest)

@@ -43,6 +43,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+wait_for_lambda_update_ready() {
+  local attempts="${1:-30}"
+  local sleep_seconds="${2:-5}"
+  local i
+  for ((i = 1; i <= attempts; i++)); do
+    local status
+    status="$(aws lambda get-function-configuration \
+      --function-name "$FUNCTION_NAME" \
+      --region "$AWS_REGION" \
+      --query 'LastUpdateStatus' \
+      --output text 2>/dev/null || echo "Unknown")"
+    if [[ "$status" == "Successful" || "$status" == "Failed" ]]; then
+      return 0
+    fi
+    echo "⏳ Lambda update in progress (status=$status), waiting ${sleep_seconds}s..."
+    sleep "$sleep_seconds"
+  done
+  echo "❌ Timed out waiting for Lambda update readiness."
+  return 1
+}
+
 echo "🚀 Deploying Lambda: $FUNCTION_NAME"
 echo "Region: $AWS_REGION"
 
@@ -76,11 +97,26 @@ zip -r9 "$ZIP_PATH" . -x "*.pyc" "*/__pycache__/*"
 cd "$SCRIPT_DIR"
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+  CURRENT_ENV_JSON="$(aws lambda get-function-configuration \
+    --function-name "$FUNCTION_NAME" \
+    --region "$AWS_REGION" \
+    --query 'Environment.Variables' \
+    --output json 2>/dev/null || echo '{}')"
+  current_var() {
+    python3 -c "import json,sys; data=json.loads(sys.argv[1] if sys.argv[1] else '{}'); print(data.get(sys.argv[2], ''))" "$CURRENT_ENV_JSON" "$1"
+  }
+  [[ -z "$RDS_SECRET_ARN" ]] && RDS_SECRET_ARN="$(current_var RDS_SECRET_ARN)"
+  [[ -z "$SERVING_API_KEY" ]] && SERVING_API_KEY="$(current_var SERVING_API_KEY)"
+  [[ -z "${ALLOWED_ORIGIN:-}" || "$ALLOWED_ORIGIN" == "*" ]] && ALLOWED_ORIGIN="$(current_var ALLOWED_ORIGIN)"
+  [[ -z "$SCREENER_CACHE_TTL_S" ]] && SCREENER_CACHE_TTL_S="$(current_var SCREENER_CACHE_TTL_S)"
+  [[ -z "$RETURNS_CACHE_TTL_S" ]] && RETURNS_CACHE_TTL_S="$(current_var RETURNS_CACHE_TTL_S)"
+
   echo "⬆️  Updating existing function code"
   aws lambda update-function-code \
     --function-name "$FUNCTION_NAME" \
     --zip-file "fileb://$ZIP_PATH" \
     --region "$AWS_REGION" >/dev/null
+  wait_for_lambda_update_ready
 else
   if [[ -z "$LAMBDA_ROLE_ARN" ]]; then
     echo "❌ LAMBDA_ROLE_ARN is required to create a new Lambda function"
@@ -98,6 +134,7 @@ else
     --memory-size "$LAMBDA_MEMORY" \
     --vpc-config "SubnetIds=${SUBNET_IDS_CSV},SecurityGroupIds=${SECURITY_GROUP_IDS_CSV}" \
     --region "$AWS_REGION" >/dev/null
+  wait_for_lambda_update_ready 60 5
 fi
 
 echo "⚙️  Applying runtime/network/environment settings"
@@ -110,6 +147,7 @@ aws lambda update-function-configuration \
   --vpc-config "SubnetIds=${SUBNET_IDS_CSV},SecurityGroupIds=${SECURITY_GROUP_IDS_CSV}" \
   --environment "Variables={RDS_SECRET_ARN=${RDS_SECRET_ARN},SERVING_API_KEY=${SERVING_API_KEY},ALLOWED_ORIGIN=${ALLOWED_ORIGIN},SCREENER_CACHE_TTL_S=${SCREENER_CACHE_TTL_S},RETURNS_CACHE_TTL_S=${RETURNS_CACHE_TTL_S}}" \
   --region "$AWS_REGION" >/dev/null
+wait_for_lambda_update_ready
 
 aws lambda put-function-concurrency \
   --function-name "$FUNCTION_NAME" \

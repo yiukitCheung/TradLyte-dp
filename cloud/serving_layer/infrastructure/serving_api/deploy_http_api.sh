@@ -74,6 +74,12 @@ fi
 
 declare -a ROUTES=(
   "GET /health"
+  "GET /screener/quotes"
+  "GET /picks/today"
+  "GET /picks/{scan_date}/returns"
+)
+
+declare -a DEPRECATED_ROUTES=(
   "GET /v1/screener/quotes"
   "GET /v1/picks/today"
   "GET /v1/picks/{scan_date}/returns"
@@ -99,6 +105,21 @@ for ROUTE_KEY in "${ROUTES[@]}"; do
       --target "integrations/$INTEGRATION_ID" \
       --region "$AWS_REGION" >/dev/null
     echo "🔄 Updated route: $ROUTE_KEY"
+  fi
+done
+
+for ROUTE_KEY in "${DEPRECATED_ROUTES[@]}"; do
+  ROUTE_ID="$(aws apigatewayv2 get-routes \
+    --api-id "$API_ID" \
+    --region "$AWS_REGION" \
+    --query "Items[?RouteKey=='$ROUTE_KEY'].RouteId | [0]" \
+    --output text)"
+  if [[ -n "$ROUTE_ID" && "$ROUTE_ID" != "None" ]]; then
+    aws apigatewayv2 delete-route \
+      --api-id "$API_ID" \
+      --route-id "$ROUTE_ID" \
+      --region "$AWS_REGION" >/dev/null
+    echo "🗑️  Removed deprecated route: $ROUTE_KEY"
   fi
 done
 

@@ -3,7 +3,6 @@
 Scripts to deploy the MVP serving API stack:
 
 - `deploy_lambda.sh` - packages and deploys `dev-serving-api` (FastAPI + Mangum) into the same private VPC shape used by batch ingest Lambdas.
-- `create_rds_proxy.sh` - provisions `dev-rds-proxy`, security groups, and target registration.
 - `deploy_http_api.sh` - creates/updates HTTP API Gateway routes and stage (`v1`) with throttling + CORS.
 
 ## 1) Deploy Lambda
@@ -17,19 +16,21 @@ SERVING_API_KEY=replace-me \
 ./cloud/serving_layer/infrastructure/serving_api/deploy_lambda.sh
 ```
 
-## 2) Create RDS Proxy
+## 2) Create RDS Proxy (AWS Console)
 
-```bash
-AWS_REGION=ca-west-1 \
-DB_PROXY_NAME=dev-rds-proxy \
-DB_INSTANCE_ID=<db-instance-id> \
-RDS_SECRET_ARN=arn:aws:secretsmanager:...:secret:... \
-RDS_PROXY_ROLE_ARN=arn:aws:iam::<account-id>:role/<proxy-role> \
-SOURCE_LAMBDA_FOR_VPC=dev-serving-api \
-./cloud/serving_layer/infrastructure/serving_api/create_rds_proxy.sh
-```
+Create this manually in the AWS Console:
 
-After creation, update your RDS secret `host` field to the proxy endpoint.
+1. Open **RDS > Proxies > Create proxy**.
+2. Name: `dev-rds-proxy`; Engine: **PostgreSQL**.
+3. Attach the same VPC and private subnets used by `dev-serving-api`.
+4. Authentication: **Secrets Manager**, choose your existing `RDS_SECRET_ARN`.
+5. IAM role: select/create the role that allows proxy access to that secret.
+6. Security groups:
+   - Proxy SG allows inbound TCP 5432 from Lambda SG.
+   - RDS SG allows inbound TCP 5432 from Proxy SG.
+7. Create proxy, wait until status is **Available**.
+8. Register your DB instance/cluster in target group `default`.
+9. Copy proxy endpoint and update the secret `host` value to that endpoint.
 
 ## 3) Deploy HTTP API
 

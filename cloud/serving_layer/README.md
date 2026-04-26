@@ -22,7 +22,6 @@ All three are implemented in `lambda_functions/serving_api/` and deployed as a s
 | `lambda_functions/backtester/Dockerfile` | Container image for backtester (ARM64) |
 | `lambda_functions/backtester/requirements.backtester.txt` | Lean deps for that image |
 | `infrastructure/serving_api/deploy_lambda.sh` | Package + deploy `dev-serving-api` |
-| `infrastructure/serving_api/create_rds_proxy.sh` | Create/update `dev-rds-proxy` + SG rules |
 | `infrastructure/serving_api/deploy_http_api.sh` | Create/update HTTP API routes + stage |
 | `infrastructure/docker/build_push_backtester.sh` | Build & push backtester image to ECR |
 
@@ -32,7 +31,6 @@ From repository root:
 
 ```bash
 ./cloud/serving_layer/infrastructure/serving_api/deploy_lambda.sh
-./cloud/serving_layer/infrastructure/serving_api/create_rds_proxy.sh
 ./cloud/serving_layer/infrastructure/serving_api/deploy_http_api.sh
 ```
 

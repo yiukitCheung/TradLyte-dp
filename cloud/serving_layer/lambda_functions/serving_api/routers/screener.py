@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from serving_api.cache import SCREENER_CACHE, make_cache_key
 from serving_api.db import execute_one, execute_query
 
-router = APIRouter(prefix="/v1/screener", tags=["screener"])
+router = APIRouter(prefix="/screener", tags=["screener"])
 
 SORT_FIELDS = {
     "marketcap": "m.marketcap",
