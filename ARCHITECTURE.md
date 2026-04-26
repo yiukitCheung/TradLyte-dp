@@ -13,7 +13,7 @@
 TradLyte is a serverless, event-driven financial-market data platform implemented on AWS. It follows a **Medallion + Lambda Architecture** pattern:
 
 - **Batch Layer** — ingests daily OHLCV and symbol metadata, materializes multi-timeframe views on demand, runs strategy scanning at market-close.
-- **Serving Layer** — REST APIs for on-demand quotes and user-defined backtests (design phase).
+- **Serving Layer** — HTTP APIs for screener + picks (live), with backtest endpoint in planned state.
 - **Speed Layer** — designed, archived for MVP (Kinesis/Flink path in `cloud/speed_layer/Archive/`).
 
 The platform's mission statement — **"Clarity Over Noise, Purpose Over Profit"** — drives two architectural non-negotiables:
@@ -80,11 +80,10 @@ flowchart TB
     SM_RDS["RDS_SECRET"]
   end
 
-  subgraph SERVE["Serving Layer - designed, not deployed"]
-    APIGW["API Gateway (REST)<br/>GET /quote - POST /backtest"]
-    REDIS["ElastiCache Redis<br/>60s TTL"]
-    LF_QUOTE["lambda quote_service"]
-    LF_BT["lambda backtester (container ARM64)"]
+  subgraph SERVE["Serving Layer - MVP live (screener+picks)"]
+    APIGW["API Gateway (HTTP)<br/>/v1/screener/quotes<br/>/v1/picks/today<br/>/v1/picks/{scan_date}/returns"]
+    LF_SERVE["lambda dev-serving-api<br/>FastAPI + Mangum"]
+    LF_BT["lambda backtester (container ARM64, planned)"]
     RDSPROXY["RDS Proxy"]
     FE["Frontend (React)"]
   end
@@ -134,12 +133,11 @@ flowchart TB
 
   LF_OHLCV -.->|HTTPS| POLY
   LF_META  -.->|HTTPS| POLY
-  LF_QUOTE -.->|HTTPS cache miss| POLY
 
   FE -->|HTTPS + API key| APIGW
-  APIGW --> LF_QUOTE
+  APIGW --> LF_SERVE
   APIGW --> LF_BT
-  LF_QUOTE <--> REDIS
+  LF_SERVE --> RDSPROXY
   LF_BT --> RDSPROXY
   RDSPROXY --> T_OHLCV
 ```
@@ -175,16 +173,15 @@ flowchart TB
 | `shared.utils.market_calendar` | Trading-day arithmetic (US/Eastern) |
 | `shared.analytics_core.*` | Strategy framework: `indicators/` (Polars-native), `strategies/base.py` + `builder.py` (CompositeStrategy from JSON), `scanner.py` (`DailyScanner.run → rank → write`), `backtester.py`, `executor.py`, `inputs.py` |
 
-### 3.3 Serving Layer (Design — Not Yet Deployed)
+### 3.3 Serving Layer (MVP — Live)
 
 | Component | AWS Resource | Code | Status |
 |---|---|---|---|
-| Serving API (MVP) | Lambda (zip) behind HTTP API Gateway (`GET /v1/screener/quotes`, `GET /v1/picks/today`, `GET /v1/picks/{scan_date}/returns`) | `cloud/serving_layer/lambda_functions/serving_api/` | Code + deploy scripts written; AWS resources not deployed |
-| Quote API | Lambda (zip) behind API Gateway `GET /quote` | `cloud/serving_layer/lambda_functions/quote_api/quote_service.py` | Code written; AWS resources not deployed |
-| Backtest API | Lambda (container, ARM64) behind API Gateway `POST /backtest` | `cloud/serving_layer/lambda_functions/backtester/backtest_handler.py` + `Dockerfile` | Code + Docker written; ECR/Lambda/APIGW not deployed |
-| Redis | ElastiCache (cluster mode disabled, TLS) | — | Not deployed |
-| RDS Proxy | `raw_ohlcv` read path for serving/backtester | `cloud/serving_layer/infrastructure/serving_api/create_rds_proxy.sh` | Not deployed |
-| API Gateway | HTTP API + throttling + CORS (MVP), REST API + usage plans optional later | `cloud/serving_layer/infrastructure/serving_api/deploy_http_api.sh` | Not deployed |
+| Serving API (MVP) | Lambda (zip) behind HTTP API Gateway (`GET /v1/screener/quotes`, `GET /v1/picks/today`, `GET /v1/picks/{scan_date}/returns`) | `cloud/serving_layer/lambda_functions/serving_api/` | Deployed in dev; live endpoints for screener and picks |
+| Backtest API | Lambda (container, ARM64) behind API Gateway `POST /backtest` | `cloud/serving_layer/lambda_functions/backtester/backtest_handler.py` + `Dockerfile` | Code + Docker written; not deployed |
+| Redis | ElastiCache (cluster mode disabled, TLS) | — | Deferred for MVP (not required for current read traffic) |
+| RDS Proxy | `raw_ohlcv` read path for serving/backtester | AWS Console runbook in `cloud/serving_layer/infrastructure/serving_api/README.md` | Deployed in dev (`dev-rds-proxy-v2`) |
+| API Gateway | HTTP API + throttling + CORS (MVP), REST API + usage plans optional later | `cloud/serving_layer/infrastructure/serving_api/deploy_http_api.sh` | Deployed in dev |
 
 ### 3.4 Storage
 
@@ -207,7 +204,7 @@ flowchart TB
 | `daily_scan_signals` | Scanner staging | PK `(scan_date, symbol, strategy_name)` | Written by workers, truncated-per-day by aggregator |
 | `stock_picks` | Scanner output | PK `(scan_date, rank)` + unique `(scan_date, symbol, strategy_name)` | Final ranked output |
 
-> **⚠️ Schema drift to fix:** `schema_init.sql` declares `stock_picks` twice (lines ~223 and ~260) — the second `CREATE TABLE IF NOT EXISTS stock_picks` should be `daily_scan_signals`. No-op at runtime (IF NOT EXISTS) but misleading.
+> **Schema note:** duplicate `stock_picks` declaration in `schema_init.sql` was corrected to `daily_scan_signals` in the serving-layer update cycle.
 
 ---
 
@@ -302,8 +299,8 @@ The ingest handlers also support **S3 → SQS → Lambda** (`Records`-style even
 | FR-2 | Persist last 5 years in RDS; retain full history in S3 bronze | Batch |
 | FR-3 | Rank daily strategy signals (`stock_picks`) by close of pipeline | Analytics |
 | FR-4 | Support user-defined strategies via JSON (`RequirementsStrategyConfig`) | Analytics |
-| FR-5 | Return `/quote` in ≤ 300 ms p95 (cache hit) / ≤ 1 s (cache miss) | Serving (planned) |
-| FR-6 | Return `/backtest` in ≤ 3 s p95 for 5-year single-symbol workloads | Serving (planned) |
+| FR-5 | Return `/v1/screener/quotes` and `/v1/picks/today` in ≤ 1.5 s p95 in dev | Serving (live, tuning in progress) |
+| FR-6 | Return `/v1/picks/{scan_date}/returns` and `/backtest` in ≤ 3 s p95 | Serving (partially planned; returns endpoint needs further optimization) |
 | FR-7 | Idempotent re-ingest from S3 (replay capability) | Batch |
 
 ### 5.2 Non-Functional Requirements
@@ -510,12 +507,12 @@ Packaging discipline: the deploy scripts vendor **only the shared subset a funct
 
 | ID | Risk | Severity | Mitigation / Status |
 |---|---|---|---|
-| R-1 | `schema_init.sql` duplicate `stock_picks` create (should be `daily_scan_signals`) | Low | Fix in next schema migration |
+| R-1 | Historical `schema_init.sql` duplicate `stock_picks` create | Low | Fixed in current repository; keep migration discipline for future schema changes |
 | R-2 | No automated Secrets rotation | Medium | Enable Secrets Manager managed rotation |
 | R-3 | S3 Gateway VPC Endpoint may be missing → S3 traffic traverses NAT | Low cost / Medium security | Verify + provision gateway endpoint |
 | R-4 | Ingest handlers and Step Functions both write meta — potential double work | Low | Use one path exclusively, or rely on idempotent upsert |
 | R-5 | Batch job uses `RDSTimescaleClient(secret_arn=...)` without `from_lambda_environment()` helper — duplicated credential logic | Low | Consolidate via classmethod |
-| R-6 | Serving layer infrastructure not deployed; architecture exists only as Python code | — | Tracked; next MVP milestone |
+| R-6 | `/v1/picks/{scan_date}/returns` can hit timeout/503 under current query shape on cold paths | Medium | Tune SQL/indexing + caching + Lambda timeout before broad rollout |
 | R-7 | No Terraform / CDK — configuration drift possible | Medium | Consider migrating critical IaC to CDK / Terraform before multi-env |
 | R-8 | Polygon rate limits (tier-dependent) not explicitly encoded in `PolygonClient` | Medium | Add exponential backoff + quota-aware scheduler |
 | R-9 | `cloud/serving_layer/infrastructure/backtester/build_push_backtester.sh` untracked; old script deleted at the infrastructure/docker path | Low | Commit or discard per intent |
