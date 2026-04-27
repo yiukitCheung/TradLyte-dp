@@ -62,20 +62,18 @@ This directory contains the AWS-native implementation of the TradLyte data pipel
 │   └─────────────────────────────────────────────────────────────────────────┘   │
 │                                       │                                         │
 │   ┌───────────────────────────────────▼──────────────────────────────────────┐  │
-│   │                    SERVING LAYER (📋 MVP Design)                          │  │
+│   │                    SERVING LAYER (✅ MVP Live)                            │  │
 │   │                                                                          │  │
-│   │     ┌─────────┐     ┌─────────────┐                                      │  │
-│   │     │  Redis  │ ←── │ API Gateway │ ←── Frontend                        │  │
-│   │     │ (cache) │     │  (REST)     │                                      │  │
-│   │     └─────────┘     └──────┬──────┘                                      │  │
-│   │                            │                                             │  │
-│   │              ┌──────────────┼──────────────┐                            │  │
-│   │              ▼              ▼              ▼                            │  │
-│   │      ┌──────────┐  ┌──────────┐  ┌──────────┐                          │  │
-│   │      │  Quote   │  │ Backtest │  │  Alert   │                          │  │
-│   │      │ Service  │  │   API    │  │ Service  │                          │  │
-│   │      │(Latest)  │  │(On-demand)│ │(Scheduled)│                         │  │
-│   │      └──────────┘  └──────────┘  └──────────┘                          │  │
+│   │     ┌─────────────┐                                                     │  │
+│   │     │ API Gateway │ ←── Frontend                                       │  │
+│   │     │   (HTTP)    │                                                     │  │
+│   │     └──────┬──────┘                                                     │  │
+│   │            │                                                            │  │
+│   │            ▼                                                            │  │
+│   │      ┌──────────────┐    ┌───────────┐                                  │  │
+│   │      │ Serving API  │ -> │ RDS Proxy │ -> RDS                          │  │
+│   │      │ (FastAPI/LF) │    └───────────┘                                  │  │
+│   │      └──────────────┘                                                    │  │
 │   └──────────────────────────────────────────────────────────────────────────┘  │
 │                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────┘
@@ -116,9 +114,9 @@ cloud/
 │   │       └── deploy_step_functions.sh
 │   └── BATCH_LAYER_IMPLEMENTATION_SUMMARY.md
 │
-├── serving_layer/                      # 📋 API serving (MVP Design)
+├── serving_layer/                      # ✅ API serving (MVP Live)
 │   ├── lambda_functions/
-│   │   ├── quote_service.py
+│   │   ├── serving_api/
 │   │   └── backtester/
 │   └── README.md
 │
@@ -163,15 +161,14 @@ cloud/
 | **SNS Alerts** | ✅ Configured | Failure notifications on any stage |
 | **Resampling** | On-the-fly | Backtester resamples 1d → Fibonacci intervals at query time |
 
-### Serving Layer (📋 MVP Design — Ready for Implementation)
+### Serving Layer (✅ MVP Live)
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| **Quote Service** | 📋 Designed | Latest price endpoint (on-demand REST API) |
-| **Backtest API** | 📋 Designed | Historical data queries from RDS/S3 |
-| **Alert Service** | 📋 Designed | Scheduled checks (future, not real-time) |
-| **API Gateway** | ⚠️ Not Deployed | REST API endpoints |
-| **Redis Cache** | ⚠️ Not Deployed | Quote caching (60s TTL) |
+| **Serving API** | ✅ Deployed | `GET /v1/screener/quotes`, `GET /v1/picks/today`, `GET /v1/picks/{scan_date}/returns` |
+| **API Gateway (HTTP)** | ✅ Deployed | Front door for serving endpoints |
+| **RDS Proxy** | ✅ Deployed | Connection pooling for serving Lambda |
+| **Backtest API** | 📋 Designed | Historical strategy backtest endpoint (separate path) |
 
 ### Speed Layer (📁 Archived)
 
@@ -235,10 +232,9 @@ Vacuum Script (local) → Deep clean old date files if needed
 | **Batch Layer Total** | **$59** |
 | | |
 | **Serving Layer (MVP)** | |
-| Quote Service (Lambda + Redis) | $5 |
-| Backtest API (Lambda) | $3 |
-| API Gateway | $2 |
-| **Serving Layer Total** | **$10** |
+| Serving API (Lambda + HTTP API Gateway + RDS Proxy) | $10 |
+| Backtest API (Lambda) | $3 (not deployed) |
+| **Serving Layer Total** | **~$10 current / ~$13 with backtest** |
 | | |
 | **TOTAL MVP** | **~$69/month** |
 
@@ -249,7 +245,7 @@ Vacuum Script (local) → Deep clean old date files if needed
 ## 📚 Documentation
 
 - [**Implementation Status**](./IMPLEMENTATION_STATUS.md) - Overall progress and roadmap
-- [**Serving Layer Design**](./serving_layer/README.md) - MVP architecture (Quote Service + Backtest API)
+- [**Serving Layer Design**](./serving_layer/README.md) - MVP serving API architecture and rollout lessons learned
 - [**Analytics Core**](./shared/analytics_core/README.md) - Analytics Engine documentation
 - [**Orchestration Guide**](./batch_layer/infrastructure/orchestration/README.md) - Step Functions pipeline
 - [**Database Setup**](./batch_layer/database/README.md) - Database initialization guide
@@ -272,5 +268,5 @@ Vacuum Script (local) → Deep clean old date files if needed
 
 ---
 
-**Last Updated:** March 2026  
-**Overall Status:** ✅ Batch Layer Complete (4-stage pipeline with scanner) | 📋 Serving Layer MVP Design Ready | 🧠 Analytics Core Implemented
+**Last Updated:** April 2026  
+**Overall Status:** ✅ Batch Layer Complete (4-stage pipeline with scanner) | ✅ Serving Layer MVP Live (screener + picks routes) | 🧠 Analytics Core Implemented

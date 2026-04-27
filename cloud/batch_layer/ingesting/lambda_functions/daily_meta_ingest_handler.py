@@ -133,7 +133,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     - SQS event (standard S3-notification via SQS): event['Records'][...]['body'] contains S3 event JSON.
     - Manual replay: {"s3_bucket": "...", "s3_key": "..."}
     """
-    rds_client = RDSTimescaleClient(secret_arn=os.environ["RDS_SECRET_ARN"])
+    rds_client = RDSTimescaleClient.from_lambda_environment()
 
     meta_prefix = os.environ.get("S3_META_PREFIX", _DEFAULT_META_PREFIX)
     chunk_size = int(os.environ.get("META_RDS_CHUNK_SIZE", "200"))

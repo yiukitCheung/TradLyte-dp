@@ -20,7 +20,31 @@ logger = logging.getLogger(__name__)
 
 class RDSTimescaleClient:
     """Client for RDS PostgreSQL + TimescaleDB database operations"""
-    
+
+    @classmethod
+    def from_lambda_environment(cls) -> "RDSTimescaleClient":
+        """
+        Build client from Lambda env. Prefer RDS_SECRET_ARN + Secrets Manager.
+
+        If the function runs in a VPC private subnet without NAT or a Secrets Manager
+        VPC endpoint, Secrets Manager HTTPS calls will time out. Then set
+        RDS_USE_ENV_CREDENTIALS=true and RDS_ENDPOINT, RDS_USERNAME, RDS_PASSWORD, RDS_DATABASE.
+        """
+        use_env = os.environ.get("RDS_USE_ENV_CREDENTIALS", "").lower() in ("1", "true", "yes")
+        secret_arn = (os.environ.get("RDS_SECRET_ARN") or "").strip()
+        if use_env or not secret_arn:
+            required = ("RDS_ENDPOINT", "RDS_USERNAME", "RDS_PASSWORD", "RDS_DATABASE")
+            missing = [k for k in required if not os.environ.get(k)]
+            if missing:
+                raise ValueError(
+                    "RDS_USE_ENV_CREDENTIALS or empty RDS_SECRET_ARN requires env: "
+                    + ", ".join(missing)
+                )
+            logger.info("RDSTimescaleClient: env credentials (no Secrets Manager API)")
+            return cls(secret_arn=None)
+        logger.info("RDSTimescaleClient: Secrets Manager (%s)", secret_arn)
+        return cls(secret_arn=secret_arn)
+
     def __init__(self, endpoint: str = None, port: str = None, 
                  username: str = None, password: str = None, 
                  database: str = None, secret_arn: str = None):
@@ -48,7 +72,15 @@ class RDSTimescaleClient:
     def _load_credentials_from_secrets(self):
         """Load database credentials from AWS Secrets Manager"""
         try:
-            secrets_client = boto3.client('secretsmanager')
+            # Optional: Interface VPC endpoint URL when private DNS is disabled, e.g.
+            # https://vpce-....secretsmanager.ca-west-1.vpce.amazonaws.com
+            endpoint_url = (os.environ.get("SECRETS_MANAGER_ENDPOINT_URL") or "").strip() or None
+            if endpoint_url:
+                logger.info("Secrets Manager boto client using SECRETS_MANAGER_ENDPOINT_URL")
+            secrets_client = boto3.client(
+                "secretsmanager",
+                **({"endpoint_url": endpoint_url} if endpoint_url else {}),
+            )
             response = secrets_client.get_secret_value(SecretId=self.secret_arn)
             secret = json.loads(response['SecretString'])
             
@@ -61,6 +93,16 @@ class RDSTimescaleClient:
             logger.info("Loaded RDS credentials from Secrets Manager")
             
         except Exception as e:
+            if type(e).__name__ == "ConnectTimeoutError" or "Connect timeout" in str(e).lower():
+                logger.error("Secrets Manager connect timeout (VPC cannot reach API): %s", e)
+                raise RuntimeError(
+                    "Secrets Manager HTTPS timed out. Lambdas in a private VPC need either: "
+                    "(1) NAT Gateway for outbound internet, or "
+                    "(2) Interface VPC endpoint com.amazonaws.<region>.secretsmanager with SG allowing 443 from this Lambda, or "
+                    "(3) set SECRETS_MANAGER_ENDPOINT_URL to your VPC endpoint URL if private DNS is off, or "
+                    "(4) set RDS_USE_ENV_CREDENTIALS=true and RDS_ENDPOINT/RDS_USERNAME/RDS_PASSWORD/RDS_DATABASE. "
+                    "See cloud/batch_layer/infrastructure/common/VPC_LAMBDA_SECRETS_MANAGER.txt"
+                ) from e
             logger.error(f"Error loading credentials from Secrets Manager: {str(e)}")
             raise
     

@@ -72,7 +72,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     logger.info(f"scan_date={scan_date}  array_size={array_size}  bucket={CHUNKS_BUCKET}")
 
     # ── fetch active symbols (single RDS query) ───────────────────────────────
-    rds_client = RDSTimescaleClient(secret_arn=os.environ['RDS_SECRET_ARN'])
+    rds_client = RDSTimescaleClient.from_lambda_environment()
     try:
         symbols: List[str] = rds_client.get_active_symbols()
     finally:

@@ -1,44 +1,146 @@
 ---
 config:
   theme: default
+  flowchart:
+    curve: basis
 ---
-flowchart TD
-  subgraph Source["📡 Data Input"]
-    A1["Polygon REST API (1D OHLCV)"]
-    A2["Polygon WebSocket (Live Tick)"]
-    A3["Frontend: User Strategy Config + Journal Log"]
+flowchart TB
+  %% =============================================================
+  %% TradLyte Data Platform — Post-Decoupling Architecture (2026)
+  %% =============================================================
+
+  subgraph EXT["🌐 External Sources"]
+    POLY["Polygon.io REST<br/>(OHLCV + Metadata + Quote)"]
   end
 
-  subgraph Batch["⏱️ Batch Layer (Daily Snapshot)"]
-    B1["CloudWatch Event Schedule"]
-    B2["AWS Lambda Function"]
-    B3["Fetch Daily OHLCV from Polygon"]
-    B4["Resample (3D / 1W)"]
-    B5["Write to Aurora PostgreSQL: raw_ohlcv_1d"]
+  subgraph SCHED["⏱️ Orchestration"]
+    EB["EventBridge<br/>cron 21:05 UTC Mon–Fri"]
+    SFN["Step Functions<br/>dev-daily-ohlcv-pipeline"]
+    SNS["SNS<br/>condvest-pipeline-alerts"]
   end
 
-  subgraph Speed["⚡ Live Signal Layer (AWS)"]
-    C1["WebSocket Client (EC2 / Lambda / Fargate)"]
-    C2["Kinesis Data Streams: ticks.raw"]
-    C3["Kinesis Data Analytics (Flink/SQL): Resample + Strategy"]
-    C4["Emit Signal (buy/sell/wait)"]
+  subgraph FETCH["📥 Fetch Tier — Stateless, NO VPC"]
+    LF_OHLCV["λ daily-ohlcv-fetcher<br/>Polygon → S3 parquet"]
+    LF_META["λ daily-meta-fetcher<br/>Polygon → S3 JSON manifest"]
   end
 
-  subgraph Storage["🗃️ Storage & Cache"]
-    D1["Aurora PostgreSQL: users"]
-    D2["Aurora PostgreSQL: strategy_configs"]
-    D3["Aurora PostgreSQL: journal_logs"]
-    D5["ElastiCache Redis: signals:{symbol}:{strategy_id}"]
-    D6["ElastiCache Redis: strategy_cfg:{user_id}"]
+  subgraph PLAN["🧭 Plan Tier — VPC"]
+    LF_PLAN["λ daily-ohlcv-planner<br/>reads watermark → fan-out invoke"]
   end
 
-  %% Connections
-  A1 --> B1
-  B1 --> B2 --> B3 --> B4 --> B5
-  B5 --> D1
+  subgraph LAKE["🗃️ S3 Data Lake (Bronze)"]
+    S3_OHLCV["bronze/raw_ohlcv/<br/>symbol=X/date=Y.parquet"]
+    S3_META["bronze/raw_meta/<br/>run_date=…/_manifest.json"]
+    S3_CHUNKS["scanner-chunks/<br/>{scan_date}/chunk_N.json"]
+  end
 
-  A2 --> C1 --> C2 --> C3 --> C4 --> D5
+  subgraph INGEST["📝 Ingest Tier — VPC (private subnet)"]
+    SQS["SQS (optional async path)"]
+    LF_INGEST_O["λ daily-ohlcv-ingest-handler<br/>parquet → RDS upsert + watermark"]
+    LF_INGEST_M["λ daily-meta-ingest-handler<br/>manifest → symbol_metadata"]
+  end
 
-  A3 --> D2
-  A3 --> D3
-  D2 --> D6
+  subgraph SCAN["🎯 Scanner Tier"]
+    LF_PART["λ scan-partitioner<br/>RDS → 10 chunk files"]
+    BATCH_W["AWS Batch / Fargate<br/>scanner-worker · Array×10"]
+    BATCH_A["AWS Batch / Fargate<br/>scanner-aggregator · ×1"]
+  end
+
+  subgraph DB["🗄️ RDS PostgreSQL (private)"]
+    T_OHLCV["raw_ohlcv · 5yr retention"]
+    T_META["symbol_metadata"]
+    T_WM["data_ingestion_watermark<br/>(SCD Type 2)"]
+    T_STAGE["daily_scan_signals · staging"]
+    T_PICKS["stock_picks · final"]
+  end
+
+  subgraph SEC["🔐 Secrets Manager"]
+    SM_POLY["POLYGON_API_KEY"]
+    SM_RDS["RDS_SECRET (host/user/pwd)"]
+  end
+
+  subgraph SERVE["🚀 Serving Layer — designed, not deployed"]
+    APIGW["API Gateway (REST)<br/>GET /quote · POST /backtest"]
+    REDIS["ElastiCache Redis<br/>60s TTL"]
+    LF_QUOTE["λ quote_service"]
+    LF_BT["λ backtester (container, ARM64)"]
+    RDSPROXY["RDS Proxy"]
+    FE["Frontend (React)"]
+  end
+
+  %% ---------------- Batch flows ----------------
+  EB --> SFN
+  SFN -->|PlanOHLCVFetch| LF_PLAN
+  SFN -->|FetchMetadata| LF_META
+  LF_PLAN -->|boto3 invoke async/sync| LF_OHLCV
+  LF_OHLCV -->|PutObject| S3_OHLCV
+  LF_META  -->|PutObject| S3_META
+
+  SFN -->|IngestOHLCVToRDS| LF_INGEST_O
+  SFN -->|IngestMetaToRDS| LF_INGEST_M
+  S3_OHLCV -. "S3 event (optional)" .-> SQS
+  SQS --> LF_INGEST_O
+  LF_INGEST_O -->|GetObject| S3_OHLCV
+  LF_INGEST_M -->|GetObject| S3_META
+
+  LF_INGEST_O -->|upsert + watermark| T_OHLCV
+  LF_INGEST_O --> T_WM
+  LF_INGEST_M -->|upsert| T_META
+
+  SFN -->|PartitionSymbols| LF_PART
+  LF_PART --> T_META
+  LF_PART -->|PutObject| S3_CHUNKS
+
+  SFN -->|RunScannerWorkers Array=10| BATCH_W
+  BATCH_W -->|GetObject| S3_CHUNKS
+  BATCH_W -->|SELECT raw_ohlcv| T_OHLCV
+  BATCH_W -->|INSERT| T_STAGE
+
+  SFN -->|RunScannerAggregator| BATCH_A
+  BATCH_A -->|SELECT| T_STAGE
+  BATCH_A -->|INSERT| T_PICKS
+  BATCH_A -->|DELETE staging| T_STAGE
+
+  SFN -->|any failure| SNS
+
+  %% ---------------- Secrets flows ----------------
+  LF_PLAN -.->|GetSecretValue via VPC endpoint| SM_RDS
+  LF_INGEST_O -.-> SM_RDS
+  LF_INGEST_M -.-> SM_RDS
+  LF_PART -.-> SM_RDS
+  BATCH_W -.-> SM_RDS
+  BATCH_A -.-> SM_RDS
+  LF_OHLCV -.->|public egress| SM_POLY
+  LF_META  -.-> SM_POLY
+
+  %% ---------------- External API calls ----------------
+  LF_OHLCV -.->|HTTPS| POLY
+  LF_META  -.->|HTTPS| POLY
+  LF_QUOTE -.->|HTTPS cache miss| POLY
+
+  %% ---------------- Serving flows ----------------
+  FE -->|HTTPS + API key| APIGW
+  APIGW --> LF_QUOTE
+  APIGW --> LF_BT
+  LF_QUOTE <--> REDIS
+  LF_BT --> RDSPROXY
+  RDSPROXY --> T_OHLCV
+
+  %% ---------------- Styling ----------------
+  classDef lambda fill:#fef3c7,stroke:#b45309,color:#000;
+  classDef batch fill:#fde68a,stroke:#92400e,color:#000;
+  classDef store fill:#dbeafe,stroke:#1e3a8a,color:#000;
+  classDef db fill:#c7d2fe,stroke:#3730a3,color:#000;
+  classDef sec fill:#fecaca,stroke:#991b1b,color:#000;
+  classDef sched fill:#e9d5ff,stroke:#6b21a8,color:#000;
+  classDef serve fill:#d1fae5,stroke:#065f46,color:#000;
+  classDef ext fill:#f3f4f6,stroke:#111827,color:#000;
+
+  class LF_OHLCV,LF_META,LF_PLAN,LF_INGEST_O,LF_INGEST_M,LF_PART,LF_QUOTE,LF_BT lambda;
+  class BATCH_W,BATCH_A batch;
+  class S3_OHLCV,S3_META,S3_CHUNKS store;
+  class T_OHLCV,T_META,T_WM,T_STAGE,T_PICKS,RDSPROXY db;
+  class SM_POLY,SM_RDS sec;
+  class EB,SFN,SNS,SQS sched;
+  class APIGW,REDIS,FE serve;
+  class POLY ext;
