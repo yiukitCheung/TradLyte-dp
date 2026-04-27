@@ -77,12 +77,18 @@ declare -a ROUTES=(
   "GET /screener/quotes"
   "GET /picks/today"
   "GET /picks/{scan_date}/returns"
+  "GET /market/quote/{symbol}"
+  "GET /market/ohlcv/{symbol}"
+  "GET /market/returns/{symbol}"
 )
 
 declare -a DEPRECATED_ROUTES=(
   "GET /v1/screener/quotes"
   "GET /v1/picks/today"
   "GET /v1/picks/{scan_date}/returns"
+  "GET /v1/market/quote/{symbol}"
+  "GET /v1/market/ohlcv/{symbol}"
+  "GET /v1/market/returns/{symbol}"
 )
 
 for ROUTE_KEY in "${ROUTES[@]}"; do

@@ -58,6 +58,7 @@ Set on `dev-serving-api` Lambda:
 - `ALLOWED_ORIGIN` - frontend origin for CORS.
 - `SCREENER_CACHE_TTL_S` - default `60`.
 - `RETURNS_CACHE_TTL_S` - default `300`.
+- `MARKET_CACHE_TTL_S` - default `60`.
 
 ## Troubleshooting notes
 
