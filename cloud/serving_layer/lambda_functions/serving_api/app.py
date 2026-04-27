@@ -9,6 +9,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from serving_api.routers.market import router as market_router
 from serving_api.routers.picks import router as picks_router
 from serving_api.routers.screener import router as screener_router
 
@@ -64,3 +65,4 @@ def health() -> dict:
 
 app.include_router(screener_router, dependencies=[Depends(require_api_key)])
 app.include_router(picks_router, dependencies=[Depends(require_api_key)])
+app.include_router(market_router, dependencies=[Depends(require_api_key)])

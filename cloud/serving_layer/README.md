@@ -4,11 +4,14 @@ REST-facing APIs for frontend and consumers.
 
 ## MVP scope
 
-The MVP serving API exposes three RDS-backed endpoints:
+The MVP serving API exposes six RDS-backed endpoints:
 
 - `GET /v1/screener/quotes` - latest daily quote by filters (`industry`, `type`, `market cap` band).
 - `GET /v1/picks/today` - ranked picks from latest `scan_date`.
 - `GET /v1/picks/{scan_date}/returns` - pick performance (1d/5d/21d + return-to-date).
+- `GET /v1/market/quote/{symbol}` - latest OHLCV quote for one symbol.
+- `GET /v1/market/ohlcv/{symbol}` - OHLCV candle history by interval/date range.
+- `GET /v1/market/returns/{symbol}` - 1d/5d/21d style returns for one symbol.
 
 All three are implemented in `lambda_functions/serving_api/` and deployed as a single VPC Lambda (`dev-serving-api`) behind HTTP API Gateway.
 
@@ -18,6 +21,9 @@ All three are implemented in `lambda_functions/serving_api/` and deployed as a s
 - `GET /v1/screener/quotes` is live and healthy.
 - `GET /v1/picks/today` is live and healthy.
 - `GET /v1/picks/{scan_date}/returns` exists but may require additional query/index tuning for stable p95 latency.
+- `GET /v1/market/quote/{symbol}` is available.
+- `GET /v1/market/ohlcv/{symbol}` is available.
+- `GET /v1/market/returns/{symbol}` is available.
 
 ## Code layout
 
