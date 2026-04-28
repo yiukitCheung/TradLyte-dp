@@ -44,6 +44,31 @@ logger.setLevel(logging.INFO)
 CHUNKS_BUCKET  = os.environ.get('S3_BUCKET_NAME', 'dev-condvest-datalake')
 CHUNKS_PREFIX  = 'scanner-chunks'
 DEFAULT_ARRAY_SIZE = 10
+REQUIRE_OHLCV_FOR_SCAN_DATE = os.environ.get("REQUIRE_OHLCV_FOR_SCAN_DATE", "true").lower() == "true"
+
+def _get_scannable_symbols(rds_client: RDSTimescaleClient, scan_date: date) -> List[str]:
+    """
+    Return symbols that are:
+      1) active in symbol_metadata, and
+      2) have 1d OHLCV loaded for the given scan_date.
+
+    This prevents scanner workers from receiving symbols that cannot be priced
+    for the current day due to async ingest lag or stale metadata rows.
+    """
+    rows = rds_client.execute_query(
+        """
+        SELECT DISTINCT m.symbol
+        FROM symbol_metadata m
+        JOIN raw_ohlcv o
+          ON o.symbol = m.symbol
+         AND o.interval = '1d'
+         AND o.timestamp::date = %s
+        WHERE LOWER(TRIM(COALESCE(m.active, 'true'))) = 'true'
+        ORDER BY m.symbol
+        """,
+        (scan_date.isoformat(),),
+    )
+    return [row["symbol"] for row in rows]
 
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
@@ -71,10 +96,19 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 
     logger.info(f"scan_date={scan_date}  array_size={array_size}  bucket={CHUNKS_BUCKET}")
 
-    # ── fetch active symbols (single RDS query) ───────────────────────────────
+    # ── fetch symbols for scanner chunks (single RDS query) ───────────────────
     rds_client = RDSTimescaleClient.from_lambda_environment()
     try:
-        symbols: List[str] = rds_client.get_active_symbols()
+        if REQUIRE_OHLCV_FOR_SCAN_DATE:
+            symbols: List[str] = _get_scannable_symbols(rds_client, scan_date)
+            logger.info(
+                "Fetched %s active symbols with OHLCV on %s",
+                len(symbols),
+                scan_date.isoformat(),
+            )
+        else:
+            symbols = rds_client.get_active_symbols()
+            logger.info("Fetched %s active symbols (metadata-only mode)", len(symbols))
     finally:
         rds_client.close()
 
@@ -89,8 +123,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             'bucket':      CHUNKS_BUCKET,
             'prefix':      f"{CHUNKS_PREFIX}/{scan_date.isoformat()}",
         }
-
-    logger.info(f"Fetched {len(symbols)} active symbols from RDS")
 
     # ── split into equal chunks ───────────────────────────────────────────────
     chunk_size = math.ceil(len(symbols) / array_size)
