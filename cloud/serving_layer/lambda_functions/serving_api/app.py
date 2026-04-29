@@ -28,7 +28,6 @@ app.add_middleware(
     allow_headers=["content-type", "x-api-key"],
 )
 
-
 def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="x-api-key")) -> None:
     expected_key = os.environ.get("SERVING_API_KEY")
     if not expected_key:
