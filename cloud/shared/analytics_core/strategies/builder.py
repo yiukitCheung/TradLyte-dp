@@ -49,11 +49,7 @@ class CompositeStrategy(BaseStrategy):
             self.requirements_config = None
             self._use_requirements_format = False
         elif requirements_config:
-            super().__init__(name=requirements_config.strategy_name, description=None)
-            self.config = None
-            self.requirements_config = requirements_config
-            self._use_requirements_format = True
-            # Create step configs for expandable mode
+            # Create step configs first so BaseStrategy enables expandable mode.
             steps = []
             if 'setup' in requirements_config.components:
                 steps.append(StepConfig(
@@ -73,6 +69,14 @@ class CompositeStrategy(BaseStrategy):
                     timeframe=requirements_config.components['exit'].timeframe,
                     enabled=True
                 ))
+            super().__init__(
+                name=requirements_config.strategy_name,
+                description=None,
+                steps=steps,
+            )
+            self.config = None
+            self.requirements_config = requirements_config
+            self._use_requirements_format = True
             self.steps = steps
         else:
             raise ValueError("Either config or requirements_config must be provided")

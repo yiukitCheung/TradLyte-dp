@@ -9,7 +9,7 @@ import polars as pl
 from typing import List, Dict, Any, Optional
 from datetime import date, datetime
 from dataclasses import dataclass
-import numpy as np
+import math
 from .strategies.base import BaseStrategy
 from .executor import MultiTimeframeExecutor
 
@@ -308,8 +308,8 @@ class Backtester:
         win_rate = winning_count / total_trades if total_trades > 0 else 0.0
         
         # Average win/loss
-        avg_win = np.mean([p.pnl for p in winning_trades]) if winning_trades else 0.0
-        avg_loss = np.mean([p.pnl for p in losing_trades]) if losing_trades else 0.0
+        avg_win = (sum(p.pnl for p in winning_trades) / winning_count) if winning_trades else 0.0
+        avg_loss = (sum(p.pnl for p in losing_trades) / losing_count) if losing_trades else 0.0
         
         # Profit factor
         total_profit = sum([p.pnl for p in winning_trades]) if winning_trades else 0.0
@@ -317,16 +317,30 @@ class Backtester:
         profit_factor = total_profit / total_loss if total_loss > 0 else float('inf') if total_profit > 0 else 0.0
         
         # Max drawdown
-        equity_array = np.array(equity_curve)
-        running_max = np.maximum.accumulate(equity_array)
-        drawdown = equity_array - running_max
-        max_drawdown = abs(np.min(drawdown))
+        running_peak = float("-inf")
+        max_drawdown = 0.0
+        for eq in equity_curve:
+            eq_val = float(eq)
+            if eq_val > running_peak:
+                running_peak = eq_val
+            drawdown = running_peak - eq_val
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
         max_drawdown_pct = max_drawdown / initial_capital if initial_capital > 0 else 0.0
         
-        # Sharpe ratio (simplified - using equity curve returns)
-        returns = np.diff(equity_array) / equity_array[:-1]
-        if len(returns) > 1 and np.std(returns) > 0:
-            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252)  # Annualized
+        # Sharpe ratio (simplified - using equity curve returns, population std dev)
+        returns: List[float] = []
+        for i in range(1, len(equity_curve)):
+            prev = float(equity_curve[i - 1])
+            curr = float(equity_curve[i])
+            if prev != 0:
+                returns.append((curr - prev) / prev)
+
+        if len(returns) > 1:
+            mean_ret = sum(returns) / len(returns)
+            variance = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
+            std_ret = math.sqrt(variance)
+            sharpe_ratio = (mean_ret / std_ret) * math.sqrt(252) if std_ret > 0 else 0.0
         else:
             sharpe_ratio = 0.0
         

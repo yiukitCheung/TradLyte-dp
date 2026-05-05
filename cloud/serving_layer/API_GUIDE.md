@@ -134,6 +134,8 @@ Routes must exist in API Gateway — keep **`deploy_http_api.sh`** `ROUTES` arra
 |--------|------|-------------|
 | POST | `/backtest` | Run a single-symbol strategy backtest over date range and return performance metrics |
 
+`dev-serving-api` handles request auth/validation and proxies execution to a dedicated backtester Lambda (`BACKTEST_FUNCTION_NAME`, default `dev-serving-backtester`). This keeps serving ZIP packages small while heavy analytics deps live in the containerized backtester function.
+
 **Request body (`/backtest`)**
 
 ```json
@@ -153,6 +155,47 @@ Routes must exist in API Gateway — keep **`deploy_http_api.sh`** `ROUTES` arra
 ```
 
 **Response fields (`data`) include:** `total_return_pct`, `sharpe_ratio`, `max_drawdown_pct`, `equity_curve`, `total_trades`, `win_rate`, and `trades`.
+
+**Known-good smoke payload (validated):**
+
+```json
+{
+  "strategy_name": "smoke_test",
+  "symbol": "AAPL",
+  "timeframe": "1d",
+  "start_date": "2025-01-01",
+  "end_date": "2025-01-31",
+  "initial_capital": 10000,
+  "components": {
+    "setup": { "type": "NONE", "timeframe": "1d" },
+    "trigger": { "type": "CANDLE_PATTERN", "timeframe": "1d", "pattern": "GREEN_CANDLE" },
+    "exit": { "type": "TAKE_PROFIT_PCT", "timeframe": "1d", "value": 0.1 }
+  }
+}
+```
+
+**Example success shape:**
+
+```json
+{
+  "data": {
+    "total_return_pct": -0.0367,
+    "sharpe_ratio": -9.1651,
+    "max_drawdown_pct": 0.0367,
+    "total_trades": 1,
+    "equity_curve": [10000, 10000, 9632.98],
+    "trades": []
+  },
+  "meta": {
+    "symbol": "AAPL",
+    "strategy_name": "smoke_test",
+    "timeframe": "1d",
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-31",
+    "source": "dev-serving-backtester"
+  }
+}
+```
 
 **`/picks/today` and `/picks/today/metadata`**
 
@@ -212,7 +255,7 @@ Picks are joined to `symbol_metadata` on `symbol`. Omitting filters returns the 
 Replace `BASE` and `KEY`.
 
 ```bash
-BASE="https://YOUR_API_ID.execute-api.ca-west-1.amazonaws.com/v1"
+BASE="https://abc123xyz.execute-api.ca-west-1.amazonaws.com/v1"
 KEY="your-serving-api-key"
 
 curl -sS -H "x-api-key: $KEY" "$BASE/picks/today?limit=10"
@@ -225,7 +268,7 @@ curl -sS -H "x-api-key: $KEY" \
 
 curl -sS -X POST -H "x-api-key: $KEY" -H "Content-Type: application/json" \
   "$BASE/backtest" \
-  -d '{"strategy_name":"Momentum_Swing","symbol":"AAPL","timeframe":"1d","start_date":"2022-01-01","end_date":"2024-12-31","initial_capital":10000,"components":{"setup":{"type":"NONE","timeframe":"1d"},"trigger":{"type":"CANDLE_PATTERN","timeframe":"1d","pattern":"GREEN_CANDLE"},"exit":{"type":"TAKE_PROFIT_PCT","timeframe":"1d","value":0.1}}}'
+  -d '{"strategy_name":"smoke_test","symbol":"AAPL","timeframe":"1d","start_date":"2025-01-01","end_date":"2025-01-31","initial_capital":10000,"components":{"setup":{"type":"NONE","timeframe":"1d"},"trigger":{"type":"CANDLE_PATTERN","timeframe":"1d","pattern":"GREEN_CANDLE"},"exit":{"type":"TAKE_PROFIT_PCT","timeframe":"1d","value":0.1}}}'
 
 curl -sS "$BASE/health"
 ```
@@ -236,7 +279,7 @@ curl -sS "$BASE/health"
 
 1. Implement the route in FastAPI (`cloud/serving_layer/lambda_functions/serving_api/`).
 2. Package and update the **Lambda** function code.
-3. Add **`GET /path`** to the `ROUTES` array in `infrastructure/serving_api/deploy_http_api.sh`.
+3. Add the route key (for example **`GET /path`** or **`POST /path`**) to the `ROUTES` array in `infrastructure/serving_api/deploy_http_api.sh`.
 4. Run **`deploy_http_api.sh`** so API Gateway exposes the new path (otherwise you may see `403` / missing route).
 
 ---

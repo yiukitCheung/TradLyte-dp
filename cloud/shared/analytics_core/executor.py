@@ -172,27 +172,33 @@ class MultiTimeframeExecutor:
                 
                 step_timeframe = step.timeframe
                 
-                # Load and prepare data for this step's timeframe
-                if step_timeframe in data_by_timeframe:
+                # Load and prepare data for this step's timeframe.
+                # IMPORTANT: for same-timeframe steps, continue from base_df so
+                # prior step outputs (e.g. setup_valid -> signal -> exit columns)
+                # are preserved across the chain.
+                if step_timeframe == base_timeframe:
+                    step_df = base_df.clone()
+                elif step_timeframe in data_by_timeframe:
                     step_df = data_by_timeframe[step_timeframe].clone()
                     step_df = self.prepare_dataframe(step_df, step_timeframe)
-                    
-                    # Execute step on its timeframe
-                    step_df = strategy.execute_step(step, step_df)
-                    
-                    # If step timeframe is different from base, align signals
-                    if step_timeframe != base_timeframe:
-                        # Find signal columns added by this step
-                        new_columns = [col for col in step_df.columns if col not in base_df.columns]
-                        for col in new_columns:
-                            base_df = self.align_timeframe_signals(
-                                base_df, step_df, step_timeframe, col
-                            )
-                    else:
-                        # Same timeframe, merge directly
-                        base_df = step_df
                 else:
                     print(f"Warning: Timeframe {step_timeframe} not available, skipping step {step.step_name}")
+                    continue
+                    
+                # Execute step on its timeframe
+                step_df = strategy.execute_step(step, step_df)
+
+                # If step timeframe is different from base, align signals
+                if step_timeframe != base_timeframe:
+                    # Find signal columns added by this step
+                    new_columns = [col for col in step_df.columns if col not in base_df.columns]
+                    for col in new_columns:
+                        base_df = self.align_timeframe_signals(
+                            base_df, step_df, step_timeframe, col
+                        )
+                else:
+                    # Same timeframe, merge directly
+                    base_df = step_df
         
         else:
             # Legacy 3-step mode: execute on base timeframe

@@ -10,6 +10,14 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/var/task/shared
 
+# psycopg2 may need to compile on arm64 if no prebuilt wheel matches.
+# pg_config comes from postgresql-devel.
+RUN yum install -y \
+      gcc \
+      postgresql-devel \
+    && yum clean all \
+    && rm -rf /var/cache/yum
+
 # Dependencies
 COPY cloud/serving_layer/lambda_functions/backtester/requirements.backtester.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt

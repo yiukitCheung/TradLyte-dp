@@ -1,74 +1,23 @@
-"""Backtest API route."""
+"""Backtest API route (thin proxy to dedicated backtester Lambda)."""
 
+import json
 import os
 from datetime import date
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus
+from typing import Any, Dict
 
+import boto3
+from botocore.config import Config
 from fastapi import APIRouter, HTTPException
-
-from serving_api.db import load_rds_secret
-from shared.analytics_core.backtester import Backtester
-from shared.analytics_core.executor import MultiTimeframeExecutor
-from shared.analytics_core.strategies.builder import CompositeStrategy
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
-
-def _collect_timeframes_from_components(components: Dict[str, Any], base_tf: str) -> List[str]:
-    """Collect unique timeframes from setup/trigger/exit component configs."""
-    timeframes = {base_tf}
-    if not isinstance(components, dict):
-        return sorted(timeframes)
-    for comp in components.values():
-        if isinstance(comp, dict) and comp.get("timeframe"):
-            tf = str(comp["timeframe"]).strip().lower()
-            if tf:
-                timeframes.add(tf)
-    return sorted(timeframes)
+_lambda_client = boto3.client(
+    "lambda",
+    config=Config(connect_timeout=5, read_timeout=120, retries={"max_attempts": 1, "mode": "standard"}),
+)
 
 
-def _extract_exit_limits(components: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
-    """Extract stop loss / take profit percentages from requirements-style exit config."""
-    exit_component = components.get("exit", {}) if isinstance(components, dict) else {}
-    stop_loss_pct: Optional[float] = None
-    take_profit_pct: Optional[float] = None
-
-    if not isinstance(exit_component, dict):
-        return stop_loss_pct, take_profit_pct
-
-    exit_type = exit_component.get("type")
-    if exit_type == "CONDITIONAL_OR_FIXED":
-        for cond in exit_component.get("conditions", []):
-            if not isinstance(cond, dict):
-                continue
-            if cond.get("type") == "STOP_LOSS_PCT":
-                stop_loss_pct = cond.get("value")
-            elif cond.get("type") == "TAKE_PROFIT_PCT":
-                take_profit_pct = cond.get("value")
-    elif exit_type == "STOP_LOSS_PCT":
-        stop_loss_pct = exit_component.get("value")
-    elif exit_type == "TAKE_PROFIT_PCT":
-        take_profit_pct = exit_component.get("value")
-
-    return stop_loss_pct, take_profit_pct
-
-
-def _build_rds_connection_string() -> str:
-    """Build a safe PostgreSQL URI from Secrets Manager credentials."""
-    cfg = load_rds_secret()
-    user = quote_plus(str(cfg["username"]))
-    password = quote_plus(str(cfg["password"]))
-    sslmode = os.environ.get("RDS_SSL_MODE", "require")
-    return (
-        f"postgresql://{user}:{password}@{cfg['host']}:{cfg['port']}/{cfg['database']}"
-        f"?sslmode={sslmode}"
-    )
-
-
-@router.post("")
-def run_backtest(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Run a single-symbol backtest from frontend-provided strategy JSON."""
+def _validate_payload(payload: Dict[str, Any]) -> None:
     required_fields = ["strategy_name", "symbol", "components", "start_date", "end_date"]
     missing = [field for field in required_fields if field not in payload]
     if missing:
@@ -76,7 +25,6 @@ def run_backtest(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     strategy_name = str(payload["strategy_name"]).strip()
     symbol = str(payload["symbol"]).strip().upper()
-    timeframe = str(payload.get("timeframe", "1d")).strip().lower() or "1d"
     components = payload.get("components")
     if not strategy_name:
         raise HTTPException(status_code=400, detail="strategy_name must not be empty")
@@ -109,50 +57,49 @@ def run_backtest(payload: Dict[str, Any]) -> Dict[str, Any]:
     if initial_capital <= 0:
         raise HTTPException(status_code=400, detail="initial_capital must be > 0")
 
-    strategy_config = {
-        "strategy_name": strategy_name,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "components": components,
-    }
 
+def _invoke_backtester_lambda(payload: Dict[str, Any]) -> Dict[str, Any]:
+    function_name = os.environ.get("BACKTEST_FUNCTION_NAME", "dev-serving-backtester")
+    invoke_payload = {"body": json.dumps(payload)}
     try:
-        strategy = CompositeStrategy.from_requirements_json(strategy_config)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid strategy configuration: {exc}")
-
-    try:
-        executor = MultiTimeframeExecutor(rds_connection_string=_build_rds_connection_string())
-        result_df = executor.execute(
-            strategy=strategy,
-            symbol=symbol,
-            timeframes=_collect_timeframes_from_components(components, timeframe),
-            start_date=start_date,
-            end_date=end_date,
-            base_timeframe=timeframe,
+        response = _lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(invoke_payload).encode("utf-8"),
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Strategy execution failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"Failed to invoke backtester Lambda: {exc}")
 
-    stop_loss_pct, take_profit_pct = _extract_exit_limits(components)
+    if response.get("FunctionError"):
+        raise HTTPException(status_code=502, detail=f"Backtester Lambda error: {response.get('FunctionError')}")
 
-    try:
-        backtest_result = Backtester(initial_capital=initial_capital).run(
-            strategy=strategy,
-            data=result_df,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Backtest failed: {exc}")
+    raw = response.get("Payload").read()
+    outer = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+    status_code = int(outer.get("statusCode", 500))
+    body_raw = outer.get("body", {})
+    body = json.loads(body_raw) if isinstance(body_raw, str) else body_raw
+    if status_code >= 400:
+        msg = body.get("error") if isinstance(body, dict) else str(body)
+        raise HTTPException(status_code=status_code, detail=msg or "Backtester request failed")
+
+    if isinstance(body, dict) and "data" in body and "meta" in body:
+        return body
 
     return {
-        "data": backtest_result.to_dict(),
+        "data": body,
         "meta": {
-            "symbol": symbol,
-            "strategy_name": strategy_name,
-            "timeframe": timeframe,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
+            "symbol": str(payload.get("symbol", "")).strip().upper() or None,
+            "strategy_name": payload.get("strategy_name"),
+            "timeframe": payload.get("timeframe", "1d"),
+            "start_date": payload.get("start_date"),
+            "end_date": payload.get("end_date"),
+            "source": function_name,
         },
     }
+
+
+@router.post("")
+def run_backtest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate request and proxy execution to dedicated backtester Lambda."""
+    _validate_payload(payload)
+    return _invoke_backtester_lambda(payload)

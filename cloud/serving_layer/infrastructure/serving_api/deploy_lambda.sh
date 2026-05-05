@@ -14,7 +14,6 @@ export AWS_PAGER=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 SERVING_DIR="$REPO_ROOT/cloud/serving_layer/lambda_functions/serving_api"
-SHARED_DIR="$REPO_ROOT/cloud/shared"
 COMMON_DIR="$REPO_ROOT/cloud/batch_layer/infrastructure/common"
 
 # shellcheck source=/dev/null
@@ -35,6 +34,9 @@ SERVING_API_KEY="${SERVING_API_KEY:-}"
 ALLOWED_ORIGIN="${ALLOWED_ORIGIN:-*}"
 SCREENER_CACHE_TTL_S="${SCREENER_CACHE_TTL_S:-60}"
 RETURNS_CACHE_TTL_S="${RETURNS_CACHE_TTL_S:-300}"
+BACKTEST_FUNCTION_NAME="${BACKTEST_FUNCTION_NAME:-dev-serving-backtester}"
+LAMBDA_UPLOAD_MAX_BYTES="${LAMBDA_UPLOAD_MAX_BYTES:-69000000}"
+LAMBDA_DEPLOY_BUCKET="${LAMBDA_DEPLOY_BUCKET:-dev-condvest-lambda-deploy}"
 
 PACKAGE_DIR="$SCRIPT_DIR/package"
 ZIP_PATH="$SCRIPT_DIR/${FUNCTION_NAME}.zip"
@@ -65,6 +67,88 @@ wait_for_lambda_update_ready() {
   return 1
 }
 
+zip_size_bytes() {
+  local file_path="$1"
+  if stat -f%z "$file_path" >/dev/null 2>&1; then
+    stat -f%z "$file_path"
+  else
+    stat -c%s "$file_path"
+  fi
+}
+
+ensure_deploy_bucket_exists() {
+  if ! aws s3 ls "s3://$LAMBDA_DEPLOY_BUCKET" --region "$AWS_REGION" >/dev/null 2>&1; then
+    echo "🪣 Creating deploy bucket: s3://$LAMBDA_DEPLOY_BUCKET"
+    aws s3 mb "s3://$LAMBDA_DEPLOY_BUCKET" --region "$AWS_REGION" >/dev/null
+  fi
+}
+
+update_lambda_code_auto() {
+  local function_name="$1"
+  local zip_path="$2"
+  local size_bytes
+  size_bytes="$(zip_size_bytes "$zip_path")"
+
+  if (( size_bytes < LAMBDA_UPLOAD_MAX_BYTES )); then
+    echo "⬆️  Updating function code via direct upload (${size_bytes} bytes)"
+    aws lambda update-function-code \
+      --function-name "$function_name" \
+      --zip-file "fileb://$zip_path" \
+      --region "$AWS_REGION" >/dev/null
+    return
+  fi
+
+  ensure_deploy_bucket_exists
+  local s3_key="lambda-packages/${function_name}-$(date +%Y%m%d%H%M%S).zip"
+  echo "⬆️  Package too large for direct upload (${size_bytes} bytes). Using S3: s3://$LAMBDA_DEPLOY_BUCKET/$s3_key"
+  aws s3 cp "$zip_path" "s3://$LAMBDA_DEPLOY_BUCKET/$s3_key" --region "$AWS_REGION" >/dev/null
+  aws lambda update-function-code \
+    --function-name "$function_name" \
+    --s3-bucket "$LAMBDA_DEPLOY_BUCKET" \
+    --s3-key "$s3_key" \
+    --region "$AWS_REGION" >/dev/null
+}
+
+create_lambda_auto() {
+  local function_name="$1"
+  local role_arn="$2"
+  local zip_path="$3"
+  local size_bytes
+  size_bytes="$(zip_size_bytes "$zip_path")"
+
+  if (( size_bytes < LAMBDA_UPLOAD_MAX_BYTES )); then
+    echo "➕ Creating function via direct upload (${size_bytes} bytes)"
+    aws lambda create-function \
+      --function-name "$function_name" \
+      --runtime "$LAMBDA_RUNTIME" \
+      --role "$role_arn" \
+      --handler "serving_api.handler.lambda_handler" \
+      --architectures "$LAMBDA_ARCH" \
+      --zip-file "fileb://$zip_path" \
+      --timeout "$LAMBDA_TIMEOUT" \
+      --memory-size "$LAMBDA_MEMORY" \
+      --vpc-config "SubnetIds=${SUBNET_IDS_CSV},SecurityGroupIds=${SECURITY_GROUP_IDS_CSV}" \
+      --region "$AWS_REGION" >/dev/null
+    return
+  fi
+
+  ensure_deploy_bucket_exists
+  local s3_key="lambda-packages/${function_name}-$(date +%Y%m%d%H%M%S).zip"
+  echo "➕ Package too large for direct create (${size_bytes} bytes). Using S3: s3://$LAMBDA_DEPLOY_BUCKET/$s3_key"
+  aws s3 cp "$zip_path" "s3://$LAMBDA_DEPLOY_BUCKET/$s3_key" --region "$AWS_REGION" >/dev/null
+  aws lambda create-function \
+    --function-name "$function_name" \
+    --runtime "$LAMBDA_RUNTIME" \
+    --role "$role_arn" \
+    --handler "serving_api.handler.lambda_handler" \
+    --architectures "$LAMBDA_ARCH" \
+    --code "S3Bucket=$LAMBDA_DEPLOY_BUCKET,S3Key=$s3_key" \
+    --timeout "$LAMBDA_TIMEOUT" \
+    --memory-size "$LAMBDA_MEMORY" \
+    --vpc-config "SubnetIds=${SUBNET_IDS_CSV},SecurityGroupIds=${SECURITY_GROUP_IDS_CSV}" \
+    --region "$AWS_REGION" >/dev/null
+}
+
 echo "🚀 Deploying Lambda: $FUNCTION_NAME"
 echo "Region: $AWS_REGION"
 
@@ -86,15 +170,14 @@ fi
 
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/serving_api"
-mkdir -p "$PACKAGE_DIR/shared"
 
 pip_for_lambda_x86_64 "$SERVING_DIR/requirements.txt" "$PACKAGE_DIR"
 cp -R "$SERVING_DIR/"* "$PACKAGE_DIR/serving_api/"
-cp -R "$SHARED_DIR/"* "$PACKAGE_DIR/shared/"
 
 find "$PACKAGE_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 find "$PACKAGE_DIR" -name "*.pyc" -delete
 
+rm -f "$ZIP_PATH"
 cd "$PACKAGE_DIR"
 zip -r9 "$ZIP_PATH" . -x "*.pyc" "*/__pycache__/*"
 cd "$SCRIPT_DIR"
@@ -113,12 +196,10 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGIO
   [[ -z "${ALLOWED_ORIGIN:-}" || "$ALLOWED_ORIGIN" == "*" ]] && ALLOWED_ORIGIN="$(current_var ALLOWED_ORIGIN)"
   [[ -z "$SCREENER_CACHE_TTL_S" ]] && SCREENER_CACHE_TTL_S="$(current_var SCREENER_CACHE_TTL_S)"
   [[ -z "$RETURNS_CACHE_TTL_S" ]] && RETURNS_CACHE_TTL_S="$(current_var RETURNS_CACHE_TTL_S)"
+  [[ -z "$BACKTEST_FUNCTION_NAME" ]] && BACKTEST_FUNCTION_NAME="$(current_var BACKTEST_FUNCTION_NAME)"
 
   echo "⬆️  Updating existing function code"
-  aws lambda update-function-code \
-    --function-name "$FUNCTION_NAME" \
-    --zip-file "fileb://$ZIP_PATH" \
-    --region "$AWS_REGION" >/dev/null
+  update_lambda_code_auto "$FUNCTION_NAME" "$ZIP_PATH"
   wait_for_lambda_update_ready
 else
   if [[ -z "$LAMBDA_ROLE_ARN" ]]; then
@@ -126,17 +207,7 @@ else
     exit 1
   fi
   echo "➕ Creating new function"
-  aws lambda create-function \
-    --function-name "$FUNCTION_NAME" \
-    --runtime "$LAMBDA_RUNTIME" \
-    --role "$LAMBDA_ROLE_ARN" \
-    --handler "serving_api.handler.lambda_handler" \
-    --architectures "$LAMBDA_ARCH" \
-    --zip-file "fileb://$ZIP_PATH" \
-    --timeout "$LAMBDA_TIMEOUT" \
-    --memory-size "$LAMBDA_MEMORY" \
-    --vpc-config "SubnetIds=${SUBNET_IDS_CSV},SecurityGroupIds=${SECURITY_GROUP_IDS_CSV}" \
-    --region "$AWS_REGION" >/dev/null
+  create_lambda_auto "$FUNCTION_NAME" "$LAMBDA_ROLE_ARN" "$ZIP_PATH"
   wait_for_lambda_update_ready 60 5
 fi
 
@@ -148,7 +219,7 @@ aws lambda update-function-configuration \
   --timeout "$LAMBDA_TIMEOUT" \
   --memory-size "$LAMBDA_MEMORY" \
   --vpc-config "SubnetIds=${SUBNET_IDS_CSV},SecurityGroupIds=${SECURITY_GROUP_IDS_CSV}" \
-  --environment "Variables={RDS_SECRET_ARN=${RDS_SECRET_ARN},SERVING_API_KEY=${SERVING_API_KEY},ALLOWED_ORIGIN=${ALLOWED_ORIGIN},SCREENER_CACHE_TTL_S=${SCREENER_CACHE_TTL_S},RETURNS_CACHE_TTL_S=${RETURNS_CACHE_TTL_S}}" \
+  --environment "Variables={RDS_SECRET_ARN=${RDS_SECRET_ARN},SERVING_API_KEY=${SERVING_API_KEY},ALLOWED_ORIGIN=${ALLOWED_ORIGIN},SCREENER_CACHE_TTL_S=${SCREENER_CACHE_TTL_S},RETURNS_CACHE_TTL_S=${RETURNS_CACHE_TTL_S},BACKTEST_FUNCTION_NAME=${BACKTEST_FUNCTION_NAME}}" \
   --region "$AWS_REGION" >/dev/null
 wait_for_lambda_update_ready
 
