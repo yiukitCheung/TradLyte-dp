@@ -217,12 +217,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Run backtest
         backtester = Backtester(initial_capital=initial_capital)
         
-        # Extract exit parameters from components
+        # Extract exit parameters from components. The Backtester applies
+        # these as OR-composed exits; the JSON layer just collects them.
         exit_component = components.get('exit', {})
         stop_loss_pct = None
         take_profit_pct = None
         trailing_stop_pct = None
         max_holding_days = None
+        stop_loss_anchor = None
+        stop_loss_anchor_offset_pct = 0.0
         if exit_component.get('type') == 'CONDITIONAL_OR_FIXED':
             conditions = exit_component.get('conditions', [])
             for cond in conditions:
@@ -233,7 +236,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 elif cond.get('type') == 'TRAILING_STOP_PCT':
                     trailing_stop_pct = cond.get('value')
                 elif cond.get('type') == 'TIME_BASED':
-                    max_holding_days = cond.get('value')
+                    max_holding_days = cond.get('max_holding_days') or cond.get('value')
+                elif cond.get('type') == 'STOP_LOSS_ANCHOR':
+                    stop_loss_anchor = cond.get('anchor')
+                    stop_loss_anchor_offset_pct = float(cond.get('offset_pct') or 0.0)
+        # Standalone top-level exits (parity with STOP_LOSS_PCT etc.)
+        elif exit_component.get('type') == 'STOP_LOSS_ANCHOR':
+            stop_loss_anchor = exit_component.get('anchor')
+            stop_loss_anchor_offset_pct = float(exit_component.get('offset_pct') or 0.0)
         try:
             backtest_result = backtester.run(
                 strategy=strategy,
@@ -241,7 +251,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 stop_loss_pct=stop_loss_pct,
                 take_profit_pct=take_profit_pct,
                 trailing_stop_pct=trailing_stop_pct,
-                max_holding_days=max_holding_days
+                max_holding_days=max_holding_days,
+                stop_loss_anchor=stop_loss_anchor,
+                stop_loss_anchor_offset_pct=stop_loss_anchor_offset_pct,
             )
         except Exception as e:
             logger.error(f"Error running backtest: {str(e)}")

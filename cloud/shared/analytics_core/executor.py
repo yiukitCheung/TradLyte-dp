@@ -268,6 +268,7 @@ class MultiTimeframeExecutor:
         if not self.rds_connection_string:
             raise ValueError("rds_connection_string is required.")
 
+        # Load data from RDS
         multi_df = load_ohlcv_multi_timeframe(
             symbol=symbol,
             timeframe=timeframes,
@@ -279,6 +280,7 @@ class MultiTimeframeExecutor:
             raise ValueError(f"No data loaded for {symbol}")
 
         data_by_timeframe: Dict[str, pl.DataFrame] = {}
+        # Split data by timeframe
         if "timeframe" in multi_df.columns:
             for tf in timeframes:
                 tf_df = multi_df.filter(pl.col("timeframe") == tf).drop("timeframe")
@@ -289,6 +291,7 @@ class MultiTimeframeExecutor:
             tf = timeframes[0] if timeframes else base_timeframe
             data_by_timeframe[tf] = multi_df.sort("date")
 
+        # Run strategy on data
         if not data_by_timeframe:
             raise ValueError(f"No data loaded for {symbol}")
 

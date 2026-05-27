@@ -206,6 +206,35 @@ class StopLossConfig(BaseModel):
     value: float = Field(..., description="Stop loss value (percentage or ATR multiplier)")
 
 
+class StopLossAnchorConfig(BaseModel):
+    """
+    Structural stop loss anchored to the entry candle's OHLC.
+
+    For long positions the effective stop price is::
+
+        anchor_value * (1 - offset_pct)
+
+    where ``anchor_value`` is the entry bar's open/high/low/close. Composes
+    with ``STOP_LOSS_PCT`` and ``TRAILING_STOP_PCT`` via OR logic — whichever
+    stop triggers first wins.
+
+    ``ENTRY_HIGH`` sits at or above the entry close, so using it as a long
+    stop tends to trigger immediately on the first down-tick. Allowed for
+    completeness but rarely useful on the long side.
+    """
+    type: Literal['STOP_LOSS_ANCHOR'] = 'STOP_LOSS_ANCHOR'
+    anchor: Literal['ENTRY_OPEN', 'ENTRY_HIGH', 'ENTRY_LOW', 'ENTRY_CLOSE'] = Field(
+        ...,
+        description="Which OHLC component of the entry candle to anchor against",
+    )
+    offset_pct: Optional[float] = Field(
+        0.0,
+        ge=0,
+        lt=1,
+        description="Buffer below the anchor (0.005 = 0.5% below); 0 means anchor exactly",
+    )
+
+
 class TakeProfitConfig(BaseModel):
     """Take profit configuration"""
     type: Literal['TAKE_PROFIT_PCT', 'TAKE_PROFIT_ATR'] = Field(..., description="Take profit type")
@@ -223,7 +252,7 @@ class IndicatorExitConfig(BaseModel):
 class ConditionalOrFixedConfig(BaseModel):
     """Conditional or fixed exit configuration (OR logic)"""
     type: Literal['CONDITIONAL_OR_FIXED'] = 'CONDITIONAL_OR_FIXED'
-    conditions: List[Union[StopLossConfig, TakeProfitConfig, IndicatorExitConfig]] = Field(
+    conditions: List[Union[StopLossConfig, StopLossAnchorConfig, TakeProfitConfig, IndicatorExitConfig]] = Field(
         ..., 
         description="List of exit conditions (OR logic - any condition triggers exit)"
     )
@@ -285,17 +314,29 @@ class ExitComponentConfig(BaseModel):
     Exit component configuration (requirements JSON format).
 
     Adds an optional ``expression`` for arbitrary boolean exit conditions.
-    Position-relative exits (STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT,
-    TIME_BASED) continue to be extracted by the backtest handler and applied
-    by the Backtester against ``Position.entry_price`` / ``peak_price``.
+    Position-relative exits (STOP_LOSS_PCT, STOP_LOSS_ANCHOR, TAKE_PROFIT_PCT,
+    TRAILING_STOP_PCT, TIME_BASED) continue to be extracted by the backtest
+    handler and applied by the Backtester against ``Position.entry_price``,
+    ``peak_price``, or the captured entry-candle OHLC.
     """
-    type: Literal['CONDITIONAL_OR_FIXED', 'STOP_LOSS_PCT', 'TAKE_PROFIT_PCT', 'TRAILING_STOP_PCT', 'TIME_BASED', 'INDICATOR_CROSS', 'EXPRESSION'] = Field(..., description="Exit type")
+    type: Literal['CONDITIONAL_OR_FIXED', 'STOP_LOSS_PCT', 'STOP_LOSS_ANCHOR', 'TAKE_PROFIT_PCT', 'TRAILING_STOP_PCT', 'TIME_BASED', 'INDICATOR_CROSS', 'EXPRESSION'] = Field(..., description="Exit type")
     timeframe: str = Field("1d", description="Candle interval for exit")
     conditions: Optional[List[Dict[str, Any]]] = Field(None, description="Exit conditions (for CONDITIONAL_OR_FIXED)")
     value: Optional[float] = Field(None, description="Exit value (for percentage-based exits)")
     indicator: Optional[str] = Field(None, description="Indicator name (for INDICATOR_CROSS)")
     direction: Optional[Literal['UP', 'DOWN']] = Field(None, description="Cross direction (for INDICATOR_CROSS)")
     max_holding_days: Optional[int] = Field(None, description="Max holding days (for TIME_BASED)")
+    # STOP_LOSS_ANCHOR fields (entry-candle structural stop)
+    anchor: Optional[Literal['ENTRY_OPEN', 'ENTRY_HIGH', 'ENTRY_LOW', 'ENTRY_CLOSE']] = Field(
+        None,
+        description="Anchor reference (for STOP_LOSS_ANCHOR)",
+    )
+    offset_pct: Optional[float] = Field(
+        None,
+        ge=0,
+        lt=1,
+        description="Buffer below the anchor for STOP_LOSS_ANCHOR (default 0)",
+    )
     # New expression form
     expression: Optional['ConditionNode'] = Field(None, description="Boolean expression tree (new form)")
 

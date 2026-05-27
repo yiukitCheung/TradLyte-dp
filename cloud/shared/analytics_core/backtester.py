@@ -19,6 +19,21 @@ from .executor import MultiTimeframeExecutor
 TRADING_DAYS_PER_YEAR = 252
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    """Coerce a Polars/Python numeric to float, returning None on failure.
+
+    Used when capturing OHLC for a Position so a missing or non-numeric
+    field never crashes the run; the anchor-stop check just falls back to
+    "no anchor stop" for that position.
+    """
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _infer_periods_per_year(data: pl.DataFrame) -> int:
     """
     Estimate the number of bars per year from the median spacing of the
@@ -62,6 +77,11 @@ def _infer_periods_per_year(data: pl.DataFrame) -> int:
     return max(1, int(round(TRADING_DAYS_PER_YEAR / median_days)))
 
 
+# Allowed anchor references for STOP_LOSS_ANCHOR. These map to the entry
+# candle's OHLC and are resolved by Position.anchor_price().
+ALLOWED_ANCHORS = {'ENTRY_OPEN', 'ENTRY_HIGH', 'ENTRY_LOW', 'ENTRY_CLOSE'}
+
+
 @dataclass
 class Position:
     """Represents a trading position"""
@@ -70,12 +90,22 @@ class Position:
     # peak_price is the highest close seen since entry; used by the trailing
     # stop. Defaults to entry_price on open (see __post_init__).
     peak_price: float = 0.0
+    # OHLC of the entry candle. Captured at position open so structural stops
+    # (STOP_LOSS_ANCHOR) can reference the entry bar's open/high/low/close
+    # without a look-back over `data`.
+    entry_open: Optional[float] = None
+    entry_high: Optional[float] = None
+    entry_low: Optional[float] = None
+    entry_close: Optional[float] = None
     exit_date: Optional[date] = None
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
     pnl_pct: Optional[float] = None
     holding_days: Optional[int] = None
-    exit_reason: Optional[str] = None  # 'stop_loss', 'take_profit', 'signal', 'trailing_stop', 'time_based'
+    # Valid exit_reason values include:
+    #   'stop_loss', 'take_profit', 'trailing_stop', 'time_based',
+    #   'stop_loss_anchor', 'signal', 'end_of_data'
+    exit_reason: Optional[str] = None
 
     def __post_init__(self):
         # Initialise peak to entry so trailing-stop math never references 0.0.
@@ -90,6 +120,21 @@ class Position:
         """Track the highest price observed since entry (for trailing stop)."""
         if price > self.peak_price:
             self.peak_price = price
+
+    def anchor_price(self, anchor: str) -> Optional[float]:
+        """Resolve an ``ENTRY_*`` anchor key to the entry candle's OHLC value.
+
+        Returns ``None`` when the requested anchor is unknown or the entry
+        candle did not carry that field (older Position rows). Callers should
+        treat ``None`` as "no anchor stop", not as a zero stop.
+        """
+        mapping = {
+            'ENTRY_OPEN': self.entry_open,
+            'ENTRY_HIGH': self.entry_high,
+            'ENTRY_LOW': self.entry_low,
+            'ENTRY_CLOSE': self.entry_close,
+        }
+        return mapping.get(anchor)
 
     def close(self, exit_date: date, exit_price: float, reason: str):
         """Close the position"""
@@ -142,6 +187,10 @@ class BacktestResult:
                 {
                     'entry_date': str(t.entry_date),
                     'entry_price': t.entry_price,
+                    'entry_open': t.entry_open,
+                    'entry_high': t.entry_high,
+                    'entry_low': t.entry_low,
+                    'entry_close': t.entry_close,
                     'exit_date': str(t.exit_date) if t.exit_date else None,
                     'exit_price': t.exit_price,
                     'pnl': t.pnl,
@@ -186,11 +235,13 @@ class Backtester:
         stop_loss_pct: Optional[float] = None,
         take_profit_pct: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
-        max_holding_days: Optional[int] = None
+        max_holding_days: Optional[int] = None,
+        stop_loss_anchor: Optional[str] = None,
+        stop_loss_anchor_offset_pct: float = 0.0,
     ) -> BacktestResult:
         """
         Run backtest on strategy
-        
+
         Args:
             strategy: Strategy instance to backtest
             data: OHLCV DataFrame with strategy signals
@@ -198,7 +249,18 @@ class Backtester:
             take_profit_pct: Take profit percentage (e.g., 0.10 = 10%)
             trailing_stop_pct: Trailing stop percentage (e.g., 0.03 = 3%)
             max_holding_days: Maximum holding period in days
-            
+            stop_loss_anchor: Anchor reference for a structural stop tied to
+                the entry candle. One of ``ENTRY_OPEN``, ``ENTRY_HIGH``,
+                ``ENTRY_LOW``, ``ENTRY_CLOSE``. For long positions, the
+                effective stop is ``anchor * (1 - stop_loss_anchor_offset_pct)``.
+                Composes with ``stop_loss_pct`` and ``trailing_stop_pct`` via
+                OR logic (whichever stop triggers first wins). Note that
+                ``ENTRY_HIGH`` will sit above the entry close and therefore
+                tends to trigger very quickly on long entries.
+            stop_loss_anchor_offset_pct: Optional buffer below the anchor
+                (0.005 = 0.5% below). Must be in ``[0, 1)``. Ignored when
+                ``stop_loss_anchor`` is not set.
+
         Returns:
             BacktestResult with performance metrics
         """
@@ -207,6 +269,22 @@ class Backtester:
             stop_loss_pct = getattr(strategy, 'stop_loss_pct', None)
         if take_profit_pct is None:
             take_profit_pct = getattr(strategy, 'take_profit_pct', None)
+
+        # Validate anchor early so config errors fail loudly instead of
+        # silently being ignored deeper in the exit loop.
+        if stop_loss_anchor is not None:
+            anchor_key = str(stop_loss_anchor).strip().upper()
+            if anchor_key not in ALLOWED_ANCHORS:
+                raise ValueError(
+                    f"Unsupported stop_loss_anchor: {stop_loss_anchor!r}. "
+                    f"Expected one of {sorted(ALLOWED_ANCHORS)}."
+                )
+            stop_loss_anchor = anchor_key
+            if not (0.0 <= stop_loss_anchor_offset_pct < 1.0):
+                raise ValueError(
+                    "stop_loss_anchor_offset_pct must be in [0, 1). "
+                    f"Got {stop_loss_anchor_offset_pct!r}."
+                )
 
         # Execute strategy to get signals
         if 'signal' not in data.columns:
@@ -250,6 +328,8 @@ class Backtester:
                     take_profit_pct,
                     trailing_stop_pct,
                     max_holding_days,
+                    stop_loss_anchor,
+                    stop_loss_anchor_offset_pct,
                 )
 
                 if should_exit:
@@ -272,9 +352,17 @@ class Backtester:
                 if entry_price > 0 and investable > 0:
                     shares = investable / entry_price
                     cash -= shares * entry_price + self.commission
+                    # Capture the entry candle's OHLC so structural stops
+                    # (STOP_LOSS_ANCHOR) can reference it without scanning
+                    # back through `data`. row['open'/'high'/'low'/'close']
+                    # are guaranteed by the executor's prepare_dataframe.
                     open_position = Position(
                         entry_date=current_date,
                         entry_price=entry_price,
+                        entry_open=_safe_float(row.get('open')),
+                        entry_high=_safe_float(row.get('high')),
+                        entry_low=_safe_float(row.get('low')),
+                        entry_close=_safe_float(row.get('close')),
                     )
 
             # 3) Mark to market — exactly one append per bar.
@@ -314,39 +402,51 @@ class Backtester:
         stop_loss_pct: Optional[float],
         take_profit_pct: Optional[float],
         trailing_stop_pct: Optional[float],
-        max_holding_days: Optional[int]
+        max_holding_days: Optional[int],
+        stop_loss_anchor: Optional[str] = None,
+        stop_loss_anchor_offset_pct: float = 0.0,
     ) -> tuple[bool, str]:
         """Check if position should be exited"""
-        
+
         # Check stop loss
         if stop_loss_pct:
             stop_loss_price = position.entry_price * (1 - stop_loss_pct)
             if current_price <= stop_loss_price:
                 return True, 'stop_loss'
-        
+
+        # Structural stop anchored to the entry candle (e.g. low of entry
+        # bar). Runs alongside % stops via OR logic so whichever stop is
+        # tighter wins. Falls back silently if the anchor field is None.
+        if stop_loss_anchor:
+            anchor_value = position.anchor_price(stop_loss_anchor)
+            if anchor_value is not None:
+                anchor_stop_price = anchor_value * (1.0 - stop_loss_anchor_offset_pct)
+                if current_price <= anchor_stop_price:
+                    return True, 'stop_loss_anchor'
+
         # Check take profit
         if take_profit_pct:
             take_profit_price = position.entry_price * (1 + take_profit_pct)
             if current_price >= take_profit_price:
                 return True, 'take_profit'
-        
+
         # Trailing stop relative to the highest close observed since entry.
         # position.peak_price is updated each bar by Backtester.run().
         if trailing_stop_pct:
             trailing_stop_price = position.peak_price * (1 - trailing_stop_pct)
             if current_price <= trailing_stop_price:
                 return True, 'trailing_stop'
-        
+
         # Check time-based exit
         if max_holding_days:
             holding_days = (current_date - position.entry_date).days
             if holding_days >= max_holding_days:
                 return True, 'time_based'
-        
+
         # Check exit signal from strategy
         if row.get('exit_signal') == 'SELL':
             return True, 'signal'
-        
+
         return False, ''
     
     def _calculate_metrics(
