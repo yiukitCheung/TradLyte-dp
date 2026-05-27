@@ -138,9 +138,11 @@ Routes must exist in API Gateway — keep **`deploy_http_api.sh`** `ROUTES` arra
 |--------|------|-------------|
 | POST | `/backtest` | Run a single-symbol strategy backtest over date range and return performance metrics |
 
-`dev-serving-api` handles request auth/validation and proxies execution to a dedicated backtester Lambda (`BACKTEST_FUNCTION_NAME`, default `dev-serving-backtester`). This keeps serving ZIP packages small while heavy analytics deps live in the containerized backtester function.
+`dev-serving-api` handles request auth/validation and proxies execution to a dedicated backtester Lambda (`BACKTEST_FUNCTION_NAME`, default `dev-serving-backtester`). This keeps serving ZIP packages small while heavy analytics deps (Polars, psycopg2, etc.) live in the containerized backtester function.
 
-**Request body (`/backtest`)**
+**Timeouts.** API Gateway HTTP API integration timeout is set to **30 s** (the HTTP API maximum). Lambda timeouts: `dev-serving-api` = 30 s, `dev-serving-backtester` = 120 s. A request that runs longer than 30 s at the gateway returns `503 Service Unavailable` even if the backtester is still working; keep `(end_date - start_date) ≤ BACKTEST_MAX_LOOKBACK_DAYS` (default `1825` ≈ 5 years) and prefer warm invocations for interactive use.
+
+#### Request body
 
 ```json
 {
@@ -151,16 +153,81 @@ Routes must exist in API Gateway — keep **`deploy_http_api.sh`** `ROUTES` arra
   "end_date": "2024-12-31",
   "initial_capital": 10000,
   "components": {
-    "setup": { "type": "INDICATOR_THRESHOLD", "timeframe": "1d", "indicator": "RSI", "operator": ">", "value": 50 },
-    "trigger": { "type": "CANDLE_PATTERN", "timeframe": "1d", "pattern": "BULLISH_ENGULFING" },
-    "exit": { "type": "CONDITIONAL_OR_FIXED", "timeframe": "1d", "conditions": [{ "type": "STOP_LOSS_PCT", "value": 0.05 }, { "type": "TAKE_PROFIT_PCT", "value": 0.12 }] }
+    "setup": { /* SetupComponentConfig */ },
+    "trigger": { /* TriggerComponentConfig */ },
+    "exit": { /* ExitComponentConfig */ }
   }
 }
 ```
 
-**Response fields (`data`) include:** `total_return_pct`, `sharpe_ratio`, `max_drawdown_pct`, `equity_curve`, `total_trades`, `win_rate`, and `trades`.
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `strategy_name` | string | yes | Free-form identifier echoed back in `meta`; used for logging / catalog joins |
+| `symbol` | string | yes | Single ticker, upper-cased server-side |
+| `timeframe` | string | no (`1d`) | Base candle interval (`1d`, `1h`, …) |
+| `start_date`, `end_date` | date | yes | `YYYY-MM-DD`; `start_date ≤ end_date` and range ≤ `BACKTEST_MAX_LOOKBACK_DAYS` (~5 y) |
+| `initial_capital` | number | no (`10000`) | Must be `> 0` |
+| `components.setup` | object | yes | See [setup types](#setup-types) |
+| `components.trigger` | object | yes | See [trigger types](#trigger-types) |
+| `components.exit` | object | yes | See [exit types](#exit-types) |
 
-**Known-good smoke payload (validated):**
+Validation is done by Pydantic (`RequirementsStrategyConfig`). Unknown types or missing required fields return `400` with a field-level message.
+
+#### Setup types
+
+Setup answers "is the regime/trend valid?" — it gates entries but does not place them.
+
+| `type` | Authoring style | Key fields |
+|---|---|---|
+| `INDICATOR_THRESHOLD` | Legacy flat | `indicator`, `params`, `operator` (`>` `<` `>=` `<=` `==` `CROSS_ABOVE` `CROSS_BELOW`), `value`, optional `indicator2` |
+| `EXPRESSION` | Recommended | `expression`: a recursive boolean tree (see [expression DSL](#expression-dsl)) |
+| `NONE` | — | No setup gate; trigger fires on its own |
+
+#### Trigger types
+
+Trigger answers "did the entry happen on this bar?" — when true the engine emits a BUY (or SELL if `signal_value: "SELL"`).
+
+| `type` | Key fields |
+|---|---|
+| `CANDLE_PATTERN` | `pattern` (`BULLISH_ENGULFING`, `BEARISH_ENGULFING`, `HAMMER`, `SHOOTING_STAR`, `DOJI`, `MORNING_STAR`, `EVENING_STAR`, `GREEN_CANDLE`, `RED_CANDLE`) |
+| `PRICE_CROSSOVER` | `direction` (`ABOVE`/`BELOW`) and either `price_level` (number) or `indicator` (string) |
+| `INDICATOR_CROSSOVER` | `indicator1`, `indicator2`, `crossover_type` (`GOLDEN_CROSS`/`DEATH_CROSS`) |
+| `EXPRESSION` | `expression` tree; optional `signal_value` (`BUY`/`SELL`, default `BUY`) |
+
+#### Exit types
+
+Exit answers "when do we close the position?" The backtester applies position-relative exits (stop loss, take profit, trailing stop, anchor stop, time-based) against `Position.entry_price`, `Position.peak_price`, or the captured entry-candle OHLC. Whichever condition fires first wins; ties on the same bar resolve in the order checked by `_check_exit_conditions`.
+
+Two authoring shapes are supported:
+
+1. **`CONDITIONAL_OR_FIXED`** — wrap one or more conditions under `conditions[]` (OR logic).
+2. **Top-level form** — set `exit.type` directly to one of the leaf exit types below (single-rule exit).
+
+| Leaf `type` (in `conditions[]` **or** top-level) | Fields | Behaviour |
+|---|---|---|
+| `STOP_LOSS_PCT` | `value` (0–1) | Exit when `close ≤ entry_price × (1 − value)` |
+| `STOP_LOSS_ANCHOR` | `anchor` (`ENTRY_OPEN` \| `ENTRY_HIGH` \| `ENTRY_LOW` \| `ENTRY_CLOSE`), optional `offset_pct` (0–1, default `0`) | Structural stop: exit when `close ≤ anchor_value × (1 − offset_pct)`. `anchor_value` is the entry candle's OHLC, captured at position open |
+| `TAKE_PROFIT_PCT` | `value` (≥ 0) | Exit when `close ≥ entry_price × (1 + value)` |
+| `TRAILING_STOP_PCT` | `value` (0–1) | Exit when `close ≤ peak_price × (1 − value)` (peak tracked since entry) |
+| `TIME_BASED` | `max_holding_days` (int > 0) | Force exit after N calendar days since entry. Top-level form only; not selectable inside `conditions[]` |
+| `INDICATOR_CROSS` | `indicator`, `direction` (`UP`/`DOWN`), optional `value` | Exit on indicator cross |
+| `EXPRESSION` | `expression` tree | Exit when the expression is true on a bar |
+
+> **`STOP_LOSS_ANCHOR` notes.** `ENTRY_LOW` is the typical choice for longs — it places a structural stop just under the swing low of the entry bar. `ENTRY_HIGH` sits at or above the entry close so on the long side it tends to trigger on the first down-tick (allowed for completeness; rarely useful). On a gap-through, the exit fill is the next bar's `close`, so realized loss can exceed the configured `offset_pct`. Fires `exit_reason = "stop_loss_anchor"`.
+
+#### Expression DSL
+
+`EXPRESSION` components accept a recursive boolean tree (discriminated by `op`). Three node families:
+
+| Family | Examples |
+|---|---|
+| **Operands** | `{"indicator": "RSI", "params": {"period": 13}}`, `{"indicator": "MACD", "output": "signal"}`, `{"price": "close"}`, `{"const": 50}` |
+| **Comparators / patterns** | `{"op": "GT" \| "LT" \| "GTE" \| "LTE" \| "EQ" \| "NEQ" \| "CROSS_ABOVE" \| "CROSS_BELOW", "left": …, "right": …}`, `{"op": "PATTERN", "pattern": "DOJI"}` |
+| **Combinators** | `{"op": "AND" \| "OR", "conditions": [...]}`, `{"op": "NOT", "condition": …}` |
+
+#### Example payloads
+
+**1. Minimal smoke test** (always-on trigger, fixed take-profit):
 
 ```json
 {
@@ -171,35 +238,113 @@ Routes must exist in API Gateway — keep **`deploy_http_api.sh`** `ROUTES` arra
   "end_date": "2025-01-31",
   "initial_capital": 10000,
   "components": {
-    "setup": { "type": "NONE", "timeframe": "1d" },
+    "setup":   { "type": "NONE",           "timeframe": "1d" },
     "trigger": { "type": "CANDLE_PATTERN", "timeframe": "1d", "pattern": "GREEN_CANDLE" },
-    "exit": { "type": "TAKE_PROFIT_PCT", "timeframe": "1d", "value": 0.1 }
+    "exit":    { "type": "TAKE_PROFIT_PCT","timeframe": "1d", "value": 0.10 }
   }
 }
 ```
 
-**Example success shape:**
+**2. EMA trend with `STOP_LOSS_ANCHOR` exit** (validated against the live API; produces structural stops anchored to entry-bar low):
+
+```json
+{
+  "strategy_name": "anchor_exit_test_aapl",
+  "symbol": "AAPL",
+  "timeframe": "1d",
+  "start_date": "2023-01-01",
+  "end_date": "2024-12-31",
+  "initial_capital": 10000,
+  "components": {
+    "setup": {
+      "type": "EXPRESSION", "timeframe": "1d",
+      "expression": {
+        "op": "GT",
+        "left":  { "indicator": "EMA", "params": { "period": 8  } },
+        "right": { "indicator": "EMA", "params": { "period": 21 } }
+      }
+    },
+    "trigger": {
+      "type": "EXPRESSION", "timeframe": "1d", "signal_value": "BUY",
+      "expression": {
+        "op": "CROSS_ABOVE",
+        "left":  { "price": "close" },
+        "right": { "indicator": "EMA", "params": { "period": 8 } }
+      }
+    },
+    "exit": {
+      "type": "CONDITIONAL_OR_FIXED", "timeframe": "1d",
+      "conditions": [
+        { "type": "STOP_LOSS_ANCHOR", "anchor": "ENTRY_LOW", "offset_pct": 0.01 },
+        { "type": "TAKE_PROFIT_PCT",  "value": 0.10 }
+      ]
+    }
+  }
+}
+```
+
+**3. Top-level `STOP_LOSS_ANCHOR`** (no other rules; for testing the structural stop in isolation):
+
+```json
+"exit": {
+  "type": "STOP_LOSS_ANCHOR",
+  "timeframe": "1d",
+  "anchor": "ENTRY_LOW",
+  "offset_pct": 0.005
+}
+```
+
+#### Response shape
 
 ```json
 {
   "data": {
-    "total_return_pct": -0.0367,
-    "sharpe_ratio": -9.1651,
-    "max_drawdown_pct": 0.0367,
-    "total_trades": 1,
-    "equity_curve": [10000, 10000, 9632.98],
-    "trades": []
+    "total_return": 9509.23,
+    "total_return_pct": 0.9509,
+    "total_trades": 10,
+    "winning_trades": 8,
+    "losing_trades": 2,
+    "win_rate": 0.80,
+    "avg_win": 16.97,
+    "avg_loss": -5.99,
+    "profit_factor": 11.33,
+    "max_drawdown": 1338.31,
+    "max_drawdown_pct": 0.1338,
+    "sharpe_ratio": 2.54,
+    "equity_curve": [10000.0, 10000.0, "..."],
+    "initial_capital": 10000,
+    "final_capital": 19509.23,
+    "trades": [
+      {
+        "entry_date": "2023-07-12",
+        "entry_price": 187.68,
+        "entry_open":  187.59,
+        "entry_high":  189.58,
+        "entry_low":   186.39,
+        "entry_close": 187.68,
+        "exit_date":   "2023-08-04",
+        "exit_price":  179.98,
+        "pnl": -7.70,
+        "pnl_pct": -0.041,
+        "holding_days": 23,
+        "exit_reason": "stop_loss_anchor"
+      }
+    ]
   },
   "meta": {
     "symbol": "AAPL",
-    "strategy_name": "smoke_test",
+    "strategy_name": "anchor_exit_test_aapl",
     "timeframe": "1d",
-    "start_date": "2025-01-01",
-    "end_date": "2025-01-31",
+    "start_date": "2023-01-01",
+    "end_date": "2024-12-31",
     "source": "dev-serving-backtester"
   }
 }
 ```
+
+`data.trades[].exit_reason` is one of: `stop_loss`, `take_profit`, `trailing_stop`, `time_based`, `stop_loss_anchor`, `signal`, `end_of_data`.
+
+`entry_open` / `entry_high` / `entry_low` / `entry_close` capture the entry candle's OHLC. They are populated for every position so consumers can recompute structural-stop math (e.g. `anchor = entry_low`, `effective_stop = entry_low × (1 − offset_pct)`) without re-pulling raw OHLCV.
 
 **`/picks/today` and `/picks/today/metadata`**
 
@@ -291,6 +436,11 @@ curl -sS -H "x-api-key: $KEY" \
 curl -sS -X POST -H "x-api-key: $KEY" -H "Content-Type: application/json" \
   "$BASE/backtest" \
   -d '{"strategy_name":"smoke_test","symbol":"AAPL","timeframe":"1d","start_date":"2025-01-01","end_date":"2025-01-31","initial_capital":10000,"components":{"setup":{"type":"NONE","timeframe":"1d"},"trigger":{"type":"CANDLE_PATTERN","timeframe":"1d","pattern":"GREEN_CANDLE"},"exit":{"type":"TAKE_PROFIT_PCT","timeframe":"1d","value":0.1}}}'
+
+# Backtest with structural stop-loss anchor (entry-candle low − 1% buffer) + 10% take-profit
+curl -sS -X POST -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  "$BASE/backtest" \
+  -d '{"strategy_name":"anchor_exit_test_aapl","symbol":"AAPL","timeframe":"1d","start_date":"2023-01-01","end_date":"2024-12-31","initial_capital":10000,"components":{"setup":{"type":"EXPRESSION","timeframe":"1d","expression":{"op":"GT","left":{"indicator":"EMA","params":{"period":8}},"right":{"indicator":"EMA","params":{"period":21}}}},"trigger":{"type":"EXPRESSION","timeframe":"1d","signal_value":"BUY","expression":{"op":"CROSS_ABOVE","left":{"price":"close"},"right":{"indicator":"EMA","params":{"period":8}}}},"exit":{"type":"CONDITIONAL_OR_FIXED","timeframe":"1d","conditions":[{"type":"STOP_LOSS_ANCHOR","anchor":"ENTRY_LOW","offset_pct":0.01},{"type":"TAKE_PROFIT_PCT","value":0.1}]}}}'
 
 curl -sS "$BASE/health"
 ```

@@ -13,7 +13,7 @@
 TradLyte is a serverless, event-driven financial-market data platform implemented on AWS. It follows a **Medallion + Lambda Architecture** pattern:
 
 - **Batch Layer** — ingests daily OHLCV and symbol metadata, materializes multi-timeframe views on demand, runs strategy scanning at market-close.
-- **Serving Layer** — HTTP APIs for screener + picks (live), with backtest endpoint in planned state.
+- **Serving Layer** — HTTP APIs for screener, picks, market data, and backtest (all live in dev).
 - **Speed Layer** — designed, archived for MVP (Kinesis/Flink path in `cloud/speed_layer/Archive/`).
 
 The platform's mission statement — **"Clarity Over Noise, Purpose Over Profit"** — drives two architectural non-negotiables:
@@ -80,10 +80,10 @@ flowchart TB
     SM_RDS["RDS_SECRET"]
   end
 
-  subgraph SERVE["Serving Layer - MVP live (screener+picks)"]
-    APIGW["API Gateway (HTTP)<br/>/v1/screener/quotes<br/>/v1/picks/today<br/>/v1/picks/{scan_date}/returns"]
-    LF_SERVE["lambda dev-serving-api<br/>FastAPI + Mangum"]
-    LF_BT["lambda backtester (container ARM64, planned)"]
+  subgraph SERVE["Serving Layer - live in dev"]
+    APIGW["API Gateway (HTTP)<br/>/v1/screener/quotes<br/>/v1/picks/today<br/>/v1/picks/{scan_date}/returns<br/>/v1/market/*<br/>POST /v1/backtest"]
+    LF_SERVE["lambda dev-serving-api<br/>FastAPI + Mangum (zip)"]
+    LF_BT["lambda dev-serving-backtester<br/>container ARM64 (live)"]
     RDSPROXY["RDS Proxy"]
     FE["Frontend (React)"]
   end
@@ -136,7 +136,7 @@ flowchart TB
 
   FE -->|HTTPS + API key| APIGW
   APIGW --> LF_SERVE
-  APIGW --> LF_BT
+  LF_SERVE -->|invoke (POST /backtest)| LF_BT
   LF_SERVE --> RDSPROXY
   LF_BT --> RDSPROXY
   RDSPROXY --> T_OHLCV
@@ -171,17 +171,17 @@ flowchart TB
 | `shared.models.data_models` | Pydantic DTOs: `OHLCVData`, `BatchProcessingJob`, response envelopes |
 | `shared.utils.pipeline` | `get_missing_dates`, `get_new_symbols`, `update_watermark`, `write_to_rds_with_retention` (5-year rolling retention) |
 | `shared.utils.market_calendar` | Trading-day arithmetic (US/Eastern) |
-| `shared.analytics_core.*` | Strategy framework: `indicators/` (Polars-native), `strategies/base.py` + `builder.py` (CompositeStrategy from JSON), `scanner.py` (`DailyScanner.run → rank → write`), `backtester.py`, `executor.py`, `inputs.py` |
+| `shared.analytics_core.*` | Strategy framework: `indicators/` (Polars-native), `strategies/base.py` + `builder.py` (CompositeStrategy from JSON), `scanner.py` (`DailyScanner.run → rank → write`), `executor.py` (`MultiTimeframeExecutor`), `inputs.py`, `models.py` (Pydantic configs incl. `STOP_LOSS_ANCHOR`), and `backtester.py` — supports stop-loss / take-profit / trailing-stop / time-based exits **plus structural stops anchored to the entry candle's OHLC** (`STOP_LOSS_ANCHOR`, `exit_reason='stop_loss_anchor'`) |
 
-### 3.3 Serving Layer (MVP — Live)
+### 3.3 Serving Layer (Live in dev)
 
 | Component | AWS Resource | Code | Status |
 |---|---|---|---|
-| Serving API (MVP) | Lambda (zip) behind HTTP API Gateway (`GET /v1/screener/quotes`, `GET /v1/picks/today`, `GET /v1/picks/{scan_date}/returns`) | `cloud/serving_layer/lambda_functions/serving_api/` | Deployed in dev; live endpoints for screener and picks |
-| Backtest API | Lambda (container, ARM64) behind API Gateway `POST /backtest` | `cloud/serving_layer/lambda_functions/backtester/backtest_handler.py` + `Dockerfile` | Code + Docker written; not deployed |
+| Serving API | `dev-serving-api` Lambda (zip) behind HTTP API Gateway — `GET /v1/{screener,picks,market}/*` and `POST /v1/backtest` (proxies to backtester) | `cloud/serving_layer/lambda_functions/serving_api/` | Live in dev |
+| Backtest API | `dev-serving-backtester` Lambda (container, ARM64) invoked by `dev-serving-api` for `POST /backtest` | `cloud/serving_layer/lambda_functions/backtester/backtest_handler.py` + `Dockerfile`; ECR repo `dev-serving-backtester:latest` | Live in dev |
 | Redis | ElastiCache (cluster mode disabled, TLS) | — | Deferred for MVP (not required for current read traffic) |
-| RDS Proxy | `raw_ohlcv` read path for serving/backtester | AWS Console runbook in `cloud/serving_layer/infrastructure/serving_api/README.md` | Deployed in dev (`dev-rds-proxy-v2`) |
-| API Gateway | HTTP API + throttling + CORS (MVP), REST API + usage plans optional later | `cloud/serving_layer/infrastructure/serving_api/deploy_http_api.sh` | Deployed in dev |
+| RDS Proxy | `raw_ohlcv` read path for serving + backtester | AWS Console runbook in `cloud/serving_layer/infrastructure/serving_api/README.md` | Deployed in dev (`dev-rds-proxy-v2`) |
+| API Gateway | HTTP API + throttling + CORS; integration timeout = **30 s** (HTTP API max) for the `POST /backtest` cold-start path | `cloud/serving_layer/infrastructure/serving_api/deploy_http_api.sh` | Deployed in dev |
 
 ### 3.4 Storage
 
@@ -300,7 +300,7 @@ The ingest handlers also support **S3 → SQS → Lambda** (`Records`-style even
 | FR-3 | Rank daily strategy signals (`stock_picks`) by close of pipeline | Analytics |
 | FR-4 | Support user-defined strategies via JSON (`RequirementsStrategyConfig`) | Analytics |
 | FR-5 | Return `/v1/screener/quotes` and `/v1/picks/today` in ≤ 1.5 s p95 in dev | Serving (live, tuning in progress) |
-| FR-6 | Return `/v1/picks/{scan_date}/returns` and `/backtest` in ≤ 3 s p95 | Serving (partially planned; returns endpoint needs further optimization) |
+| FR-6 | Return `/v1/picks/{scan_date}/returns` and `/v1/backtest` in ≤ 3 s p95 on warm path | Serving (both endpoints live; returns endpoint still tuning, backtest container cold-start ≤ 30 s) |
 | FR-7 | Idempotent re-ingest from S3 (replay capability) | Batch |
 
 ### 5.2 Non-Functional Requirements
@@ -357,6 +357,8 @@ Fibonacci intervals `3d/5d/8d/13d/21d/34d` are now computed on the fly in `share
 | `daily-ohlcv-ingest-handler` | 1024 MB | 300 s | Parquet decode + RDS batch insert |
 | `daily-meta-ingest-handler` | 1024 MB | 180 s | JSON decode + RDS upsert |
 | `scan-partitioner` | 512 MB (default) | 60 s | Single RDS query + 10 tiny S3 PUTs |
+| `dev-serving-api` | 512 MB | 30 s | Lightweight FastAPI + Mangum; proxies `POST /backtest` to backtester |
+| `dev-serving-backtester` | 2048 MB | 120 s | Container ARM64; Polars + psycopg2; reads `raw_ohlcv` via RDS Proxy |
 
 ### 7.2 AWS Batch (Fargate)
 
@@ -553,3 +555,4 @@ Packaging discipline: the deploy scripts vendor **only the shared subset a funct
 |---|---|---|
 | 1.0 | 2026-03-19 | Initial industrial architecture doc post fetch / ingest / plan decoupling |
 | 1.1 | 2026-05-13 | Documentation cleanse: corrected stale references and dead links across the repo, refreshed serving-layer status, refreshed R-9 (`build_push_backtester.sh` duplicate) |
+| 1.2 | 2026-05-26 | Backtest endpoint promoted from planned to live: documented `dev-serving-backtester` container Lambda, corrected `API Gateway → serving-api → backtester` invoke path in §2 diagram, added serving Lambda sizing, raised HTTP API integration timeout to 30 s, and added `STOP_LOSS_ANCHOR` (entry-candle structural stop) to the analytics framework summary |

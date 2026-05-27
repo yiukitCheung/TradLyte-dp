@@ -34,7 +34,7 @@ The MVP serving API exposes ten GET routes and one POST route, all behind API Ga
 | `GET /v1/market/news/{symbol}` | Live |
 | `GET /v1/market/ohlcv/{symbol}` | Live |
 | `GET /v1/market/returns/{symbol}` | Live |
-| `POST /v1/backtest` | Code present, **backtester Lambda not deployed yet** — the route returns an error until `dev-serving-backtester` is built and registered |
+| `POST /v1/backtest` | Live — `dev-serving-api` proxies to `dev-serving-backtester` (container, ARM64). API Gateway HTTP API integration timeout is **30 s** (max), so first-request cold starts on the container may approach the limit; subsequent warm invocations typically respond in 1–3 s |
 
 ## Code layout
 
@@ -71,7 +71,28 @@ AWS_REGION=ca-west-1 ECR_REPO=dev-serving-backtester \
   ./cloud/serving_layer/infrastructure/backtester/build_push_backtester.sh
 ```
 
-After the image is in ECR, create the `dev-serving-backtester` Lambda from that image and grant `dev-serving-api` permission to invoke it (`BACKTEST_FUNCTION_NAME=dev-serving-backtester`).
+This builds an ARM64 image and pushes it to ECR as `dev-serving-backtester:latest`.
+
+### First-time creation
+
+If the Lambda doesn't yet exist, create it from the latest image and grant `dev-serving-api` permission to invoke it (`BACKTEST_FUNCTION_NAME=dev-serving-backtester` on the serving Lambda).
+
+### Redeploy after code changes
+
+The container `latest` tag is mutable, so Lambda needs to be told to pull the new image:
+
+```bash
+aws lambda update-function-code \
+  --function-name dev-serving-backtester \
+  --image-uri "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.ca-west-1.amazonaws.com/dev-serving-backtester:latest" \
+  --region ca-west-1
+
+# Wait until LastUpdateStatus = Successful before testing
+aws lambda get-function-configuration \
+  --function-name dev-serving-backtester \
+  --region ca-west-1 \
+  --query 'LastUpdateStatus'
+```
 
 Lambda env vars (backtester):
 
@@ -79,6 +100,21 @@ Lambda env vars (backtester):
 - `BACKTEST_MAX_LOOKBACK_DAYS` — optional, default `1825` (~5 years).
 
 Use the **RDS Proxy** endpoint in the secret's `host` for production traffic.
+
+### Backtest exit types
+
+The backtester supports the following exit conditions (set under `components.exit` in the request body — see [`API_GUIDE.md`](API_GUIDE.md#exit-types) for full schema and examples):
+
+| Type | Behaviour |
+|---|---|
+| `STOP_LOSS_PCT` | Exit when `close ≤ entry_price × (1 − value)` |
+| `STOP_LOSS_ANCHOR` | Structural stop anchored to the entry candle's OHLC: `close ≤ entry_<anchor> × (1 − offset_pct)` where anchor is `ENTRY_OPEN \| ENTRY_HIGH \| ENTRY_LOW \| ENTRY_CLOSE`. Fires `exit_reason="stop_loss_anchor"` |
+| `TAKE_PROFIT_PCT` | Exit when `close ≥ entry_price × (1 + value)` |
+| `TRAILING_STOP_PCT` | Exit when `close ≤ peak_price × (1 − value)` |
+| `TIME_BASED` | Force exit after `max_holding_days` |
+| `INDICATOR_CROSS` / `EXPRESSION` | Boolean exit signals |
+
+Exits compose via `CONDITIONAL_OR_FIXED` (OR logic — first to fire wins). Every trade in the response carries the entry candle's full OHLC (`entry_open`, `entry_high`, `entry_low`, `entry_close`) so the frontend can render the structural-stop level without re-pulling raw bars.
 
 ## Lessons learned (MVP rollout)
 
