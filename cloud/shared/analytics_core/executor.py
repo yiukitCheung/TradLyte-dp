@@ -18,6 +18,18 @@ from .indicators.technicals import calculate_all_indicators
 from .indicators.patterns import detect_all_patterns
 
 
+# Columns that represent a one-bar *event* rather than a persistent *state*.
+# Event columns must NOT be forward-filled when aligning from a higher
+# timeframe down to the base timeframe — otherwise a BUY emitted on a 3d bar
+# would replicate onto each underlying 1d bar in the same 3d window. State
+# columns (setup_valid, indicator values, etc.) are still forward-filled.
+_EVENT_COLUMNS = frozenset({"signal", "exit_signal"})
+_EVENT_DEFAULTS: Dict[str, object] = {
+    "signal": "HOLD",
+    "exit_signal": None,
+}
+
+
 class MultiTimeframeExecutor:
     """
     Executes strategies across multiple timeframes
@@ -109,36 +121,60 @@ class MultiTimeframeExecutor:
         signal_column: str = 'setup_valid'
     ) -> pl.DataFrame:
         """
-        Align higher timeframe signals to base timeframe
-        
-        Example: If RSI > 50 on 3d candles, apply that signal to all 1d candles
-        within that 3d period.
-        
+        Align higher-timeframe column values onto the base timeframe.
+
+        Two behaviours depending on column semantics:
+
+        - **State columns** (default, e.g. ``setup_valid``, indicator values):
+          forward-filled via ``join_asof(strategy='backward')`` so the most
+          recent higher-TF value applies to every base-TF bar within its
+          period.
+        - **Event columns** (``signal``, ``exit_signal``): fire **only** on
+          the base-TF bar whose date matches the higher-TF bar's date.
+          Other base-TF bars receive the column's neutral default
+          (``HOLD`` / ``None``). This avoids duplicating a single BUY/SELL
+          event across every underlying bar in the higher-TF window.
+
+        Example: a BUY emitted on the 3d bar dated 2026-03-18 attaches only to
+        the 1d row for 2026-03-18, not to the 1d rows for 2026-03-19/20.
+
         Args:
-            base_df: Base timeframe DataFrame (e.g., 1d)
-            higher_timeframe_df: Higher timeframe DataFrame (e.g., 3d)
-            higher_timeframe: Higher timeframe string (e.g., '3d')
-            signal_column: Column name to align (default: 'setup_valid')
-            
+            base_df: Base timeframe DataFrame (e.g., 1d).
+            higher_timeframe_df: Higher timeframe DataFrame (e.g., 3d).
+            higher_timeframe: Higher timeframe string (e.g., '3d').
+            signal_column: Column name to align (default: 'setup_valid').
+
         Returns:
-            Base DataFrame with aligned signal column added/updated
+            Base DataFrame with the aligned column added/updated.
         """
         if signal_column not in higher_timeframe_df.columns:
             return base_df
-        
-        # Create a mapping: for each base date, find the corresponding higher timeframe signal
-        # Strategy: Forward-fill the higher timeframe signal to all base candles in that period
-        
-        # Merge higher timeframe signals onto base timeframe
-        # Use date alignment (base date falls within higher timeframe period)
-        base_with_signals = base_df.join_asof(
-            higher_timeframe_df.select(['date', signal_column]).sort('date'),
-            left_on='date',
-            right_on='date',
-            strategy='backward'  # Use most recent higher timeframe signal
+
+        htf = (
+            higher_timeframe_df
+            .select(['date', signal_column])
+            .sort('date')
+            .rename({'date': '_htf_date'})
         )
-        
-        return base_with_signals
+
+        base_with_signals = base_df.sort('date').join_asof(
+            htf,
+            left_on='date',
+            right_on='_htf_date',
+            strategy='backward',
+        )
+
+        if signal_column in _EVENT_COLUMNS:
+            default_value = _EVENT_DEFAULTS.get(signal_column)
+            default_lit = pl.lit(default_value) if default_value is not None else pl.lit(None)
+            base_with_signals = base_with_signals.with_columns(
+                pl.when(pl.col('date') == pl.col('_htf_date'))
+                .then(pl.col(signal_column))
+                .otherwise(default_lit)
+                .alias(signal_column)
+            )
+
+        return base_with_signals.drop('_htf_date')
     
     def run(
         self,

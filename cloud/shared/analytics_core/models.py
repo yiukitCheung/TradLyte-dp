@@ -5,7 +5,7 @@ Validates JSON strategy configurations from users/API
 Supports both legacy 3-step format and new expandable step-based format
 """
 
-from typing import Literal, Optional, Dict, Any, List, Union
+from typing import Annotated, Literal, Optional, Dict, Any, List, Union
 from pydantic import BaseModel, Field, validator
 
 
@@ -230,19 +230,43 @@ class ConditionalOrFixedConfig(BaseModel):
 
 
 class SetupComponentConfig(BaseModel):
-    """Setup component configuration (requirements JSON format)"""
-    type: Literal['INDICATOR_THRESHOLD', 'NONE'] = Field(..., description="Setup type")
+    """
+    Setup component configuration (requirements JSON format).
+
+    Two authoring styles are supported on the same model:
+
+    1. **Legacy flat form** (kept for backward compatibility): set
+       ``type='INDICATOR_THRESHOLD'`` and fill ``indicator`` / ``params`` /
+       ``operator`` / ``value``. Limited to a single indicator/operator.
+
+    2. **Expression form** (recommended for new code): set
+       ``type='EXPRESSION'`` and supply ``expression`` as an arbitrary nested
+       boolean tree built from operands (indicators, price fields, constants)
+       and operators (comparators, crossovers, AND/OR/NOT). See
+       ``ConditionNode``.
+    """
+    type: Literal['INDICATOR_THRESHOLD', 'EXPRESSION', 'NONE'] = Field(..., description="Setup type")
     timeframe: str = Field("1d", description="Candle interval for setup")
-    indicator: Optional[str] = Field(None, description="Indicator name")
-    params: Optional[Dict[str, Any]] = Field(None, description="Indicator parameters")
-    operator: Optional[Literal['>', '<', '>=', '<=', '==', 'CROSS_ABOVE', 'CROSS_BELOW']] = Field(None, description="Comparison operator")
-    value: Optional[float] = Field(None, description="Threshold value")
-    indicator2: Optional[str] = Field(None, description="Second indicator for crossover")
+    # Legacy flat form
+    indicator: Optional[str] = Field(None, description="Indicator name (legacy flat form)")
+    params: Optional[Dict[str, Any]] = Field(None, description="Indicator parameters (legacy)")
+    operator: Optional[Literal['>', '<', '>=', '<=', '==', 'CROSS_ABOVE', 'CROSS_BELOW']] = Field(None, description="Comparison operator (legacy)")
+    value: Optional[float] = Field(None, description="Threshold value (legacy)")
+    indicator2: Optional[str] = Field(None, description="Second indicator for crossover (legacy)")
+    # New expression form
+    expression: Optional['ConditionNode'] = Field(None, description="Boolean expression tree (new form)")
 
 
 class TriggerComponentConfig(BaseModel):
-    """Trigger component configuration (requirements JSON format)"""
-    type: Literal['CANDLE_PATTERN', 'PRICE_CROSSOVER', 'INDICATOR_CROSSOVER'] = Field(..., description="Trigger type")
+    """
+    Trigger component configuration (requirements JSON format).
+
+    Supports the same two authoring styles as :class:`SetupComponentConfig`:
+    legacy flat fields, or a single recursive ``expression`` evaluated to a
+    boolean column that becomes the BUY trigger (with ``signal_value``
+    controlling BUY vs SELL).
+    """
+    type: Literal['CANDLE_PATTERN', 'PRICE_CROSSOVER', 'INDICATOR_CROSSOVER', 'EXPRESSION'] = Field(..., description="Trigger type")
     timeframe: str = Field("1d", description="Candle interval for trigger")
     pattern: Optional[str] = Field(None, description="Candle pattern (for CANDLE_PATTERN type)")
     price_level: Optional[float] = Field(None, description="Price level (for PRICE_CROSSOVER type)")
@@ -251,17 +275,29 @@ class TriggerComponentConfig(BaseModel):
     indicator2: Optional[str] = Field(None, description="Second indicator (for INDICATOR_CROSSOVER)")
     crossover_type: Optional[Literal['GOLDEN_CROSS', 'DEATH_CROSS']] = Field(None, description="Crossover type")
     direction: Optional[Literal['ABOVE', 'BELOW']] = Field(None, description="Direction (for PRICE_CROSSOVER)")
+    # New expression form
+    expression: Optional['ConditionNode'] = Field(None, description="Boolean expression tree (new form)")
+    signal_value: Optional[Literal['BUY', 'SELL']] = Field('BUY', description="Signal emitted when expression is true")
 
 
 class ExitComponentConfig(BaseModel):
-    """Exit component configuration (requirements JSON format)"""
-    type: Literal['CONDITIONAL_OR_FIXED', 'STOP_LOSS_PCT', 'TAKE_PROFIT_PCT', 'TRAILING_STOP_PCT', 'TIME_BASED', 'INDICATOR_CROSS'] = Field(..., description="Exit type")
+    """
+    Exit component configuration (requirements JSON format).
+
+    Adds an optional ``expression`` for arbitrary boolean exit conditions.
+    Position-relative exits (STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRAILING_STOP_PCT,
+    TIME_BASED) continue to be extracted by the backtest handler and applied
+    by the Backtester against ``Position.entry_price`` / ``peak_price``.
+    """
+    type: Literal['CONDITIONAL_OR_FIXED', 'STOP_LOSS_PCT', 'TAKE_PROFIT_PCT', 'TRAILING_STOP_PCT', 'TIME_BASED', 'INDICATOR_CROSS', 'EXPRESSION'] = Field(..., description="Exit type")
     timeframe: str = Field("1d", description="Candle interval for exit")
     conditions: Optional[List[Dict[str, Any]]] = Field(None, description="Exit conditions (for CONDITIONAL_OR_FIXED)")
     value: Optional[float] = Field(None, description="Exit value (for percentage-based exits)")
     indicator: Optional[str] = Field(None, description="Indicator name (for INDICATOR_CROSS)")
     direction: Optional[Literal['UP', 'DOWN']] = Field(None, description="Cross direction (for INDICATOR_CROSS)")
     max_holding_days: Optional[int] = Field(None, description="Max holding days (for TIME_BASED)")
+    # New expression form
+    expression: Optional['ConditionNode'] = Field(None, description="Boolean expression tree (new form)")
 
 
 class RequirementsStrategyConfig(BaseModel):
@@ -294,3 +330,105 @@ class ExpandableStrategyConfig(BaseModel):
     # Performance tracking
     enabled: bool = Field(True, description="Whether strategy is enabled")
     priority: int = Field(0, description="Priority for scanning (higher = first)")
+
+
+# ============================================================================
+# Expression-Tree DSL (parametric, recursive condition grammar)
+# ============================================================================
+#
+# A tiny expression DSL backs the new ``EXPRESSION`` component type. Three
+# node families:
+#
+# 1. **Operands** — leaves that produce a Polars column:
+#    - ``IndicatorOperand``   {"indicator": "RSI", "params": {"period": 13}}
+#    - ``IndicatorOperand``   {"indicator": "MACD", "output": "signal"}
+#    - ``PriceOperand``       {"price": "close"}
+#    - ``ConstOperand``       {"const": 50}
+#
+# 2. **Comparators / patterns** — produce a boolean column:
+#    - ``CompareNode``        {"op": "CROSS_ABOVE", "left": ..., "right": ...}
+#    - ``PatternNode``        {"op": "PATTERN", "pattern": "DOJI"}
+#
+# 3. **Combinators** — boolean composition:
+#    - ``AndNode``            {"op": "AND", "conditions": [...]}
+#    - ``OrNode``             {"op": "OR",  "conditions": [...]}
+#    - ``NotNode``            {"op": "NOT", "condition": ...}
+#
+# Pydantic discriminated unions select the right model from the ``op``/
+# leaf-key shape. The evaluator (in ``strategies/expression.py``) walks the
+# tree, calls the indicator registry to materialise any missing columns, and
+# returns a single Polars expression.
+
+
+class IndicatorOperand(BaseModel):
+    """Operand: read a column produced by a registered indicator."""
+    indicator: str = Field(..., description="Indicator name registered in INDICATOR_REGISTRY (e.g. RSI, MACD, EMA)")
+    params: Optional[Dict[str, Any]] = Field(None, description="Indicator parameter overrides (e.g. {'period': 13})")
+    output: Optional[str] = Field(
+        None,
+        description=(
+            "Output role for multi-output indicators (e.g. 'signal' for MACD, "
+            "'upper' for BB). Defaults to the indicator's primary output."
+        ),
+    )
+
+
+class PriceOperand(BaseModel):
+    """Operand: read a raw OHLCV column."""
+    price: Literal['open', 'high', 'low', 'close', 'volume'] = Field(..., description="OHLCV column name")
+
+
+class ConstOperand(BaseModel):
+    """Operand: a numeric literal."""
+    const: float = Field(..., description="Numeric literal")
+
+
+Operand = Union[IndicatorOperand, PriceOperand, ConstOperand]
+
+
+class CompareNode(BaseModel):
+    """Boolean comparison or crossover between two operands."""
+    op: Literal['GT', 'LT', 'GTE', 'LTE', 'EQ', 'NEQ', 'CROSS_ABOVE', 'CROSS_BELOW'] = Field(..., description="Comparison operator")
+    left: Operand = Field(..., description="Left-hand operand")
+    right: Operand = Field(..., description="Right-hand operand")
+
+
+class PatternNode(BaseModel):
+    """Boolean output of a candle-pattern detector."""
+    op: Literal['PATTERN'] = 'PATTERN'
+    pattern: str = Field(..., description="Pattern name registered in PATTERN_REGISTRY (e.g. DOJI, HAMMER)")
+
+
+class AndNode(BaseModel):
+    """Logical AND of N child conditions."""
+    op: Literal['AND'] = 'AND'
+    conditions: List['ConditionNode'] = Field(..., min_items=1, description="Child conditions (AND-combined)")
+
+
+class OrNode(BaseModel):
+    """Logical OR of N child conditions."""
+    op: Literal['OR'] = 'OR'
+    conditions: List['ConditionNode'] = Field(..., min_items=1, description="Child conditions (OR-combined)")
+
+
+class NotNode(BaseModel):
+    """Logical NOT of a single child condition."""
+    op: Literal['NOT'] = 'NOT'
+    condition: 'ConditionNode' = Field(..., description="Child condition to negate")
+
+
+# Discriminated union so Pydantic picks the right model based on ``op``.
+ConditionNode = Annotated[
+    Union[CompareNode, PatternNode, AndNode, OrNode, NotNode],
+    Field(discriminator='op'),
+]
+
+
+# Recursive forward-ref resolution. Pydantic v2 needs an explicit rebuild on
+# any model that referenced ``ConditionNode`` by string before it existed.
+AndNode.model_rebuild()
+OrNode.model_rebuild()
+NotNode.model_rebuild()
+SetupComponentConfig.model_rebuild()
+TriggerComponentConfig.model_rebuild()
+ExitComponentConfig.model_rebuild()

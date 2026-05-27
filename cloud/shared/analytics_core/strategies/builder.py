@@ -10,7 +10,7 @@ Supports both legacy StrategyConfig format and new RequirementsStrategyConfig fo
 import polars as pl
 from typing import Dict, Any, Optional
 from ..models import (
-    StrategyConfig, SetupConfig, TriggerConfig, ExitConfig,
+    StrategyConfig,
     RequirementsStrategyConfig, SetupComponentConfig, TriggerComponentConfig, ExitComponentConfig,
     StepConfig
 )
@@ -21,8 +21,29 @@ from ..indicators.patterns import (
     detect_green_candle, detect_red_candle
 )
 from ..indicators.technicals import (
-    calculate_rsi, calculate_sma, calculate_ema, calculate_macd
+    calculate_rsi, calculate_macd,
+    rsi_col, macd_cols, bb_cols,
+    resolve_indicator,
 )
+from .expression import eval_condition
+
+
+# Maps each supported candle pattern to the entry direction it generates.
+# ``None`` means the pattern is intentionally neutral (e.g. DOJI is an
+# indecision pattern) and produces no BUY/SELL signal on its own.
+PATTERN_DIRECTION: Dict[str, Optional[str]] = {
+    'BULLISH_ENGULFING': 'BUY',
+    'ENGULFING_BULLISH': 'BUY',
+    'BEARISH_ENGULFING': 'SELL',
+    'ENGULFING_BEARISH': 'SELL',
+    'HAMMER': 'BUY',
+    'SHOOTING_STAR': 'SELL',
+    'MORNING_STAR': 'BUY',
+    'EVENING_STAR': 'SELL',
+    'GREEN_CANDLE': 'BUY',
+    'RED_CANDLE': 'SELL',
+    'DOJI': None,
+}
 
 class CompositeStrategy(BaseStrategy):
     """                            
@@ -152,7 +173,7 @@ class CompositeStrategy(BaseStrategy):
         df = df.with_columns([
             pl.lit(None).alias('exit_signal'),
             pl.lit(None).cast(pl.Float64).alias('exit_price'),
-        ])
+        ])  
         
         if exit_type == 'STOP_LOSS':
             return self._exit_stop_loss(df)
@@ -178,18 +199,20 @@ class CompositeStrategy(BaseStrategy):
     # Setup Methods
     
     def _setup_rsi_momentum(self, df: pl.DataFrame) -> pl.DataFrame:
-        """RSI momentum filter"""
+        """RSI momentum filter. Reads ``rsi_{period}`` (default period 14)."""
+        rsi_period = getattr(self.setup_config, 'rsi_period', None) or 14
+        df = calculate_rsi(df, period=rsi_period)
+        rsi_column = rsi_col(rsi_period)
+
         conditions = []
-        
         if self.setup_config.min_rsi is not None:
-            conditions.append(pl.col('rsi') >= self.setup_config.min_rsi)
-        
+            conditions.append(pl.col(rsi_column) >= self.setup_config.min_rsi)
         if self.setup_config.max_rsi is not None:
-            conditions.append(pl.col('rsi') <= self.setup_config.max_rsi)
-        
+            conditions.append(pl.col(rsi_column) <= self.setup_config.max_rsi)
+
         if not conditions:
             return df.with_columns(pl.lit(True).alias('setup_valid'))
-        
+
         return df.with_columns(
             pl.all_horizontal(conditions).alias('setup_valid')
         )
@@ -215,29 +238,44 @@ class CompositeStrategy(BaseStrategy):
             return df.with_columns(pl.lit(True).alias('setup_valid'))
     
     def _setup_macd_trend(self, df: pl.DataFrame) -> pl.DataFrame:
-        """MACD trend filter"""
+        """MACD trend filter. Reads parametric MACD/signal columns."""
         signal = self.setup_config.macd_signal
-        
+        fast = getattr(self.setup_config, 'macd_fast', None) or 12
+        slow = getattr(self.setup_config, 'macd_slow', None) or 26
+        sigp = getattr(self.setup_config, 'macd_signal_period', None) or 9
+        df = calculate_macd(df, fast_period=fast, slow_period=slow, signal_period=sigp)
+
+        cols = macd_cols(fast, slow, sigp)
+        macd_c, signal_c = cols['macd'], cols['signal']
+
         if signal == 'BULLISH':
             return df.with_columns(
-                (pl.col('macd') > pl.col('macd_signal')).alias('setup_valid')
+                (pl.col(macd_c) > pl.col(signal_c)).alias('setup_valid')
             )
         elif signal == 'BEARISH':
             return df.with_columns(
-                (pl.col('macd') < pl.col('macd_signal')).alias('setup_valid')
+                (pl.col(macd_c) < pl.col(signal_c)).alias('setup_valid')
             )
         else:
             return df.with_columns(pl.lit(True).alias('setup_valid'))
     
     def _setup_volume_trend(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Volume trend filter"""
+        """
+        Volume trend filter.
+
+        Compares the current bar's volume against the mean of the prior
+        ``VOLUME_TREND_LOOKBACK`` bars (shifted so the current bar is excluded).
+        This avoids the lookahead bias of ``df['volume'].mean()`` which would
+        use future bars when deciding the current bar's setup validity.
+        """
         multiplier = self.setup_config.volume_multiplier or 1.0
-        
-        # Calculate average volume
-        avg_volume = df['volume'].mean()
-        
+        lookback = 20  # bars; sensible default for daily and intraday timeframes
+
+        rolling_avg = pl.col('volume').rolling_mean(window_size=lookback).shift(1)
         return df.with_columns(
-            (pl.col('volume') >= (avg_volume * multiplier)).alias('setup_valid')
+            (pl.col('volume') >= (rolling_avg * multiplier))
+            .fill_null(False)
+            .alias('setup_valid')
         )
     
     # Trigger Methods
@@ -357,10 +395,11 @@ class CompositeStrategy(BaseStrategy):
         setup_mask = pl.col('setup_valid')
         
         if breakout_type == 'BOLLINGER_UPPER':
-            # Price breaks above upper Bollinger Band
+            # Price breaks above upper Bollinger Band (default 20/2.0).
+            bb_upper_col = bb_cols(20, 2.0)['upper']
             breakout = (
-                (pl.col('close') > pl.col('bb_upper')) &
-                (pl.col('close').shift(1) <= pl.col('bb_upper').shift(1))
+                (pl.col('close') > pl.col(bb_upper_col)) &
+                (pl.col('close').shift(1) <= pl.col(bb_upper_col).shift(1))
             )
             return df.with_columns(
                 pl.when(setup_mask & breakout)
@@ -379,11 +418,12 @@ class CompositeStrategy(BaseStrategy):
         setup_mask = pl.col('setup_valid')
         
         if reversal_type == 'RSI_OVERSOLD':
-            # RSI was oversold (<30) and now bouncing back
+            # RSI was oversold (<30) and now bouncing back. Default RSI(14).
+            rsi_column = rsi_col(14)
             reversal = (
-                (pl.col('rsi') > 30) &
-                (pl.col('rsi').shift(1) <= 30) &
-                (pl.col('close') > pl.col('open'))  # Bullish candle
+                (pl.col(rsi_column) > 30) &
+                (pl.col(rsi_column).shift(1) <= 30) &
+                (pl.col('close') > pl.col('open'))
             )
             return df.with_columns(
                 pl.when(setup_mask & reversal)
@@ -393,11 +433,12 @@ class CompositeStrategy(BaseStrategy):
             )
         
         elif reversal_type == 'RSI_OVERBOUGHT':
-            # RSI was overbought (>70) and now reversing
+            # RSI was overbought (>70) and now reversing. Default RSI(14).
+            rsi_column = rsi_col(14)
             reversal = (
-                (pl.col('rsi') < 70) &
-                (pl.col('rsi').shift(1) >= 70) &
-                (pl.col('close') < pl.col('open'))  # Bearish candle
+                (pl.col(rsi_column) < 70) &
+                (pl.col(rsi_column).shift(1) >= 70) &
+                (pl.col('close') < pl.col('open'))
             )
             return df.with_columns(
                 pl.when(setup_mask & reversal)
@@ -508,44 +549,39 @@ class CompositeStrategy(BaseStrategy):
             raise ValueError(f"Unknown step name: {step_name}")
     
     def _execute_setup_requirements(self, setup: SetupComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
-        """Execute setup step in requirements format"""
+        """Execute setup step in requirements format."""
         if setup.type == 'NONE':
             return df.with_columns(pl.lit(True).alias('setup_valid'))
-        
+
         elif setup.type == 'INDICATOR_THRESHOLD':
             return self._setup_indicator_threshold(setup, df)
-        
+
+        elif setup.type == 'EXPRESSION':
+            if setup.expression is None:
+                raise ValueError("EXPRESSION setup requires 'expression' field")
+            df, expr = eval_condition(setup.expression, df)
+            return df.with_columns(expr.fill_null(False).alias('setup_valid'))
+
         else:
             raise ValueError(f"Unknown setup type: {setup.type}")
     
     def _setup_indicator_threshold(self, setup: SetupComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
-        """Setup using indicator threshold (requirements format)"""
-        indicator = setup.indicator.upper()
+        """
+        Setup using indicator threshold (requirements format).
+
+        The indicator name + params are resolved via the central
+        ``resolve_indicator`` registry, so adding a new indicator anywhere in
+        ``indicators/technicals.py:INDICATOR_REGISTRY`` automatically exposes
+        it here without touching this dispatcher.
+        """
         operator = setup.operator
         value = setup.value
-        
-        # Calculate indicator if not present
-        if indicator == 'RSI':
-            period = setup.params.get('period', 14) if setup.params else 14
-            if 'rsi' not in df.columns:
-                df = calculate_rsi(df, period=period)
-            indicator_col = 'rsi'
-        elif indicator.startswith('SMA'):
-            period = setup.params.get('period', 20) if setup.params else 20
-            indicator_col = f'sma_{period}'
-            if indicator_col not in df.columns:
-                df = calculate_sma(df, period=period)
-        elif indicator.startswith('EMA'):
-            period = setup.params.get('period', 12) if setup.params else 12
-            indicator_col = f'ema_{period}'
-            if indicator_col not in df.columns:
-                df = calculate_ema(df, period=period)
-        else:
-            raise ValueError(f"Unsupported indicator for threshold: {indicator}")
-        
-        # Apply operator
+
+        resolved = resolve_indicator(setup.indicator, setup.params)
+        indicator_col = resolved['column']
+        df = resolved['calc'](df)
+
         if operator == 'CROSS_ABOVE':
-            # Indicator crosses above value or another indicator
             if setup.indicator2:
                 indicator2_col = setup.indicator2
                 condition = (pl.col(indicator_col) > pl.col(indicator2_col)) & \
@@ -573,28 +609,41 @@ class CompositeStrategy(BaseStrategy):
             condition = pl.col(indicator_col) == value
         else:
             raise ValueError(f"Unsupported operator: {operator}")
-        
+
         return df.with_columns(condition.alias('setup_valid'))
     
     def _execute_trigger_requirements(self, trigger: TriggerComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
-        """Execute trigger step in requirements format"""
-        # Initialize signal column
+        """Execute trigger step in requirements format."""
         if 'signal' not in df.columns:
             df = df.with_columns(pl.lit('HOLD').alias('signal'))
-        
+
         if trigger.type == 'CANDLE_PATTERN':
             return self._trigger_candle_pattern_requirements(trigger, df)
         elif trigger.type == 'PRICE_CROSSOVER':
             return self._trigger_price_crossover_requirements(trigger, df)
         elif trigger.type == 'INDICATOR_CROSSOVER':
             return self._trigger_indicator_crossover_requirements(trigger, df)
+        elif trigger.type == 'EXPRESSION':
+            if trigger.expression is None:
+                raise ValueError("EXPRESSION trigger requires 'expression' field")
+            df, expr = eval_condition(trigger.expression, df)
+            # Only emit signals when the upstream setup is valid (or default
+            # to always-valid when no setup column was produced).
+            setup_mask = pl.col('setup_valid') if 'setup_valid' in df.columns else pl.lit(True)
+            signal_value = trigger.signal_value or 'BUY'
+            return df.with_columns(
+                pl.when(setup_mask & expr.fill_null(False))
+                .then(pl.lit(signal_value))
+                .otherwise(pl.col('signal'))
+                .alias('signal')
+            )
         else:
             raise ValueError(f"Unknown trigger type: {trigger.type}")
     
     def _trigger_candle_pattern_requirements(self, trigger: TriggerComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
         """Trigger using candle pattern (requirements format)"""
         pattern = trigger.pattern
-        
+
         # Detect patterns
         if pattern in ['BULLISH_ENGULFING', 'ENGULFING_BULLISH']:
             df = detect_engulfing_bullish(df)
@@ -625,11 +674,21 @@ class CompositeStrategy(BaseStrategy):
             condition = pl.col('red_candle')
         else:
             raise ValueError(f"Unknown candle pattern: {pattern}")
-        
-        # Only trigger when setup is valid
+
+        # Only trigger when setup is valid (or no setup column → unconditional).
         setup_mask = pl.col('setup_valid') if 'setup_valid' in df.columns else pl.lit(True)
-        signal_value = 'BUY' if 'BULLISH' in pattern or pattern in ['HAMMER', 'MORNING_STAR', 'GREEN_CANDLE'] else 'SELL'
-        
+
+        if pattern not in PATTERN_DIRECTION:
+            raise ValueError(
+                f"Pattern {pattern!r} has no entry direction defined; add it "
+                "to PATTERN_DIRECTION in builder.py if it should generate a signal."
+            )
+        signal_value = PATTERN_DIRECTION[pattern]
+        if signal_value is None:
+            # Neutral pattern (e.g. DOJI) — detection still runs so callers
+            # can inspect the boolean column, but no BUY/SELL is emitted.
+            return df
+
         return df.with_columns(
             pl.when(setup_mask & condition)
             .then(pl.lit(signal_value))
@@ -696,7 +755,7 @@ class CompositeStrategy(BaseStrategy):
         )
     
     def _execute_exit_requirements(self, exit: ExitComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
-        """Execute exit step in requirements format"""
+        """Execute exit step in requirements format."""
         if exit.type == 'CONDITIONAL_OR_FIXED':
             return self._exit_conditional_or_fixed(exit, df)
         elif exit.type == 'STOP_LOSS_PCT':
@@ -709,61 +768,82 @@ class CompositeStrategy(BaseStrategy):
             return self._exit_time_based_requirements(exit, df)
         elif exit.type == 'INDICATOR_CROSS':
             return self._exit_indicator_cross(exit, df)
+        elif exit.type == 'EXPRESSION':
+            if exit.expression is None:
+                raise ValueError("EXPRESSION exit requires 'expression' field")
+            df, expr = eval_condition(exit.expression, df)
+            if 'exit_signal' not in df.columns:
+                df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias('exit_signal'))
+            return df.with_columns(
+                pl.when(expr.fill_null(False))
+                .then(pl.lit('SELL'))
+                .otherwise(pl.col('exit_signal'))
+                .alias('exit_signal')
+            )
         else:
             raise ValueError(f"Unknown exit type: {exit.type}")
     
     def _exit_conditional_or_fixed(self, exit: ExitComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
-        """Exit with conditional OR fixed rules (requirements format)"""
-        # Initialize exit columns
+        """
+        Conditional / fixed exit step (requirements format).
+
+        Only **position-independent** conditions are evaluated here, i.e.
+        conditions that can be expressed as a vectorised function of OHLCV +
+        indicators on a single bar:
+
+        - ``INDICATOR_CROSS`` (e.g. RSI crosses below 70)
+
+        Position-relative conditions (``STOP_LOSS_PCT``, ``TAKE_PROFIT_PCT``,
+        ``TRAILING_STOP_PCT``, ``TIME_BASED``) require knowing the *entry*
+        price/date which the strategy layer does not have. Those are extracted
+        from the same JSON by ``backtest_handler.lambda_handler`` (see
+        ``cloud/serving_layer/lambda_functions/backtester/backtest_handler.py``)
+        and forwarded to ``Backtester.run(...)`` as keyword arguments, where
+        they are enforced correctly against ``Position.entry_price`` /
+        ``peak_price``.
+        """
         if 'exit_signal' not in df.columns:
             df = df.with_columns([
-                pl.lit(None).alias('exit_signal'),
+                pl.lit(None).cast(pl.Utf8).alias('exit_signal'),
                 pl.lit(None).cast(pl.Float64).alias('exit_price'),
             ])
-        
-        # Apply each condition (OR logic - any condition triggers exit)
+
         exit_conditions = []
-        
+
         for condition_dict in exit.conditions or []:
             cond_type = condition_dict.get('type')
-            
-            if cond_type == 'STOP_LOSS_PCT':
-                stop_pct = condition_dict.get('value', 0.05)
-                stop_price = pl.col('close') * (1 - stop_pct)
-                exit_conditions.append(pl.col('close') <= stop_price)
-            
-            elif cond_type == 'TAKE_PROFIT_PCT':
-                profit_pct = condition_dict.get('value', 0.10)
-                profit_price = pl.col('close') * (1 + profit_pct)
-                exit_conditions.append(pl.col('close') >= profit_price)
-            
-            elif cond_type == 'INDICATOR_CROSS':
+
+            if cond_type == 'INDICATOR_CROSS':
                 indicator = condition_dict.get('indicator')
                 direction = condition_dict.get('direction', 'DOWN')
+                value = condition_dict.get('value')
+                if not indicator or indicator not in df.columns or value is None:
+                    continue
                 if direction == 'DOWN':
                     exit_conditions.append(
-                        (pl.col(indicator) < pl.col(indicator).shift(1)) &
-                        (pl.col(indicator).shift(1) >= condition_dict.get('value', 70))
+                        (pl.col(indicator) < value)
+                        & (pl.col(indicator).shift(1) >= value)
                     )
                 else:
                     exit_conditions.append(
-                        (pl.col(indicator) > pl.col(indicator).shift(1)) &
-                        (pl.col(indicator).shift(1) <= condition_dict.get('value', 30))
+                        (pl.col(indicator) > value)
+                        & (pl.col(indicator).shift(1) <= value)
                     )
-        
-        # Combine with OR logic
+            # STOP_LOSS_PCT / TAKE_PROFIT_PCT / TRAILING_STOP_PCT / TIME_BASED:
+            # intentionally skipped here — enforced by Backtester (position-relative).
+
         if exit_conditions:
             combined_condition = exit_conditions[0]
             for cond in exit_conditions[1:]:
                 combined_condition = combined_condition | cond
-            
+
             return df.with_columns(
                 pl.when(combined_condition)
                 .then(pl.lit('SELL'))
                 .otherwise(pl.col('exit_signal'))
                 .alias('exit_signal')
             )
-        
+
         return df
     
     def _exit_stop_loss_pct(self, exit: ExitComponentConfig, df: pl.DataFrame) -> pl.DataFrame:
