@@ -217,8 +217,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Run backtest
         backtester = Backtester(initial_capital=initial_capital)
         
-        # Extract exit parameters from components. The Backtester applies
-        # these as OR-composed exits; the JSON layer just collects them.
+        # Extract position-relative exit parameters from the JSON. The
+        # Backtester applies these as OR-composed exits; the JSON layer just
+        # collects them. Two authoring shapes are supported and treated
+        # symmetrically — a single top-level rule (e.g. just `STOP_LOSS_PCT`)
+        # and the `CONDITIONAL_OR_FIXED` wrapper that bundles multiple rules.
         exit_component = components.get('exit', {})
         stop_loss_pct = None
         take_profit_pct = None
@@ -226,24 +229,39 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         max_holding_days = None
         stop_loss_anchor = None
         stop_loss_anchor_offset_pct = 0.0
+
+        def _extract_leaf(cond: Dict[str, Any]) -> None:
+            """Read one leaf exit rule into the local accumulators above.
+
+            Shared by both authoring shapes so top-level and
+            `CONDITIONAL_OR_FIXED.conditions[]` behave identically. Unknown
+            types are silently skipped — the vectorized leaves
+            (`INDICATOR_CROSS`, `EXPRESSION`) are handled by the strategy
+            layer's `_execute_exit_requirements`, not here.
+            """
+            nonlocal stop_loss_pct, take_profit_pct, trailing_stop_pct
+            nonlocal max_holding_days, stop_loss_anchor, stop_loss_anchor_offset_pct
+            ctype = cond.get('type')
+            if ctype == 'STOP_LOSS_PCT':
+                stop_loss_pct = cond.get('value')
+            elif ctype == 'TAKE_PROFIT_PCT':
+                take_profit_pct = cond.get('value')
+            elif ctype == 'TRAILING_STOP_PCT':
+                trailing_stop_pct = cond.get('value')
+            elif ctype == 'TIME_BASED':
+                max_holding_days = cond.get('max_holding_days') or cond.get('value')
+            elif ctype == 'STOP_LOSS_ANCHOR':
+                stop_loss_anchor = cond.get('anchor')
+                stop_loss_anchor_offset_pct = float(cond.get('offset_pct') or 0.0)
+
         if exit_component.get('type') == 'CONDITIONAL_OR_FIXED':
-            conditions = exit_component.get('conditions', [])
-            for cond in conditions:
-                if cond.get('type') == 'STOP_LOSS_PCT':
-                    stop_loss_pct = cond.get('value')
-                elif cond.get('type') == 'TAKE_PROFIT_PCT':
-                    take_profit_pct = cond.get('value')
-                elif cond.get('type') == 'TRAILING_STOP_PCT':
-                    trailing_stop_pct = cond.get('value')
-                elif cond.get('type') == 'TIME_BASED':
-                    max_holding_days = cond.get('max_holding_days') or cond.get('value')
-                elif cond.get('type') == 'STOP_LOSS_ANCHOR':
-                    stop_loss_anchor = cond.get('anchor')
-                    stop_loss_anchor_offset_pct = float(cond.get('offset_pct') or 0.0)
-        # Standalone top-level exits (parity with STOP_LOSS_PCT etc.)
-        elif exit_component.get('type') == 'STOP_LOSS_ANCHOR':
-            stop_loss_anchor = exit_component.get('anchor')
-            stop_loss_anchor_offset_pct = float(exit_component.get('offset_pct') or 0.0)
+            for cond in exit_component.get('conditions', []) or []:
+                _extract_leaf(cond)
+        else:
+            # Single top-level rule: extract it the same way so a user can
+            # author e.g. `{"type": "TIME_BASED", "max_holding_days": 20}` as
+            # a one-rule exit and have it enforced.
+            _extract_leaf(exit_component)
         try:
             backtest_result = backtester.run(
                 strategy=strategy,

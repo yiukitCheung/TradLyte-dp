@@ -1,0 +1,6 @@
+# snapshot_builder Lambda dependencies
+# boto3 is pre-installed in the Lambda runtime — not listed here.
+# polars          → native Parquet read/write (no pyarrow needed) + dedupe/trim
+# psycopg2-binary → direct RDS reads (self-contained; does not import shared/)
+polars>=0.20.0
+psycopg2-binary>=2.9.9
