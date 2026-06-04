@@ -3,6 +3,19 @@ Base Strategy Class - Supports Expandable Step-Based Architecture
 
 Legacy 3-step structure (setup/trigger/exit) is still supported for backward compatibility.
 New expandable architecture supports N steps with individual timeframes.
+
+Partition awareness
+--------------------
+A strategy may be evaluated on a *single-symbol* frame (the backtester / serving
+layer) or on a *multi-symbol* long-format frame (the full-universe vectorized
+scanner). Cross-row operations (``shift``, ``rolling_*``, ``ewm_mean``,
+``diff``, aggregates) must NOT bleed across symbols on a multi-symbol frame.
+
+To support both with a single implementation, ``run()`` accepts an optional
+``partition_by`` key. Subclasses wrap any cross-row expression in
+``self._w(expr)``: when a partition is active it expands to
+``expr.over(partition_by)``; otherwise the expression is returned unchanged so
+the single-symbol path stays byte-for-byte identical to before.
 """
 
 from abc import ABC, abstractmethod
@@ -27,6 +40,22 @@ class BaseStrategy(ABC):
         self.description = description
         self.steps = steps  # Expandable steps (None = use legacy 3-step mode)
         self._use_expandable_mode = steps is not None and len(steps) > 0
+        # Active partition key for the current run() call. None => single-symbol
+        # frame; cross-row ops run unpartitioned (legacy behavior).
+        self._partition_by: Optional[str] = None
+
+    def _w(self, expr: pl.Expr) -> pl.Expr:
+        """
+        Partition a cross-row expression when running on a multi-symbol frame.
+
+        Returns ``expr.over(self._partition_by)`` while a partition is active
+        (e.g. ``"symbol"`` in the vectorized scanner) and ``expr`` unchanged
+        otherwise. Wrap EVERY ``shift`` / ``rolling_*`` / ``ewm_mean`` / ``diff``
+        / aggregate that must stay within a single symbol.
+        """
+        if self._partition_by:
+            return expr.over(self._partition_by)
+        return expr
     
     @abstractmethod
     def setup(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -76,22 +105,33 @@ class BaseStrategy(ABC):
         """
         pass
     
-    def run(self, df: pl.DataFrame) -> pl.DataFrame:
+    def run(self, df: pl.DataFrame, partition_by: Optional[str] = None) -> pl.DataFrame:
         """
         Execute the strategy (supports both legacy 3-step and expandable modes)
         
         Args:
-            df: OHLCV dataframe (must have indicators pre-calculated)
+            df: OHLCV dataframe (must have indicators pre-calculated). When
+                ``partition_by`` is set, ``df`` may contain many symbols stacked
+                long-format and MUST be sorted by ``[partition_by, date]`` so
+                rolling / shift windows are well-defined per group.
+            partition_by: optional column (e.g. ``"symbol"``) that bounds all
+                cross-row operations to a single group. ``None`` (default)
+                preserves the original single-symbol behavior exactly.
             
         Returns:
             DataFrame with all strategy columns added
         """
-        if self._use_expandable_mode:
-            # Expandable step-based execution
-            return self._run_expandable(df)
-        else:
-            # Legacy 3-step execution (backward compatibility)
-            return self._run_legacy(df)
+        prev_partition = self._partition_by
+        self._partition_by = partition_by
+        try:
+            if self._use_expandable_mode:
+                # Expandable step-based execution
+                return self._run_expandable(df)
+            else:
+                # Legacy 3-step execution (backward compatibility)
+                return self._run_legacy(df)
+        finally:
+            self._partition_by = prev_partition
     
     def _run_legacy(self, df: pl.DataFrame) -> pl.DataFrame:
         """Legacy 3-step execution (backward compatibility)"""

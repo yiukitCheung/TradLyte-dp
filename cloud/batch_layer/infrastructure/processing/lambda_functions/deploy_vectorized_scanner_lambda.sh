@@ -6,8 +6,9 @@
 # universe with Polars, and writes raw signals to daily_scan_signals (the same
 # staging table the existing aggregator reads).
 #
-# Self-contained: bundles polars + psycopg2-binary + the standalone
-# analytics_core/vectorized_scanner.py module (copied to the package root).
+# Self-contained: bundles polars + psycopg2-binary + pydantic + the whole
+# analytics_core package (so the runner uses the shared, partition-aware
+# strategy library — the same code the per-symbol scanner/backtester run).
 #
 # Usage:
 #   ./deploy_vectorized_scanner_lambda.sh            # update existing function
@@ -71,7 +72,7 @@ echo "Region:       $AWS_REGION"
 echo "Function:     $FUNCTION_NAME"
 echo "Handler:      $LAMBDA_HANDLER"
 echo "Source:       $PROCESSING_DIR/lambda_functions/${FILE_NAME}.py"
-echo "Bundled mod:  $SHARED_DIR/analytics_core/vectorized_scanner.py"
+echo "Bundled pkg:  $SHARED_DIR/analytics_core (partition-aware strategy library)"
 echo "Mode:         $( $CREATE_MODE && echo 'CREATE + DEPLOY' || echo 'UPDATE (code only)' )"
 
 if ! command -v aws &>/dev/null; then echo "ERROR: aws CLI not found."; exit 1; fi
@@ -89,9 +90,16 @@ $PIP_CMD install -r "$REQUIREMENTS" -t "$PACKAGE_DIR" \
     --python-version 3.11 --implementation cp --no-cache-dir --quiet 2>/dev/null \
 || $PIP_CMD install -r "$REQUIREMENTS" -t "$PACKAGE_DIR" --no-cache-dir --quiet
 
-echo "Copying Lambda source + bundled scanner module..."
+echo "Copying Lambda source + bundled analytics_core package..."
 cp "$PROCESSING_DIR/lambda_functions/${FILE_NAME}.py" "$PACKAGE_DIR/${FILE_NAME}.py"
-cp "$SHARED_DIR/analytics_core/vectorized_scanner.py" "$PACKAGE_DIR/vectorized_scanner.py"
+# Bundle the whole analytics_core package so the runner imports the shared,
+# partition-aware strategy library (single source of truth for signal logic).
+# Strip dev-only / runtime-irrelevant subtrees to keep the package lean.
+rm -rf "$PACKAGE_DIR/analytics_core"
+cp -r "$SHARED_DIR/analytics_core" "$PACKAGE_DIR/analytics_core"
+rm -rf "$PACKAGE_DIR/analytics_core/_spikes" \
+       "$PACKAGE_DIR/analytics_core/tests" \
+       "$PACKAGE_DIR/analytics_core"/*.egg-info
 
 echo "Removing cache files..."
 find "$PACKAGE_DIR" -name "*.pyc" -delete

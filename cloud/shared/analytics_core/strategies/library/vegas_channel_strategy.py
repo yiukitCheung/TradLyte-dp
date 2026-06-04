@@ -57,11 +57,11 @@ class VegasChannelStrategy(BaseStrategy):
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
     def _ensure_emas(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Ensure all required EMAs are calculated"""
+        """Ensure all required EMAs are calculated (partition-aware)"""
         for period in self.required_emas:
             ema_col = f'ema_{period}'
             if ema_col not in df.columns:
-                df = calculate_ema(df, period=period)
+                df = calculate_ema(df, period=period, partition_by=self._partition_by)
         return df
     
     def _calculate_velocity_status(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -149,22 +149,20 @@ class VegasChannelStrategy(BaseStrategy):
         df = self._calculate_velocity_status(df)
 
         df = df.with_columns([
-            # Count velocity loss and maintained in the last obs_window
-            pl.col("velocity_status").map_elements(
-                lambda s: 1 if s in ["velocity_loss", "velocity_weak", "velocity_negotiating"] else 0,
-                return_dtype=pl.Int32
-            ).alias("loss_flag"),
-            # Count velocity maintained in the last obs_window
-            pl.col("velocity_status").map_elements(
-                lambda s: 1 if s == "velocity_maintained" else 0,
-                return_dtype=pl.Int32
-            ).alias("maintain_flag")
+            # Flag whether each candle is a loss-ish or a maintained candle.
+            # Vectorized ``is_in`` / ``==`` replaces the old per-row map_elements
+            # (which forced a Python callback per row over the whole universe).
+            pl.col("velocity_status")
+            .is_in(["velocity_loss", "velocity_weak", "velocity_negotiating"])
+            .cast(pl.Int32)
+            .alias("loss_flag"),
+            (pl.col("velocity_status") == "velocity_maintained").cast(pl.Int32).alias("maintain_flag"),
         ])
 
-        # Sum the velocity loss and maintained in the last obs_window
+        # Sum the velocity loss and maintained in the last obs_window (per group)
         df = df.with_columns([
-            pl.col("loss_flag").rolling_sum(window_size=obs_window).alias("count_velocity_loss"),
-            pl.col("maintain_flag").rolling_sum(window_size=obs_window).alias("count_velocity_maintained")
+            self._w(pl.col("loss_flag").rolling_sum(window_size=obs_window)).alias("count_velocity_loss"),
+            self._w(pl.col("maintain_flag").rolling_sum(window_size=obs_window)).alias("count_velocity_maintained"),
         ])
 
         lng_term_max = pl.max_horizontal(pl.col("ema_144"), pl.col("ema_169"))
@@ -193,8 +191,8 @@ class VegasChannelStrategy(BaseStrategy):
         # Same for decelerated. Matches notebook: "accelerated not in previous_window" and allow_new_alert after 30.
         accel_flag = (pl.col("momentum_signal") == "accelerated").cast(pl.Int32)
         decel_flag = (pl.col("momentum_signal") == "decelerated").cast(pl.Int32)
-        accel_in_prev_30 = accel_flag.shift(1).rolling_sum(window_size=30)
-        decel_in_prev_30 = decel_flag.shift(1).rolling_sum(window_size=30)
+        accel_in_prev_30 = self._w(accel_flag.shift(1).rolling_sum(window_size=30))
+        decel_in_prev_30 = self._w(decel_flag.shift(1).rolling_sum(window_size=30))
         df = df.with_columns([
             pl.when(
                 (pl.col("momentum_signal") == "accelerated") & (accel_in_prev_30 > 0)
@@ -215,14 +213,19 @@ class VegasChannelStrategy(BaseStrategy):
 
         Requires at least 169 candles (longest EMA period). Setup valid when
         momentum is accelerating OR velocity is maintained (interval-agnostic).
-        """
-        if df.height < self.MIN_CANDLES:
-            return df.with_columns(pl.lit(False).alias("setup_valid"))
 
+        The min-history guard is expressed as a partition-aware row count rather
+        than an early ``return``: on a single-symbol frame ``self._w(pl.len())``
+        is the symbol's bar count (same effect as ``df.height``); on a
+        multi-symbol frame it is the per-symbol count, so short-history symbols
+        are individually forced ``setup_valid = False`` without aborting the
+        whole universe.
+        """
         df = self._ensure_emas(df)
         df = self._calculate_momentum_signal(df)
         df = self._calculate_velocity_status(df)
-        setup_condition = (
+        enough_history = self._w(pl.len()) >= self.MIN_CANDLES
+        setup_condition = enough_history & (
             (pl.col("momentum_signal") == "accelerated") |
             (pl.col("velocity_status") == "velocity_maintained")
         )

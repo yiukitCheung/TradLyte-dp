@@ -32,6 +32,22 @@ import polars as pl
 
 
 # ----------------------------------------------------------------------------
+# Partition helper
+# ----------------------------------------------------------------------------
+#
+# Indicators contain cross-row operations (rolling_*, ewm_mean, diff, shift).
+# On a single-symbol frame they are correct as-is. On a multi-symbol long-format
+# frame (the full-universe scanner) every such op must stay within one symbol,
+# else one symbol's tail bleeds into the next symbol's head. Pass
+# ``partition_by="symbol"`` to scope the whole indicator expression to its group
+# via ``.over(...)``. Default ``None`` preserves the original behavior exactly.
+
+def _over(expr: "pl.Expr", partition_by: Optional[str]) -> "pl.Expr":
+    """Wrap ``expr`` in ``.over(partition_by)`` when a partition key is given."""
+    return expr.over(partition_by) if partition_by else expr
+
+
+# ----------------------------------------------------------------------------
 # Column-name helpers
 # ----------------------------------------------------------------------------
 
@@ -88,7 +104,12 @@ def stoch_cols(k_period: int, d_period: int) -> Dict[str, str]:
 # Indicators
 # ----------------------------------------------------------------------------
 
-def calculate_rsi(df: pl.DataFrame, period: int = 14, price_col: str = "close") -> pl.DataFrame:
+def calculate_rsi(
+    df: pl.DataFrame,
+    period: int = 14,
+    price_col: str = "close",
+    partition_by: Optional[str] = None,
+) -> pl.DataFrame:
     """Calculate RSI. Emits column ``rsi_{period}``."""
     out_col = rsi_col(period)
     if out_col in df.columns:
@@ -104,26 +125,36 @@ def calculate_rsi(df: pl.DataFrame, period: int = 14, price_col: str = "close") 
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
 
-    return df.with_columns(rsi.alias(out_col))
+    return df.with_columns(_over(rsi, partition_by).alias(out_col))
 
 
-def calculate_sma(df: pl.DataFrame, period: int, price_col: str = "close") -> pl.DataFrame:
+def calculate_sma(
+    df: pl.DataFrame,
+    period: int,
+    price_col: str = "close",
+    partition_by: Optional[str] = None,
+) -> pl.DataFrame:
     """Calculate SMA. Emits column ``sma_{period}``."""
     out_col = sma_col(period)
     if out_col in df.columns:
         return df
     sma = pl.col(price_col).rolling_mean(window_size=period)
-    return df.with_columns(sma.alias(out_col))
+    return df.with_columns(_over(sma, partition_by).alias(out_col))
 
 
-def calculate_ema(df: pl.DataFrame, period: int, price_col: str = "close") -> pl.DataFrame:
+def calculate_ema(
+    df: pl.DataFrame,
+    period: int,
+    price_col: str = "close",
+    partition_by: Optional[str] = None,
+) -> pl.DataFrame:
     """Calculate EMA. Emits column ``ema_{period}``."""
     out_col = ema_col(period)
     if out_col in df.columns:
         return df
     alpha = 2.0 / (period + 1)
     ema = pl.col(price_col).ewm_mean(alpha=alpha, adjust=False)
-    return df.with_columns(ema.alias(out_col))
+    return df.with_columns(_over(ema, partition_by).alias(out_col))
 
 
 def calculate_macd(
@@ -132,6 +163,7 @@ def calculate_macd(
     slow_period: int = 26,
     signal_period: int = 9,
     price_col: str = "close",
+    partition_by: Optional[str] = None,
 ) -> pl.DataFrame:
     """
     Calculate MACD. Emits three parametric columns; see ``macd_cols``.
@@ -147,9 +179,9 @@ def calculate_macd(
     histogram = macd_line - signal_line
 
     return df.with_columns([
-        macd_line.alias(cols["macd"]),
-        signal_line.alias(cols["signal"]),
-        histogram.alias(cols["histogram"]),
+        _over(macd_line, partition_by).alias(cols["macd"]),
+        _over(signal_line, partition_by).alias(cols["signal"]),
+        _over(histogram, partition_by).alias(cols["histogram"]),
     ])
 
 
@@ -158,6 +190,7 @@ def calculate_bollinger_bands(
     period: int = 20,
     std_dev: float = 2.0,
     price_col: str = "close",
+    partition_by: Optional[str] = None,
 ) -> pl.DataFrame:
     """Calculate Bollinger Bands. See ``bb_cols`` for output column names."""
     cols = bb_cols(period, std_dev)
@@ -170,13 +203,17 @@ def calculate_bollinger_bands(
     lower = sma - (std * std_dev)
 
     return df.with_columns([
-        sma.alias(cols["middle"]),
-        upper.alias(cols["upper"]),
-        lower.alias(cols["lower"]),
+        _over(sma, partition_by).alias(cols["middle"]),
+        _over(upper, partition_by).alias(cols["upper"]),
+        _over(lower, partition_by).alias(cols["lower"]),
     ])
 
 
-def calculate_atr(df: pl.DataFrame, period: int = 14) -> pl.DataFrame:
+def calculate_atr(
+    df: pl.DataFrame,
+    period: int = 14,
+    partition_by: Optional[str] = None,
+) -> pl.DataFrame:
     """Calculate ATR. Emits column ``atr_{period}``."""
     out_col = atr_col(period)
     if out_col in df.columns:
@@ -187,13 +224,14 @@ def calculate_atr(df: pl.DataFrame, period: int = 14) -> pl.DataFrame:
     low_close = (pl.col("low") - pl.col("close").shift(1)).abs()
     tr = pl.max_horizontal([high_low, high_close, low_close])
     atr = tr.rolling_mean(window_size=period)
-    return df.with_columns(atr.alias(out_col))
+    return df.with_columns(_over(atr, partition_by).alias(out_col))
 
 
 def calculate_stochastic(
     df: pl.DataFrame,
     k_period: int = 14,
     d_period: int = 3,
+    partition_by: Optional[str] = None,
 ) -> pl.DataFrame:
     """Calculate Stochastic Oscillator. See ``stoch_cols`` for output names."""
     cols = stoch_cols(k_period, d_period)
@@ -205,8 +243,8 @@ def calculate_stochastic(
     k_percent = 100 * ((pl.col("close") - lowest_low) / (highest_high - lowest_low))
     d_percent = k_percent.rolling_mean(window_size=d_period)
     return df.with_columns([
-        k_percent.alias(cols["k"]),
-        d_percent.alias(cols["d"]),
+        _over(k_percent, partition_by).alias(cols["k"]),
+        _over(d_percent, partition_by).alias(cols["d"]),
     ])
 
 
@@ -315,13 +353,18 @@ def resolve_indicator(
     return {"column": column_map[role], "calc": _calc, "params": merged}
 
 
-def calculate_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
+def calculate_all_indicators(
+    df: pl.DataFrame,
+    partition_by: Optional[str] = None,
+) -> pl.DataFrame:
     """
     Pre-compute a curated bundle of canonical indicators for scanner /
     notebook use. All columns use the new parametric naming convention.
 
     Args:
         df: DataFrame with OHLCV data.
+        partition_by: optional group key (e.g. ``"symbol"``) to scope every
+            indicator to a single group on a multi-symbol long-format frame.
 
     Returns:
         DataFrame with the canonical indicator columns added.
@@ -331,27 +374,27 @@ def calculate_all_indicators(df: pl.DataFrame) -> pl.DataFrame:
         df = df.with_columns([pl.col(c).cast(pl.Float64) for c in ohlcv])
 
     # RSI (default period)
-    df = calculate_rsi(df, period=14)
+    df = calculate_rsi(df, period=14, partition_by=partition_by)
 
     # SMAs (canonical periods used across the codebase)
     for period in (20, 50, 200):
-        df = calculate_sma(df, period=period)
+        df = calculate_sma(df, period=period, partition_by=partition_by)
 
     # EMAs (Vegas channel + Fibonacci ladder)
     for period in (8, 13, 21, 55, 89, 144, 169):
-        df = calculate_ema(df, period=period)
+        df = calculate_ema(df, period=period, partition_by=partition_by)
 
     # MACD (default 12/26/9)
-    df = calculate_macd(df)
+    df = calculate_macd(df, partition_by=partition_by)
 
     # Bollinger Bands (default 20 / 2σ)
-    df = calculate_bollinger_bands(df)
+    df = calculate_bollinger_bands(df, partition_by=partition_by)
 
     # ATR (default 14)
-    df = calculate_atr(df)
+    df = calculate_atr(df, partition_by=partition_by)
 
     # Stochastic (default 14 / 3)
-    df = calculate_stochastic(df)
+    df = calculate_stochastic(df, partition_by=partition_by)
 
     return df
 

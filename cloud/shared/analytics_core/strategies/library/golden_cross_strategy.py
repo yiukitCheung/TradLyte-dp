@@ -38,18 +38,24 @@ class GoldenCrossStrategy(BaseStrategy):
         )
 
     def _ensure_smas(self, df: pl.DataFrame) -> pl.DataFrame:
-        df = calculate_sma(df, period=self.FAST_PERIOD)
-        df = calculate_sma(df, period=self.SLOW_PERIOD)
+        df = calculate_sma(df, period=self.FAST_PERIOD, partition_by=self._partition_by)
+        df = calculate_sma(df, period=self.SLOW_PERIOD, partition_by=self._partition_by)
         return df
 
     def setup(self, df: pl.DataFrame) -> pl.DataFrame:
         """
         Setup: Uptrend (SMA 50 > SMA 200).
         Requires at least 200 candles of history before the current candle.
+
+        The history guard is partition-aware: on a single-symbol frame it keeps
+        all rows iff the symbol has >= SLOW_PERIOD dates; on a multi-symbol frame
+        it drops only those symbols that lack enough history.
         """
         df = self._ensure_smas(df)
         fast, slow = sma_col(self.FAST_PERIOD), sma_col(self.SLOW_PERIOD)
-        return df.filter(pl.col('date').n_unique() >= self.SLOW_PERIOD).with_columns(
+        return df.filter(
+            self._w(pl.col('date').n_unique()) >= self.SLOW_PERIOD
+        ).with_columns(
             (pl.col(fast) > pl.col(slow)).alias('setup_valid')
         )
 
@@ -59,7 +65,7 @@ class GoldenCrossStrategy(BaseStrategy):
         fast, slow = sma_col(self.FAST_PERIOD), sma_col(self.SLOW_PERIOD)
         golden_cross = (
             (pl.col(fast) > pl.col(slow)) &
-            (pl.col(fast).shift(1) <= pl.col(slow).shift(1))
+            (self._w(pl.col(fast).shift(1)) <= self._w(pl.col(slow).shift(1)))
         )
         return df.with_columns(
             pl.when(pl.col('setup_valid') & golden_cross)
@@ -75,7 +81,7 @@ class GoldenCrossStrategy(BaseStrategy):
         stop_loss = pl.col('close') * 0.95
         death_cross = (
             (pl.col(fast) < pl.col(slow)) &
-            (pl.col(fast).shift(1) >= pl.col(slow).shift(1))
+            (self._w(pl.col(fast).shift(1)) >= self._w(pl.col(slow).shift(1)))
         )
         return df.with_columns([
             pl.when(death_cross)

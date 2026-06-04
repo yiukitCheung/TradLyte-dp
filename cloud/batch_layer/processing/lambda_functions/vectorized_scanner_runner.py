@@ -22,8 +22,10 @@ Parity-critical details
 * Window: scores against a trailing 3-year window ending at scan_date — the
   same window ``DailyScanner.run`` uses (scan_date - 3*365 days). Indicator
   warm-up therefore matches the per-symbol path exactly.
-* Resampling/scoring live in ``vectorized_scanner`` (bundled alongside this
-  handler), which mirrors ``resample_ohlcv`` and ``_score_signal``.
+* Resampling/scoring live in ``analytics_core.vectorized_scanner`` (the whole
+  package is bundled), which mirrors ``resample_ohlcv`` and ``_score_signal``
+  and runs the SAME shared library strategies partition-aware (one source of
+  truth for signal logic across scanner/backtester).
 
 Invoked by Step Functions (after BuildScannerSnapshot):
   Payload:
@@ -48,10 +50,11 @@ import boto3
 import polars as pl
 import psycopg2
 
-# vectorized_scanner.py is bundled at the package root by the deploy script.
+# The analytics_core package is bundled by the deploy script so the runner uses
+# the SAME partition-aware strategy library as the per-symbol scanner/backtester.
 # Fall back to the shared package path for local execution / tests.
 try:
-    import vectorized_scanner as vs
+    from analytics_core import vectorized_scanner as vs
 except ImportError:  # pragma: no cover - local dev
     from shared.analytics_core import vectorized_scanner as vs  # type: ignore
 

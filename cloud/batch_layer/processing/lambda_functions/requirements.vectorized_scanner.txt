@@ -1,6 +1,10 @@
 # vectorized_scanner_runner Lambda dependencies
 # boto3 is pre-installed in the Lambda runtime — not listed here.
 # polars          → full-universe vectorized scan (.over(symbol)) + native Parquet read
-# psycopg2-binary → write signals to daily_scan_signals (self-contained; no shared/)
+# psycopg2-binary → write signals to daily_scan_signals; also imported at
+#                   analytics_core.inputs load time
+# pydantic        → analytics_core.models (StepConfig/SignalResult) imported by
+#                   the bundled strategy library
 polars>=0.20.0
 psycopg2-binary>=2.9.9
+pydantic>=2.0.0

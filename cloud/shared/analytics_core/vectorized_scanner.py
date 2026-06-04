@@ -7,6 +7,18 @@ long-format snapshot produced by the snapshot_builder Lambda:
 
     [date: Date, symbol: Utf8, open, high, low, close, volume: Float64]
 
+One strategy, two evaluation modes
+----------------------------------
+This module does NOT re-implement strategy logic. It runs the SAME shared
+library strategies the per-symbol scanner and backtester use
+(``strategies.library.*``), but evaluates them with
+``strategy.run(frame, partition_by="symbol")``. ``BaseStrategy`` is
+partition-aware: every cross-row op a strategy performs (``rolling_*``,
+``shift``, ``ewm_mean``, ``diff``, aggregates) is wrapped in ``self._w(...)``,
+which expands to ``.over("symbol")`` here and to a no-op on the single-symbol
+backtester path. This keeps a single source of truth for signal logic while
+scanning the whole universe in one pass.
+
 Why this is fast
 ----------------
 Polars window functions (``.over("symbol")``) compute per-symbol rolling
@@ -16,24 +28,29 @@ fits comfortably in RAM and scans in well under a second per strategy.
 
 CRITICAL correctness rule
 --------------------------
-Every operation that crosses row boundaries — ``rolling_mean``,
-``rolling_std``, ``shift``, ``diff``, ``ewm_mean`` — MUST be wrapped in
-``.over("symbol")``. Without it, one symbol's tail bleeds into the next
+Without per-symbol partitioning, one symbol's tail bleeds into the next
 symbol's head (e.g. AAPL's last 49 closes contaminate AAL's first SMA-50),
-silently corrupting signals. The per-symbol library strategies omit ``.over``
-because they assume a single-symbol frame; this module re-implements them
-universe-aware.
+silently corrupting signals. The frame MUST be sorted by ``[symbol, date]``
+before evaluation; :func:`run_strategy_universe` enforces this.
 
 Timeframes
 ----------
 The snapshot is 1d. Longer timeframes (e.g. 3d "long-term") are derived on the
 fly via :func:`resample_long` — N consecutive trading rows aggregated per
 symbol — and never persisted.
+
+Parity
+------
+``analytics_core._spikes.parity_vectorized_scanner`` proves this path selects
+the SAME BUY symbols with the SAME confidence as the per-symbol
+``DailyScanner._score_signal`` on a real snapshot sample.
 """
 
 from __future__ import annotations
 
 import polars as pl
+
+from .strategies.library import GoldenCrossStrategy, VegasChannelStrategy
 
 SNAPSHOT_COLUMNS = ["date", "symbol", "open", "high", "low", "close", "volume"]
 
@@ -78,190 +95,36 @@ def resample_long(df: pl.DataFrame, n_days: int) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Golden Cross — vectorized over the full universe
-# ---------------------------------------------------------------------------
-
-def golden_cross_signals(
-    df: pl.DataFrame,
-    fast_period: int = 50,
-    slow_period: int = 200,
-) -> pl.DataFrame:
-    """
-    Vectorized Golden Cross across all symbols.
-
-    Setup:   SMA(fast) > SMA(slow)                       (uptrend)
-    Trigger: SMA(fast) crosses above SMA(slow)           (golden cross)
-    Exit:    death cross OR 5% stop loss anchor
-
-    Adds columns: sma_{fast}, sma_{slow}, setup_valid, signal,
-    exit_signal, stop_loss_price. Mirrors
-    ``strategies.library.GoldenCrossStrategy`` exactly, but every rolling /
-    shift is partitioned ``.over("symbol")``.
-    """
-    fast_col = f"sma_{fast_period}"
-    slow_col = f"sma_{slow_period}"
-
-    df = df.sort(["symbol", "date"]).with_columns(
-        [
-            pl.col("close").rolling_mean(window_size=fast_period).over("symbol").alias(fast_col),
-            pl.col("close").rolling_mean(window_size=slow_period).over("symbol").alias(slow_col),
-        ]
-    )
-
-    df = df.with_columns(
-        [
-            (pl.col(fast_col) > pl.col(slow_col)).alias("setup_valid"),
-            pl.col(fast_col).shift(1).over("symbol").alias("_fast_prev"),
-            pl.col(slow_col).shift(1).over("symbol").alias("_slow_prev"),
-        ]
-    )
-
-    golden_cross = (pl.col(fast_col) > pl.col(slow_col)) & (pl.col("_fast_prev") <= pl.col("_slow_prev"))
-    death_cross = (pl.col(fast_col) < pl.col(slow_col)) & (pl.col("_fast_prev") >= pl.col("_slow_prev"))
-
-    df = df.with_columns(
-        [
-            pl.when(pl.col("setup_valid") & golden_cross)
-            .then(pl.lit("BUY"))
-            .otherwise(pl.lit("HOLD"))
-            .alias("signal"),
-            pl.when(death_cross).then(pl.lit("SELL")).otherwise(None).alias("exit_signal"),
-            (pl.col("close") * 0.95).alias("stop_loss_price"),
-        ]
-    )
-
-    return df.drop(["_fast_prev", "_slow_prev"])
-
-
-# ---------------------------------------------------------------------------
-# Vegas Channel — vectorized over the full universe
-# ---------------------------------------------------------------------------
-
-# Required EMAs (mirrors VegasChannelStrategy.required_emas).
-_VEGAS_EMAS = [8, 13, 144, 169]
-_VEGAS_MIN_CANDLES = 169  # longest EMA period; symbols with fewer bars never set up
-
-
-def _vegas_obs_window(timeframe: str) -> int:
-    """
-    Mirror ``VegasChannelStrategy._resolve_obs_window`` for a known timeframe.
-    1d->28, 3d->20, 5d->20, 8d->14, 13d->14; unknown N -> base//4 (min 2).
-    The per-symbol scanner always passes a 'timeframe', so the None->30 fallback
-    never applies here.
-    """
-    base = 28
-    window_dict = {1: base, 3: base - 8, 5: base - 8, 8: base - 14, 13: base - 14}
-    tf = str(timeframe).strip().lower()
-    days = int(tf[:-1]) if tf.endswith("d") and tf[:-1].isdigit() else None
-    if days is None:
-        return 30
-    return max(2, window_dict.get(days, base // 4))
-
-
-def _ema(period: int) -> pl.Expr:
-    """Per-symbol EMA expression (alpha = 2/(period+1), adjust=False)."""
-    return pl.col("close").ewm_mean(alpha=2.0 / (period + 1), adjust=False).over("symbol")
-
-
-def vegas_channel_signals(df: pl.DataFrame, timeframe: str) -> pl.DataFrame:
-    """
-    Vectorized Vegas Channel across all symbols, for one timeframe frame.
-
-    Faithful port of ``strategies.library.VegasChannelStrategy`` (setup ->
-    trigger), with every cross-row op partitioned ``.over("symbol")`` and the
-    Python ``map_elements`` flags replaced by vectorized ``is_in`` expressions.
-    Emits at least: setup_valid, velocity_status, momentum_signal, signal.
-    """
-    obs_window = _vegas_obs_window(timeframe)
-
-    df = df.sort(["symbol", "date"])
-
-    # 1) EMAs (per symbol)
-    df = df.with_columns([_ema(p).alias(f"ema_{p}") for p in _VEGAS_EMAS])
-
-    # 2) velocity_status — purely row-wise (no .over needed)
-    st_max = pl.max_horizontal("ema_8", "ema_13")
-    st_min = pl.min_horizontal("ema_8", "ema_13")
-    lt_max = pl.max_horizontal("ema_144", "ema_169")
-    lt_min = pl.min_horizontal("ema_144", "ema_169")
-    df = df.with_columns(
-        pl.when(
-            (pl.col("close") > pl.col("open"))
-            & (pl.col("close") > st_max)
-            & (pl.col("close") > lt_max)
-            & (st_min > lt_max)
-        ).then(pl.lit("velocity_maintained"))
-        .when((pl.col("close") < pl.col("ema_13")) & (pl.col("close") > pl.col("ema_169")))
-        .then(pl.lit("velocity_weak"))
-        .when((pl.col("close") < pl.col("ema_13")) & (pl.col("close") < pl.col("ema_169")))
-        .then(pl.lit("velocity_loss"))
-        .otherwise(pl.lit("velocity_negotiating"))
-        .alias("velocity_status")
-    )
-
-    # 3) momentum: rolling counts of loss vs maintain over obs_window (per symbol)
-    df = df.with_columns(
-        [
-            pl.col("velocity_status")
-            .is_in(["velocity_loss", "velocity_weak", "velocity_negotiating"])
-            .cast(pl.Int32)
-            .alias("loss_flag"),
-            (pl.col("velocity_status") == "velocity_maintained").cast(pl.Int32).alias("maintain_flag"),
-        ]
-    )
-    df = df.with_columns(
-        [
-            pl.col("loss_flag").rolling_sum(window_size=obs_window).over("symbol").alias("count_velocity_loss"),
-            pl.col("maintain_flag").rolling_sum(window_size=obs_window).over("symbol").alias("count_velocity_maintained"),
-        ]
-    )
-
-    accel_candle = (lt_max <= st_max) & (st_max < pl.col("open")) & (pl.col("open") < pl.col("close"))
-    decel_candle = (pl.col("close") < st_min) & (st_min <= lt_min)
-    loss_gt_maintain = pl.col("count_velocity_loss") > pl.col("count_velocity_maintained")
-
-    df = df.with_columns(
-        pl.when(loss_gt_maintain & accel_candle).then(pl.lit("accelerated"))
-        .when(loss_gt_maintain & decel_candle).then(pl.lit("decelerated"))
-        .otherwise(None)
-        .alias("momentum_signal")
-    )
-
-    # 4) cooldown: drop an alert if the same kind fired in the previous 30 bars (per symbol)
-    accel_prev30 = (pl.col("momentum_signal") == "accelerated").cast(pl.Int32).shift(1).rolling_sum(window_size=30).over("symbol")
-    decel_prev30 = (pl.col("momentum_signal") == "decelerated").cast(pl.Int32).shift(1).rolling_sum(window_size=30).over("symbol")
-    df = df.with_columns(
-        pl.when((pl.col("momentum_signal") == "accelerated") & (accel_prev30 > 0)).then(None)
-        .when((pl.col("momentum_signal") == "decelerated") & (decel_prev30 > 0)).then(None)
-        .otherwise(pl.col("momentum_signal"))
-        .alias("momentum_signal")
-    )
-
-    # 5) setup + trigger. Symbols with < MIN_CANDLES bars never set up (matches
-    #    the strategy's early-return guard).
-    enough_history = pl.len().over("symbol") >= _VEGAS_MIN_CANDLES
-    setup_valid = enough_history & (
-        (pl.col("momentum_signal") == "accelerated") | (pl.col("velocity_status") == "velocity_maintained")
-    )
-    df = df.with_columns(setup_valid.alias("setup_valid"))
-
-    trigger = (pl.col("momentum_signal") == "accelerated") & (pl.col("open") < pl.col("close"))
-    df = df.with_columns(
-        pl.when(pl.col("setup_valid") & trigger).then(pl.lit("BUY")).otherwise(pl.lit("HOLD")).alias("signal")
-    )
-    return df
-
-
-# ---------------------------------------------------------------------------
 # Strategy registry + multi-timeframe scoring (mirrors scanner._score_signal)
 # ---------------------------------------------------------------------------
 
-# strategy_name -> (signal_fn, timeframes). signal_fn(frame, timeframe) must add
-# 'signal' (BUY/HOLD) and 'setup_valid'. Mirrors DailyScanner.get_strategy_metadata.
+# strategy_name -> (strategy_factory, timeframes). The factory builds a
+# BaseStrategy from the shared strategy library; we run it ONCE over the entire
+# universe with ``run(frame, partition_by="symbol")`` so every cross-row op the
+# strategy performs is scoped per symbol. This is the single source of truth for
+# strategy logic — it is the *same* class the per-symbol scanner and backtester
+# use, just evaluated partition-aware. Keep the names/timeframes in sync with
+# ``DailyScanner.get_strategy_metadata``.
 STRATEGY_REGISTRY = {
-    "golden_cross": (lambda f, tf: golden_cross_signals(f), ["1d", "3d", "5d"]),
-    "vegas_channel_short_term": (lambda f, tf: vegas_channel_signals(f, tf), ["1d", "3d", "5d"]),
+    "golden_cross": (GoldenCrossStrategy, ["1d", "3d", "5d"]),
+    "vegas_channel_short_term": (VegasChannelStrategy, ["1d", "3d", "5d"]),
 }
+
+
+def run_strategy_universe(factory, frame: pl.DataFrame, timeframe: str) -> pl.DataFrame:
+    """
+    Run a library strategy across the whole universe for one timeframe frame.
+
+    Builds a fresh strategy instance, injects the ``timeframe`` column some
+    strategies key off (e.g. Vegas' observation window), sorts by
+    ``[symbol, date]`` so windows are well-defined, and evaluates the strategy
+    with ``partition_by="symbol"``. Returns the strategy's full output frame
+    (includes at least ``signal`` and ``setup_valid``).
+    """
+    f = frame.sort(["symbol", "date"])
+    if "timeframe" not in f.columns:
+        f = f.with_columns(pl.lit(timeframe).alias("timeframe"))
+    return factory().run(f, partition_by="symbol")
 
 _HIGHER_TF_LOOKBACK = 5  # mirrors higher_tf_buy_lookback_candles in _score_signal
 
@@ -291,7 +154,7 @@ def score_multi_timeframe(
     Returns one row per qualifying symbol:
       [symbol, signal='BUY', price, confidence, setup_valid, trigger_met, strategy_name]
     """
-    signal_fn, timeframes = STRATEGY_REGISTRY[strategy_name]
+    factory, timeframes = STRATEGY_REGISTRY[strategy_name]
     ordered = sorted(timeframes, key=_timeframe_days)
     anchor_tf = ordered[0]
     weights = {tf: float(i + 1) for i, tf in enumerate(timeframes)}
@@ -301,7 +164,7 @@ def score_multi_timeframe(
     sig_by_tf: dict = {}
     for tf in timeframes:
         frame = base_1d if tf == "1d" else resample_long(base_1d, _timeframe_days(tf))
-        sig_by_tf[tf] = signal_fn(frame, tf)
+        sig_by_tf[tf] = run_strategy_universe(factory, frame, tf)
 
     # ---- anchor: BUY exactly on scan_date ----
     anchor = (
