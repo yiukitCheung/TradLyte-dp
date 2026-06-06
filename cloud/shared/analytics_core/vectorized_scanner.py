@@ -115,7 +115,7 @@ def run_strategy_universe(factory, frame: pl.DataFrame, timeframe: str) -> pl.Da
     """
     Run a library strategy across the whole universe for one timeframe frame.
 
-    Builds a fresh strategy instance, injects the ``timeframe`` column some
+    Builds a fresh strategy instance, injects thegit  ``timeframe`` column some
     strategies key off (e.g. Vegas' observation window), sorts by
     ``[symbol, date]`` so windows are well-defined, and evaluates the strategy
     with ``partition_by="symbol"``. Returns the strategy's full output frame
