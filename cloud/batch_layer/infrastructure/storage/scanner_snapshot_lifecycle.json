@@ -1,0 +1,16 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-scanner-snapshot-history",
+      "Filter": { "Prefix": "scanner-snapshots/history/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 14 }
+    },
+    {
+      "ID": "abort-incomplete-mpu-scanner-snapshots",
+      "Filter": { "Prefix": "scanner-snapshots/" },
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}

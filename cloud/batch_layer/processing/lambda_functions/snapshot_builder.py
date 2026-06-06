@@ -24,17 +24,36 @@ derived on the fly by the scanner from this 1d base, so the snapshot stays a
 single source of truth.
 
 Parquet is immutable — you cannot append rows in place. The daily "append"
-is therefore a read-existing + concat + dedupe + full rewrite to a fresh
-dated key (cheap at ~100 MB compressed for ~10k symbols x 5y).
+is therefore a read-existing + concat + full rewrite to a fresh dated key
+(cheap at ~100 MB compressed for ~10k symbols x 5y).
+
+De-duplication (one row per symbol-day)
+---------------------------------------
+``raw_ohlcv`` can hold more than one row that collapses to the same
+``(symbol, timestamp::date)`` for ``interval='1d'`` — e.g. two intraday
+timestamps, a re-ingest, or a correction. Both reads use
+``SELECT DISTINCT ON (symbol, timestamp::date) ... ORDER BY symbol,
+timestamp::date, timestamp DESC`` so Postgres keeps exactly the latest bar per
+symbol-day at the source (bounded, no client-side global ``unique()``). This
+guarantees the snapshot has a single row per ``(symbol, date)``.
 
 Modes
 -----
 - ``bootstrap``   : full rebuild from RDS raw_ohlcv (year-chunked, server-side
-                    cursor to bound memory). Use this once to create the file.
+                    cursor to bound memory). Use this once to create the file,
+                    or to re-clean history after a dedupe-logic change.
 - ``incremental`` : (default) read the latest snapshot from S3, pull only the
-                    new bars for ``scan_date`` from RDS, concat, dedupe on
-                    (symbol, date), trim to the retention window, rewrite.
-                    Falls back to bootstrap automatically if no snapshot exists.
+                    deduped new bars for ``scan_date`` from RDS, drop that
+                    date's existing rows, concat, trim to the retention window,
+                    rewrite. Falls back to bootstrap if no snapshot exists.
+
+Storage layout
+--------------
+- ``<prefix>/latest/<file>``         : stable key the scanner always reads.
+- ``<prefix>/history/<date>/<file>`` : point-in-time dated copies. Kept under a
+                    dedicated ``history/`` subprefix so an S3 lifecycle rule can
+                    expire them (e.g. after 14 days) WITHOUT ever touching the
+                    permanent ``latest/`` object.
 
 Invoked by Step Functions (after OHLCV ingest) or manually:
   Payload:
@@ -72,9 +91,10 @@ SNAPSHOT_PREFIX = os.environ.get("SNAPSHOT_PREFIX", "scanner-snapshots")
 SNAPSHOT_FILENAME = os.environ.get("SNAPSHOT_FILENAME", "market_1d.parquet")
 RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "1825"))
 
-# The scanner always reads this stable key. Dated copies are kept for
-# point-in-time reproducibility (apply an S3 lifecycle rule to expire them).
+# The scanner always reads this stable key. Dated copies live under a dedicated
+# history/ subprefix so a lifecycle rule can expire them without touching this.
 LATEST_KEY = f"{SNAPSHOT_PREFIX}/latest/{SNAPSHOT_FILENAME}"
+HISTORY_PREFIX = f"{SNAPSHOT_PREFIX}/history"
 
 # Polars schema for frames built from raw psycopg2 tuples. The SQL casts
 # numeric columns to float8 so we never see Decimal here.
@@ -211,7 +231,7 @@ def _write_snapshot(s3, df: pl.DataFrame, scan_date: date) -> Dict[str, str]:
     df.write_parquet(LOCAL_OUT, compression="zstd")
     size_mb = os.path.getsize(LOCAL_OUT) / 1e6
 
-    dated_key = f"{SNAPSHOT_PREFIX}/{scan_date.isoformat()}/{SNAPSHOT_FILENAME}"
+    dated_key = f"{HISTORY_PREFIX}/{scan_date.isoformat()}/{SNAPSHOT_FILENAME}"
     for key in (dated_key, LATEST_KEY):
         s3.upload_file(LOCAL_OUT, BUCKET, key)
         logger.info("Wrote snapshot → s3://%s/%s (%.1f MB)", BUCKET, key, size_mb)
@@ -228,13 +248,19 @@ def _write_snapshot(s3, df: pl.DataFrame, scan_date: date) -> Dict[str, str]:
 # Modes
 # ---------------------------------------------------------------------------
 
-# Yearly columns from raw_ohlcv, numeric cast to float8 so psycopg2 never
-# returns Decimal (which Polars would reject against the Float64 schema).
+# Columns from raw_ohlcv, numeric cast to float8 so psycopg2 never returns
+# Decimal (which Polars would reject against the Float64 schema).
 _SELECT_COLS = (
     "symbol, timestamp::date AS date, "
     "open::float8 AS open, high::float8 AS high, low::float8 AS low, "
     "close::float8 AS close, volume::float8 AS volume"
 )
+
+# DISTINCT ON keeps exactly one row per (symbol, calendar day): the one with the
+# latest intraday timestamp. The leading ORDER BY columns MUST match the
+# DISTINCT ON list; ``timestamp DESC`` then selects the most recent bar.
+_DISTINCT_ON = "DISTINCT ON (symbol, timestamp::date)"
+_DEDUPE_ORDER = "ORDER BY symbol, timestamp::date, timestamp DESC"
 
 
 def run_bootstrap(
@@ -257,9 +283,9 @@ def run_bootstrap(
         # Exclusive upper bound on timestamp to capture the whole end day.
         upper_exclusive = window_end + timedelta(days=1)
         query = (
-            f"SELECT {_SELECT_COLS} FROM raw_ohlcv "
+            f"SELECT {_DISTINCT_ON} {_SELECT_COLS} FROM raw_ohlcv "
             "WHERE interval = '1d' AND timestamp >= %s AND timestamp < %s "
-            "ORDER BY symbol, timestamp"
+            f"{_DEDUPE_ORDER}"
         )
         frame = _read_rows_to_frame(
             conn, query, (window_start, upper_exclusive), server_side=True
@@ -304,9 +330,9 @@ def run_incremental(conn, s3, scan_date: date) -> Dict[str, Any]:
         return run_bootstrap(conn, s3, scan_date, start=None, end=scan_date)
 
     query = (
-        f"SELECT {_SELECT_COLS} FROM raw_ohlcv "
+        f"SELECT {_DISTINCT_ON} {_SELECT_COLS} FROM raw_ohlcv "
         "WHERE interval = '1d' AND timestamp::date = %s "
-        "ORDER BY symbol"
+        f"{_DEDUPE_ORDER}"
     )
     new_bars = _read_rows_to_frame(conn, query, (scan_date,), server_side=False)
     logger.info("INCREMENTAL scan_date=%s — pulled %s new 1d bars from RDS", scan_date, new_bars.height)
