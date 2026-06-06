@@ -1,474 +1,247 @@
 """
-Daily Scanner Engine
+Full-Universe Scanner
 
-Batch-loads 1d OHLCV from RDS for many symbols at once, resamples to required
-timeframes in memory, then runs pick profiles (e.g. Vegas, Golden Cross) and
-outputs daily suggested symbols. Used by AWS Batch job for daily scanning.
+Runs a strategy across the ENTIRE symbol universe in a single Polars pass,
+instead of looping one symbol at a time. The input is the consolidated
+long-format snapshot produced by the snapshot_builder Lambda:
+
+    [date: Date, symbol: Utf8, open, high, low, close, volume: Float64]
+
+One strategy, two evaluation modes
+----------------------------------
+This module does NOT re-implement strategy logic. It runs the SAME shared
+library strategies the backtester uses (``strategies.library.*``), but
+evaluates them with ``strategy.run(frame, partition_by="symbol")``.
+``BaseStrategy`` is partition-aware: every cross-row op a strategy performs
+(``rolling_*``, ``shift``, ``ewm_mean``, ``diff``, aggregates) is wrapped in
+``self._w(...)``, which expands to ``.over("symbol")`` here and to a no-op on
+the single-symbol backtester path. This keeps a single source of truth for
+signal logic while scanning the whole universe in one pass.
+
+Why this is fast
+----------------
+Polars window functions (``.over("symbol")``) compute per-symbol rolling
+indicators and shifts across all symbols at once, using a single vectorized
+engine pass with no Python-level loop. A 10k-symbol x 5y frame (~12M rows)
+fits comfortably in RAM and scans in well under a second per strategy.
+
+CRITICAL correctness rule
+--------------------------
+Without per-symbol partitioning, one symbol's tail bleeds into the next
+symbol's head (e.g. AAPL's last 49 closes contaminate AAL's first SMA-50),
+silently corrupting signals. The frame MUST be sorted by ``[symbol, date]``
+before evaluation; :func:`run_strategy_universe` enforces this.
+
+Timeframes
+----------
+The snapshot is 1d. Longer timeframes (e.g. 3d "long-term") are derived on the
+fly via :func:`resample_long` — N consecutive trading rows aggregated per
+symbol — and never persisted.
 """
 
-from typing import List, Dict, Any, Optional, Callable, Union
-from datetime import date, timedelta
-from collections import defaultdict
-import json
+from __future__ import annotations
+
 import polars as pl
-from .models import SignalResult
-from .strategies.base import BaseStrategy
-from .executor import MultiTimeframeExecutor
-from .strategies.library import (
-    GoldenCrossStrategy, VegasChannelStrategy
-)
 
-class DailyScanner:
+from .strategies.library import GoldenCrossStrategy, VegasChannelStrategy
+
+SNAPSHOT_COLUMNS = ["date", "symbol", "open", "high", "low", "close", "volume"]
+
+
+# ---------------------------------------------------------------------------
+# Timeframe resampling (1d base → N trading-day bars)
+# ---------------------------------------------------------------------------
+
+def resample_long(df: pl.DataFrame, n_days: int) -> pl.DataFrame:
     """
-    Daily scanner: batch-load from RDS → resample in memory → run strategies → rank picks.
+    Resample a long-format 1d frame to N-calendar-day bars, per symbol.
+
+    PARITY: this must match ``analytics_core.inputs.resample_ohlcv``, which the
+    backtester uses. That function calls
+    ``group_by_dynamic(time_col, every="Nd")`` (calendar windows anchored to a
+    fixed epoch origin, left-labeled — the bar's ``date`` is the window START),
+    once per symbol. We reproduce it in a single vectorized pass with
+    ``group_by="symbol"``. Using calendar windows (not row buckets) is essential:
+    row bucketing drifts whenever a symbol has gaps/holidays, which would make
+    the resampled bars — and therefore the signals — diverge from production.
     """
-    
-    def __init__(
-        self,
-        rds_connection_string: Optional[str] = None,
-        lookback_days: int = 365
-    ):
-        """
-        Initialize scanner. Data is loaded from RDS (1d); resampled timeframes
-        are computed at use from 1d.
-        """
-        # Kept for backward compatibility with existing callers.
-        self.lookback_days = lookback_days
-        self.executor = MultiTimeframeExecutor(rds_connection_string=rds_connection_string)
-    
-    def get_strategy_metadata(
-        self,
-        include_pick_types: Optional[List[str]] = None,
-        exclude_pick_types: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Return strategy metadata (vegas/golden_cross short/long). Optionally filter by pick_type."""
-        strategy_metadata: List[Dict[str, Any]] = [
-            {
-                "strategy_name": "vegas_channel_short_term",
-                "strategy_factory": VegasChannelStrategy,
-                "timeframes": ["1d", "3d", "5d"]                     
-            },
-      
-            {
-                "strategy_name": "golden_cross",
-                "strategy_factory": GoldenCrossStrategy,
-                "timeframes": ["1d", "3d", "5d"]
-            }
-        ]
+    if n_days <= 1:
+        return df.sort(["symbol", "date"]).select(SNAPSHOT_COLUMNS)
 
-        # Optional filtering by pick_type
-        if include_pick_types:
-            include_set = {p.lower() for p in include_pick_types}
-            strategy_metadata = [p for p in strategy_metadata if p["pick_type"].lower() in include_set]
-        if exclude_pick_types:
-            exclude_set = {p.lower() for p in exclude_pick_types}
-            strategy_metadata = [p for p in strategy_metadata if p["pick_type"].lower() not in exclude_set]
-
-        return strategy_metadata
-
-    def _score_signal(
-        self,
-        symbol: str,
-        strategy: BaseStrategy,
-        scan_date: date,
-        timeframes: List[str],
-        symbol_data_dict: Dict[str, Any],
-    ) -> Optional[SignalResult]:
-        """Score one symbol across timeframes with pre-loaded data; return BUY signal or None."""
-        higher_tf_buy_lookback_candles = 5
-
-        def _timeframe_to_days(tf: str) -> int:
-            tf_str = str(tf).strip().lower()
-            if tf_str.endswith("d"):
-                numeric = tf_str[:-1].strip()
-                if numeric.isdigit():
-                    return int(numeric)
-            return 10**9
-
-        ordered_timeframes = sorted(timeframes, key=_timeframe_to_days)
-        anchor_timeframe = ordered_timeframes[0] if ordered_timeframes else None
-        if not anchor_timeframe:
-            return None
-
-        weights = {tf: float(idx + 1) for idx, tf in enumerate(timeframes)}
-        print(f"Score Signal: Weights per timeframe: {weights}")
-        weighted_score = 0.0
-        weighted_setup = 0.0
-        weighted_trigger = 0.0
-        total_weight = sum(weights.values())
-        votes: Dict[str, Dict[str, Any]] = {}
-        selected_price: Optional[float] = None
-        prepared_by_timeframe: Dict[str, pl.DataFrame] = {}
-
-        # Run strategy per timeframe first.
-        for timeframe in timeframes:
-            try:
-                tf_df = symbol_data_dict.get(timeframe)
-                if tf_df is None or (hasattr(tf_df, "height") and tf_df.height == 0):
-                    print(f"Score Signal: No data for timeframe '{timeframe}'.")
-                    votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
-                    continue
-                tf_df = self.executor.prepare_dataframe(tf_df, timeframe)
-                # Run Strategy
-                tf_df = strategy.run(tf_df)
-                # Get Signals
-                tf_df = strategy.get_signals(tf_df)
-                if tf_df.height == 0:
-                    votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
-                    continue
-                prepared_by_timeframe[timeframe] = tf_df
-                
-            except Exception as timeframe_error:
-                votes[timeframe] = {"error": str(timeframe_error), "weight": weights[timeframe]}
-                continue
-        # 1) Anchor rule: the lowest timeframe must be BUY exactly on scan_date.
-        anchor_df = prepared_by_timeframe.get(anchor_timeframe)
-        if anchor_df is None or anchor_df.height == 0:
-            print(f"Score Signal: No data for anchor timeframe '{anchor_timeframe}' on scan date.")
-            votes[anchor_timeframe] = {"signal": "NO_DATA_ON_SCAN_DATE", "weight": weights.get(anchor_timeframe, 0.0)}
-            return None
-        anchor_scan_day_df = anchor_df.filter(pl.col("date") == scan_date)
-        if anchor_scan_day_df.height == 0:
-            print(f"Score Signal: No row for anchor timeframe '{anchor_timeframe}' matching scan date.")
-            votes[anchor_timeframe] = {"signal": "NO_DATA_ON_SCAN_DATE", "weight": weights.get(anchor_timeframe, 0.0)}
-            return None
-        anchor_row = anchor_scan_day_df.sort("date", descending=True).head(1)
-        anchor_signal = anchor_row["signal"][0] if "signal" in anchor_row.columns else "HOLD"
-        if anchor_signal != "BUY":
-            print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' signal is not BUY ({anchor_signal}), returning None.")
-            votes[anchor_timeframe] = {"signal": str(anchor_signal), "weight": weights.get(anchor_timeframe, 0.0)}
-            return None
-
-        print(f"Score Signal: Anchor timeframe '{anchor_timeframe}' confirmed as BUY.")
-        anchor_weight = weights.get(anchor_timeframe, 0.0)
-        weighted_score += anchor_weight
-        weighted_trigger += anchor_weight
-        anchor_setup_valid = False
-        if "setup_valid" in anchor_row.columns:
-            setup_value = anchor_row["setup_valid"][0]
-            anchor_setup_valid = bool(setup_value) if setup_value is not None else False
-        if anchor_setup_valid:
-            weighted_setup += anchor_weight
-        if "close" in anchor_row.columns:
-            close_value = anchor_row["close"][0]
-            if close_value is not None:
-                selected_price = float(close_value)
-        votes[anchor_timeframe] = {
-            "signal": "BUY",
-            "weight": anchor_weight,
-            "match_mode": "exact_scan_date",
-            "matched_date": str(scan_date),
-        }
-
-        # 2) Higher timeframe rule: count BUY if found within the last N candles up to anchor day.
-        for timeframe in timeframes:
-            if timeframe == anchor_timeframe:
-                continue
-            tf_df = prepared_by_timeframe.get(timeframe)
-            if tf_df is None or tf_df.height == 0:
-                print(f"Score Signal: No data for higher timeframe '{timeframe}'.")
-                votes[timeframe] = {"signal": "NO_DATA", "weight": weights[timeframe]}
-                continue
-
-            candles_up_to_anchor = tf_df.filter(pl.col("date") <= scan_date).sort("date", descending=True)
-            if candles_up_to_anchor.height == 0:
-                print(f"Score Signal: No candles found up to anchor for timeframe '{timeframe}'.")
-                votes[timeframe] = {"signal": "NO_DATA_UP_TO_SCAN_DATE", "weight": weights[timeframe]}
-                continue
-
-            recent_window = candles_up_to_anchor.head(higher_tf_buy_lookback_candles)
-            buy_rows = recent_window.filter(pl.col("signal") == "BUY")
-            weight = weights[timeframe]
-
-            if buy_rows.height > 0:
-                matched_buy = buy_rows.sort("date", descending=True).head(1)
-                print(f"Score Signal: BUY found in higher timeframe '{timeframe}' in last {higher_tf_buy_lookback_candles} candles on {matched_buy['date'][0]}.")
-                weighted_score += weight
-                weighted_trigger += weight
-
-                setup_valid = False
-                if "setup_valid" in matched_buy.columns:
-                    setup_value = matched_buy["setup_valid"][0]
-                    setup_valid = bool(setup_value) if setup_value is not None else False
-                if setup_valid:
-                    print(f"Score Signal: Higher timeframe '{timeframe}' setup is valid.")
-                    weighted_setup += weight
-
-                votes[timeframe] = {
-                    "signal": "BUY",
-                    "weight": weight,
-                    "match_mode": "buy_within_lookback_candles",
-                    "lookback_candles": higher_tf_buy_lookback_candles,
-                    "matched_date": str(matched_buy["date"][0]),
-                }
-            else:
-                print(f"Score Signal: No BUY signals found in higher timeframe '{timeframe}' in last {higher_tf_buy_lookback_candles} candles.")
-                votes[timeframe] = {
-                    "signal": "HOLD",
-                    "weight": weight,
-                    "match_mode": "buy_within_lookback_candles",
-                    "lookback_candles": higher_tf_buy_lookback_candles,
-                }
-
-        if total_weight <= 0 or weighted_score <= 0:
-            print(f"Score Signal: Weighted score or total weight <= 0 (weighted_score={weighted_score}, total_weight={total_weight}), returning None.")
-            return None
-
-        confidence = min(max(weighted_score / total_weight, 0.0), 1.0)
-        print(f"Score Signal: Final weighted_score={weighted_score}, total_weight={total_weight}, confidence={confidence}")
-        return SignalResult(
-            symbol=symbol,
-            date=scan_date.isoformat(),
-            signal="BUY",
-            price=selected_price if selected_price is not None else 0.0,
-            setup_valid=(weighted_setup > 0),
-            trigger_met=(weighted_trigger > 0),
-            confidence=confidence,
-            metadata={
-                "strategy_name": strategy.name,
-                "timeframes": timeframes,
-                "timeframe_votes": votes,
-                "weighted_score": weighted_score,
-                "total_weight": total_weight,
-            },
+    grouped = (
+        df.sort(["symbol", "date"])
+        .group_by_dynamic(
+            "date",
+            every=f"{n_days}d",
+            group_by="symbol",
         )
+        .agg(
+            pl.col("open").first().alias("open"),
+            pl.col("high").max().alias("high"),
+            pl.col("low").min().alias("low"),
+            pl.col("close").last().alias("close"),
+            pl.col("volume").sum().alias("volume"),
+        )
+        .sort(["symbol", "date"])
+    )
+    return grouped.select(SNAPSHOT_COLUMNS)
 
-    def run(
-        self,
-        symbols: List[str],
-        strategy_metadata: List[Dict[str, Any]],
-        scan_date: date,
-        include_strategy_names: Optional[List[str]] = None,
-        exclude_strategy_names: Optional[List[str]] = None,
-        rds_client: Any = None,
-        batch_size: int = 100,
-    ) -> List[SignalResult]:
-        """Batch-load 1d from RDS, resample in memory, run profiles; return list of signals."""
-        # Initialize the signals list
-        signals: List[SignalResult] = []
-        print(f"Starting run: {len(symbols)} symbols, scan_date={scan_date}")
 
-        # Filter the pick profiles
-        selected_strategy_metadata = strategy_metadata
-        if include_strategy_names:
-            include_set = {p.lower() for p in include_strategy_names}
-            print(f"Including strategies: {', '.join(include_set)}")
-            selected_strategy_metadata = [
-                p for p in selected_strategy_metadata if p["strategy_name"].lower() in include_set
+# ---------------------------------------------------------------------------
+# Strategy registry + multi-timeframe scoring
+# ---------------------------------------------------------------------------
+
+# strategy_name -> (strategy_factory, timeframes). The factory builds a
+# BaseStrategy from the shared strategy library; we run it ONCE over the entire
+# universe with ``run(frame, partition_by="symbol")`` so every cross-row op the
+# strategy performs is scoped per symbol. This is the single source of truth for
+# strategy logic — it is the *same* class the backtester uses, just evaluated
+# partition-aware.
+STRATEGY_REGISTRY = {
+    "golden_cross": (GoldenCrossStrategy, ["1d", "3d", "5d"]),
+    "vegas_channel_short_term": (VegasChannelStrategy, ["1d", "3d", "5d"]),
+}
+
+
+def run_strategy_universe(factory, frame: pl.DataFrame, timeframe: str) -> pl.DataFrame:
+    """
+    Run a library strategy across the whole universe for one timeframe frame.
+
+    Builds a fresh strategy instance, injects the ``timeframe`` column some
+    strategies key off (e.g. Vegas' observation window), sorts by
+    ``[symbol, date]`` so windows are well-defined, and evaluates the strategy
+    with ``partition_by="symbol"``. Returns the strategy's full output frame
+    (includes at least ``signal`` and ``setup_valid``).
+    """
+    f = frame.sort(["symbol", "date"])
+    if "timeframe" not in f.columns:
+        f = f.with_columns(pl.lit(timeframe).alias("timeframe"))
+    return factory().run(f, partition_by="symbol")
+
+_HIGHER_TF_LOOKBACK = 5  # most-recent N higher-tf signal rows considered on/before scan_date
+
+
+def _timeframe_days(tf: str) -> int:
+    tf = str(tf).strip().lower()
+    return int(tf[:-1]) if tf.endswith("d") and tf[:-1].isdigit() else 10**9
+
+
+def score_multi_timeframe(
+    base_1d: pl.DataFrame,
+    strategy_name: str,
+    scan_date,
+) -> pl.DataFrame:
+    """
+    Multi-timeframe scoring for the whole universe.
+
+    Rules:
+      * weights per timeframe = position+1 (1d=1, 3d=2, 5d=3); total = sum.
+      * ANCHOR (lowest tf, 1d): must emit BUY exactly on scan_date, else the
+        symbol is dropped. Its weight always counts toward the score.
+      * HIGHER tfs: count their weight if a BUY appears within the last
+        ``_HIGHER_TF_LOOKBACK`` signal rows on/before scan_date.
+      * confidence = weighted_score / total_weight (clamped 0..1).
+      * setup_valid (output) = weighted_setup > 0; trigger_met = True.
+
+    Returns one row per qualifying symbol:
+      [symbol, signal='BUY', price, confidence, setup_valid, trigger_met, strategy_name]
+    """
+    factory, timeframes = STRATEGY_REGISTRY[strategy_name]
+    ordered = sorted(timeframes, key=_timeframe_days)
+    anchor_tf = ordered[0]
+    weights = {tf: float(i + 1) for i, tf in enumerate(timeframes)}
+    total_weight = sum(weights.values())
+
+    # Run the strategy per timeframe over the full universe.
+    sig_by_tf: dict = {}
+    for tf in timeframes:
+        frame = base_1d if tf == "1d" else resample_long(base_1d, _timeframe_days(tf))
+        sig_by_tf[tf] = run_strategy_universe(factory, frame, tf)
+
+    # ---- anchor: BUY exactly on scan_date ----
+    anchor = (
+        sig_by_tf[anchor_tf]
+        .filter((pl.col("date") == scan_date) & (pl.col("signal") == "BUY"))
+        .select(
+            "symbol",
+            pl.col("close").alias("price"),
+            pl.col("setup_valid").fill_null(False).alias("_anchor_setup"),
+        )
+        .unique(subset=["symbol"], keep="last")
+    )
+    if anchor.height == 0:
+        return _empty_score_frame()
+
+    aw = weights[anchor_tf]
+    out = anchor.with_columns(
+        [
+            pl.lit(aw).alias("_wscore"),
+            (pl.when(pl.col("_anchor_setup")).then(aw).otherwise(0.0)).alias("_wsetup"),
+        ]
+    ).drop("_anchor_setup")
+
+    # ---- higher timeframes: BUY within last N signal rows up to scan_date ----
+    for tf in timeframes:
+        if tf == anchor_tf:
+            continue
+        w = weights[tf]
+        sig = (
+            sig_by_tf[tf]
+            .filter(pl.col("signal").is_in(["BUY", "SELL"]) & (pl.col("date") <= scan_date))
+            .sort(["symbol", "date"], descending=[False, True])
+            .group_by("symbol")
+            .head(_HIGHER_TF_LOOKBACK)
+        )
+        # Most-recent BUY per symbol within the lookback window (if any).
+        buys = (
+            sig.filter(pl.col("signal") == "BUY")
+            .sort(["symbol", "date"], descending=[False, True])
+            .group_by("symbol")
+            .agg(pl.col("setup_valid").fill_null(False).first().alias(f"_setup_{tf}"))
+            .with_columns(pl.lit(True).alias(f"_has_{tf}"))
+        )
+        out = out.join(buys, on="symbol", how="left")
+        out = out.with_columns(
+            [
+                (pl.col("_wscore") + pl.when(pl.col(f"_has_{tf}").fill_null(False)).then(w).otherwise(0.0)).alias("_wscore"),
+                (pl.col("_wsetup") + pl.when(pl.col(f"_setup_{tf}").fill_null(False)).then(w).otherwise(0.0)).alias("_wsetup"),
             ]
-        if exclude_strategy_names:
-            exclude_set = {p.lower() for p in exclude_strategy_names}
-            print(f"Excluding strategies: {', '.join(exclude_set)}")
-            selected_strategy_metadata = [
-                p for p in selected_strategy_metadata if p["strategy_name"].lower() not in exclude_set
-            ]
+        ).drop([f"_has_{tf}", f"_setup_{tf}"])
 
-        if not selected_strategy_metadata:
-            print("No strategies selected after filtering, returning empty signals list.")
-            return signals
+    out = out.with_columns(
+        [
+            pl.lit("BUY").alias("signal"),
+            (pl.col("_wscore") / total_weight).clip(0.0, 1.0).alias("confidence"),
+            (pl.col("_wsetup") > 0).alias("setup_valid"),
+            pl.lit(True).alias("trigger_met"),
+            pl.lit(strategy_name).alias("strategy_name"),
+        ]
+    )
+    return out.select(
+        "symbol", "signal", "price", "confidence", "setup_valid", "trigger_met", "strategy_name"
+    ).sort("confidence", descending=True)
 
-        # Get all the timeframes required for the strategy scanning
-        all_timeframes: List[str] = []
-        for strategy_metadata in selected_strategy_metadata:
-            for tf in strategy_metadata.get("timeframes", []):
-                if tf not in all_timeframes:
-                    all_timeframes.append(tf)
-        print(f"All timeframes required: {', '.join(all_timeframes)}")
 
-        # Define the start and end dates
-        start_date = scan_date - timedelta(days=365 * 3)
-        end_date = scan_date
-        print(f"Data window: {start_date} to {end_date}")
+def _empty_score_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "symbol": pl.Utf8,
+            "signal": pl.Utf8,
+            "price": pl.Float64,
+            "confidence": pl.Float64,
+            "setup_valid": pl.Boolean,
+            "trigger_met": pl.Boolean,
+            "strategy_name": pl.Utf8,
+        }
+    )
 
-        # Step 1: Batch-load the symbols
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i : i + batch_size]
-            print(f"Processing batch {i}-{min(i+batch_size, len(symbols))} ({len(batch_symbols)} symbols)")
-            # Step 1: Load the data by symbol
-            batch_symbols_dict = self.executor.load(
-                symbols=batch_symbols,
-                timeframes=all_timeframes,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            print(f"Loaded symbol data for {sum(1 for s in batch_symbols if s in batch_symbols_dict)}/{len(batch_symbols)} batch symbols.")
 
-            # Step 2: For each symbol, score the signals for each strategy
-            for symbol in batch_symbols:
-                symbol_data_dict = batch_symbols_dict.get(symbol, {})
-                if not symbol_data_dict:
-                    print(f"No data found for symbol: {symbol}")
-                    continue
-                # Step 3: For each profile, score the signals
-                for strategy_metadata in selected_strategy_metadata:
-                    strategy_factory: Callable[[], BaseStrategy] = strategy_metadata["strategy_factory"]
-                    strategy = strategy_factory()
-                    timeframes = strategy_metadata.get("timeframes", [])
-                    print(f"Scoring {symbol} for strategy {strategy_metadata['strategy_name']} on tfs {timeframes}")
-                    signal = self._score_signal(
-                        symbol=symbol,
-                        strategy=strategy,
-                        scan_date=scan_date,
-                        timeframes=timeframes,
-                        symbol_data_dict=symbol_data_dict,
-                    )
-                    # If the signal is valid, add it to the signals list
-                    if signal:
-                        metadata = dict(signal.metadata or {})
-                        metadata["strategy_name"] = strategy_metadata["strategy_name"]
-                        metadata["timeframes"] = strategy_metadata["timeframes"]
-                        signal.metadata = metadata
-                        signals.append(signal)
-                        print(f"Added signal for symbol: {symbol}, strategy: {strategy_metadata['strategy_name']}")
-
-        print(f"Run complete. Total signals generated: {len(signals)}")
-        # Return the signals list
-        return signals
-
-    def rank(
-        self,
-        signals: List[SignalResult],
-        top_k: int = 10,
-        by_pick_type: bool = False,
-        unique_symbol: bool = True,
-    ) -> Union[List[SignalResult], Dict[str, List[SignalResult]]]:
-        """
-        Rank signals by confidence only (dense rank).
-        
-        Args:
-            signals: List of SignalResult to rank.
-            top_k: Maximum dense-rank bucket to include (per strategy_name if by_pick_type=True).
-            by_pick_type: If True, group by strategy_name and return dict; else return flat list.
-            unique_symbol: If True, only one signal per symbol.
-        
-        Returns:
-            List[SignalResult] if by_pick_type=False, else Dict[str, List[SignalResult]].
-        """
-        if not signals:
-            return {} if by_pick_type else []
-
-        def rank_dense_confidence(items: List[SignalResult]) -> List[SignalResult]:
-            scored: List[tuple[float, SignalResult]] = [
-                (float(signal.confidence or 0.0), signal) for signal in items
-            ]
-            scored.sort(key=lambda x: x[0], reverse=True)
-
-            ranked_items: List[SignalResult] = []
-            seen_symbols: set[str] = set()
-            current_rank = 0
-            previous_confidence: Optional[float] = None
-            for confidence, signal in scored:
-                if previous_confidence is None or confidence != previous_confidence:
-                    current_rank += 1
-                    previous_confidence = confidence
-                if current_rank > top_k:
-                    break
-                if unique_symbol and signal.symbol in seen_symbols:
-                    continue
-                metadata = dict(signal.metadata or {})
-                metadata["ranking_score"] = confidence
-                metadata["dense_rank"] = current_rank
-                signal.metadata = metadata
-                ranked_items.append(signal)
-                seen_symbols.add(signal.symbol)
-            return ranked_items
-
-        if by_pick_type:
-            grouped_input: Dict[str, List[SignalResult]] = defaultdict(list)
-            for signal in signals:
-                pick_type = (signal.metadata or {}).get("strategy_name", "unclassified")
-                grouped_input[pick_type].append(signal)
-            return {
-                pick_type: rank_dense_confidence(group_signals)
-                for pick_type, group_signals in grouped_input.items()
-            }
-
-        return rank_dense_confidence(signals)
-
-    def write(
-        self,
-        ranked: Union[List[SignalResult], Dict[str, List[SignalResult]]],
-        rds_client: Any,
-        scan_date: date,
-    ) -> int:
-        """
-        Write ranked top picks to RDS.
-        
-        Args:
-            ranked: Output from rank(). Dict writes grouped pick types;
-                list is written as pick_type='unclassified'.
-            rds_client: RDS client with connection/conn or execute_query().
-            scan_date: Date for the scan (used for top_picks table).
-        
-        Returns:
-            Total rows written.
-        """
-        if not ranked:
-            return 0
-
-        conn = None
-        if hasattr(rds_client, "connection"):
-            conn = rds_client.connection
-        elif hasattr(rds_client, "conn"):
-            conn = rds_client.conn
-
-        if isinstance(ranked, dict):
-            ranked_dict = ranked
-        else:
-            ranked_dict = {"unclassified": ranked}
-
-        return self._write_top_picks_internal(ranked_dict, scan_date, conn, rds_client)
-
-    def _write_top_picks_internal(
-        self,
-        ranked: Dict[str, List[SignalResult]],
-        scan_date: date,
-        conn: Any,
-        rds_client: Any,
-    ) -> int:
-        """Internal: write top picks to daily_scan_top_picks."""
-        if not ranked:
-            return 0
-
-        values = []
-        for strategy_name, picks in ranked.items():
-            for rank_idx, signal in enumerate(picks, start=1):
-                metadata_json = json.dumps(signal.metadata or {})
-                values.append((
-                    signal.date or scan_date.isoformat(),
-                    signal.symbol,
-                    strategy_name,
-                    signal.signal,
-                    signal.price,
-                    float(signal.confidence or 0.0),
-                    metadata_json,
-                    rank_idx
-                ))
-
-        query = """
-        INSERT INTO stock_picks
-        (scan_date, symbol, strategy_name, signal, price, confidence, metadata, rank)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-        ON CONFLICT (scan_date, symbol, strategy_name)
-        DO UPDATE SET   
-            signal = EXCLUDED.signal,
-            price = EXCLUDED.price,
-            confidence = EXCLUDED.confidence,
-            metadata = EXCLUDED.metadata,
-            rank = EXCLUDED.rank
-        """
-
-        if conn:
-            with conn.cursor() as cur:
-                cur.executemany(query, values)
-            conn.commit()
-        elif hasattr(rds_client, "execute_query"):
-            for v in values:
-                rds_client.execute_query(query, v)
-        else:
-            raise ValueError("Unsupported rds_client")
-
-        return len(values)
-    
-    # Backward-compatible alias
-    scan = run
+def latest_buys(df: pl.DataFrame, scan_date=None) -> pl.DataFrame:
+    """
+    Return the BUY rows. If ``scan_date`` is given, restrict to that date so the
+    daily scan only surfaces symbols that triggered today.
+    """
+    out = df.filter(pl.col("signal") == "BUY")
+    if scan_date is not None:
+        out = out.filter(pl.col("date") == scan_date)
+    return out

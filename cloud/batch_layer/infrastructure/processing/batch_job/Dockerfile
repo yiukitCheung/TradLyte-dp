@@ -51,12 +51,10 @@ USER app
 #   resampler           (default) DuckDB S3 resampler
 #   consolidator        Bronze-layer S3 consolidator
 #   historical_backfill Historical OHLCV backfill
-#   scanner_worker      Array-job child: scan symbol slice → daily_scan_signals
 #   scanner_aggregator  Single job: global rank → stock_picks → cleanup staging
 CMD ["sh", "-c", "case \"$JOB_TYPE\" in \
   consolidator)        python consolidator.py ;; \
   historical_backfill) python historical_backfill.py ;; \
-  scanner_worker)      python scan.py ;; \
-  scanner_aggregator)  python scan.py ;; \
+  scanner_aggregator)  python aggregator.py ;; \
   *)                   python resampler.py ;; \
 esac"]

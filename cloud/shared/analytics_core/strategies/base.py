@@ -7,7 +7,7 @@ New expandable architecture supports N steps with individual timeframes.
 Partition awareness
 --------------------
 A strategy may be evaluated on a *single-symbol* frame (the backtester / serving
-layer) or on a *multi-symbol* long-format frame (the full-universe vectorized
+layer) or on a *multi-symbol* long-format frame (the full-universe scanner
 scanner). Cross-row operations (``shift``, ``rolling_*``, ``ewm_mean``,
 ``diff``, aggregates) must NOT bleed across symbols on a multi-symbol frame.
 
@@ -49,7 +49,7 @@ class BaseStrategy(ABC):
         Partition a cross-row expression when running on a multi-symbol frame.
 
         Returns ``expr.over(self._partition_by)`` while a partition is active
-        (e.g. ``"symbol"`` in the vectorized scanner) and ``expr`` unchanged
+        (e.g. ``"symbol"`` in the scanner) and ``expr`` unchanged
         otherwise. Wrap EVERY ``shift`` / ``rolling_*`` / ``ewm_mean`` / ``diff``
         / aggregate that must stay within a single symbol.
         """

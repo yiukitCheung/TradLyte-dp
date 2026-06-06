@@ -7,8 +7,7 @@
 #   ./build_scanner_container.sh --tag v1.2.0     # custom image tag
 #   ./build_scanner_container.sh --help
 #
-# The image is used for both scanner_worker (Array Job) and scanner_aggregator
-# (single job). Step Functions sets JOB_TYPE per submission.
+# The image runs the scanner aggregator (global rank -> stock_picks).
 
 set -e
 

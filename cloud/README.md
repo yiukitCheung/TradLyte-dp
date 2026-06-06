@@ -14,10 +14,10 @@ cloud/
 │   ├── fetching/lambda_functions/           # OHLCV/meta fetchers (no VPC) + planner (VPC)
 │   ├── ingesting/lambda_functions/          # S3 → RDS upsert handlers (VPC)
 │   ├── processing/
-│   │   ├── batch_jobs/scan.py               # Scanner aggregator entry point
+│   │   ├── batch_jobs/aggregator.py         # Scanner aggregator (rank → stock_picks)
 │   │   └── lambda_functions/
 │   │       ├── snapshot_builder.py          # RDS → long-format market_1d.parquet snapshot
-│   │       └── vectorized_scanner_runner.py # Whole-universe Polars scan → daily_scan_signals
+│   │       └── scanner.py                   # Full-universe scan → daily_scan_signals
 │   └── infrastructure/                      # Deploy scripts (fetching, ingesting, processing, orchestration)
 │
 ├── serving_layer/                           # REST API (live in dev)
@@ -47,11 +47,11 @@ cloud/
 | Planner / OHLCV fetcher / meta fetcher | `dev-batch-daily-ohlcv-planner`, `-ohlcv-fetcher`, `-meta-fetcher` |
 | OHLCV / meta ingest handlers | `dev-batch-daily-ohlcv-ingest-handler`, `-meta-ingest-handler` |
 | Snapshot builder | `dev-batch-scanner-snapshot-builder` |
-| Vectorized scanner | `dev-batch-vectorized-scanner` |
+| Scanner | `dev-batch-scanner` |
 | Aggregator | `dev-batch-scanner-aggregator` (Batch/Fargate) |
 | Orchestrator + schedule | `dev-daily-ohlcv-pipeline` (Step Functions), Mon–Fri 4:05 PM ET |
 
-The old partitioner + 10-child scanner-worker array was replaced by the single-pass vectorized scanner. Multi-timeframe bars are resampled on the fly from 1d.
+Multi-timeframe bars are resampled on the fly from 1d.
 
 ### Serving Layer (live in dev)
 

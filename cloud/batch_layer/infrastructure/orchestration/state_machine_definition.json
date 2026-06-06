@@ -1,5 +1,5 @@
 {
-  "Comment": "Daily pipeline: parallel fetch → wait for RDS hydration → build vectorized-scanner snapshot → vectorized full-universe scanner (single Lambda, writes daily_scan_signals) → global aggregator → done. The snapshot + vectorized scanner replaced the old partitioner + 10-child Batch worker array (parity validated offline).",
+  "Comment": "Daily pipeline: parallel fetch → wait for RDS hydration → build scanner snapshot → full-universe scanner (single Lambda, writes daily_scan_signals) → global aggregator → done. The snapshot + scanner replaced the old partitioner + 10-child Batch worker array.",
   "StartAt": "ResolveScanDate",
   "States": {
 
@@ -214,7 +214,7 @@
 
     "BuildScannerSnapshot": {
       "Type": "Task",
-      "Comment": "Incrementally rewrite the consolidated long-format 1d OHLCV Parquet snapshot (scanner-snapshots/latest/market_1d.parquet) used by the vectorized full-universe scanner. RDS is hydrated by now, so this pulls only scan_date's new bars, dedupes on (symbol,date), trims the retention window, and rewrites. CRITICAL after cutover: the vectorized scanner only emits BUY signals for symbols that have a bar on scan_date, so a missing/stale snapshot ⇒ zero picks. On failure we alert instead of silently scanning stale data.",
+      "Comment": "Incrementally rewrite the consolidated long-format 1d OHLCV Parquet snapshot (scanner-snapshots/latest/market_1d.parquet) used by the full-universe scanner. RDS is hydrated by now, so this pulls only scan_date's new bars, dedupes on (symbol,date), trims the retention window, and rewrites. CRITICAL: the scanner only emits BUY signals for symbols that have a bar on scan_date, so a missing/stale snapshot ⇒ zero picks. On failure we alert instead of silently scanning stale data.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-scanner-snapshot-builder",
@@ -239,20 +239,20 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "RunVectorizedScanner"
+      "Next": "RunScanner"
     },
 
-    "RunVectorizedScanner": {
+    "RunScanner": {
       "Type": "Task",
-      "Comment": "Single Lambda replacing the partitioner + 10-child Batch worker array. Reads the long-format snapshot, runs every strategy across the WHOLE universe with Polars window functions (1d anchor + 3d/5d confirmation, identical scoring/confidence to the per-symbol scanner — parity validated offline), and writes raw signals to daily_scan_signals. Runs in seconds.",
+      "Comment": "Single Lambda replacing the partitioner + 10-child Batch worker array. Reads the long-format snapshot, runs every strategy across the WHOLE universe with Polars window functions (1d anchor + 3d/5d confirmation), and writes raw signals to daily_scan_signals. Runs in seconds.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-vectorized-scanner",
+        "FunctionName": "arn:aws:lambda:ca-west-1:471112909340:function:dev-batch-scanner",
         "Payload": {
           "scan_date.$": "$.scan_date"
         }
       },
-      "ResultPath": "$.vectorizedResult",
+      "ResultPath": "$.scannerResult",
       "Retry": [
         {
           "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.Unknown"],
@@ -276,7 +276,7 @@
       "Comment": "Cutover safety net: if the snapshot lacked a bar for scan_date (stale_snapshot=true), the scan produced no anchor-day signals — surface it as a failure rather than writing an empty pick set.",
       "Choices": [
         {
-          "Variable": "$.vectorizedResult.Payload.stale_snapshot",
+          "Variable": "$.scannerResult.Payload.stale_snapshot",
           "BooleanEquals": true,
           "Next": "StaleSnapshotError"
         }
@@ -288,7 +288,7 @@
       "Type": "Pass",
       "Comment": "Snapshot had no bar for scan_date — set a descriptive error for the SNS alert.",
       "Parameters": {
-        "error": "Vectorized scanner ran on a stale snapshot (no bar for scan_date). OHLCV ingest likely incomplete; daily_scan_signals would be empty."
+        "error": "Scanner ran on a stale snapshot (no bar for scan_date). OHLCV ingest likely incomplete; daily_scan_signals would be empty."
       },
       "ResultPath": "$.error",
       "Next": "NotifyFailure"

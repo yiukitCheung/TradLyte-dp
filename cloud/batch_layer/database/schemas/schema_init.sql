@@ -253,7 +253,7 @@ CREATE INDEX IF NOT EXISTS idx_stock_picks_symbol_date
 ON stock_picks(symbol, scan_date);
 
 -- ============================================================================
--- Array-job staging table: each scanner_worker child writes its raw signals here.
+-- Scanner staging table: scanner Lambda writes raw signals; aggregator clears daily.
 -- The scanner_aggregator reads the full day's signals, ranks globally, then
 -- writes to stock_picks. Rows are deleted after aggregation (self-cleaning).
 -- ============================================================================

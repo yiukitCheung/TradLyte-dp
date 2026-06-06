@@ -2,7 +2,7 @@
 Scanner Snapshot Builder Lambda
 
 Maintains a single consolidated, long-format Parquet snapshot of the entire
-1d OHLCV universe so the vectorized scanner can pull the whole market into
+1d OHLCV universe so the scanner can pull the whole market into
 RAM with one S3 GET and run strategies via ``.over("symbol")``.
 
 Why a dedicated snapshot (vs. scanning bronze directly)

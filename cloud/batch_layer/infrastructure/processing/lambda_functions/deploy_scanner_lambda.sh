@@ -1,19 +1,18 @@
 #!/bin/bash
-# Build and deploy the vectorized_scanner_runner Lambda function.
+# Build and deploy the scanner Lambda function (dev-batch-scanner).
 #
-# Single-pass replacement for the per-symbol Batch scanner worker phase. Reads
-# the long-format snapshot from S3, runs all strategies across the whole
-# universe with Polars, and writes raw signals to daily_scan_signals (the same
-# staging table the existing aggregator reads).
+# Single-pass full-universe scanner. Reads the long-format snapshot from S3,
+# runs all strategies across the whole universe with Polars, and writes raw
+# signals to daily_scan_signals (the staging table the aggregator reads).
 #
 # Self-contained: bundles polars + psycopg2-binary + pydantic + the whole
 # analytics_core package (so the runner uses the shared, partition-aware
-# strategy library — the same code the per-symbol scanner/backtester run).
+# strategy library — the same code the backtester runs).
 #
 # Usage:
-#   ./deploy_vectorized_scanner_lambda.sh            # update existing function
-#   ./deploy_vectorized_scanner_lambda.sh --create   # create then deploy
-#   ./deploy_vectorized_scanner_lambda.sh --help
+#   ./deploy_scanner_lambda.sh            # update existing function
+#   ./deploy_scanner_lambda.sh --create   # create then deploy
+#   ./deploy_scanner_lambda.sh --help
 #
 # Required for --create:
 #   RDS_SECRET_ARN, S3_BUCKET_NAME (or defaults)
@@ -34,9 +33,9 @@ SHARED_DIR="$CLOUD_DIR/shared"
 
 AWS_REGION="${AWS_REGION:-ca-west-1}"
 FUNCTION_PREFIX="${FUNCTION_PREFIX:-dev-batch-}"
-FUNCTION_SUFFIX="vectorized-scanner"
-FUNCTION_NAME="${FUNCTION_PREFIX}${FUNCTION_SUFFIX}"   # dev-batch-vectorized-scanner
-FILE_NAME="vectorized_scanner_runner"
+FUNCTION_SUFFIX="scanner"
+FUNCTION_NAME="${FUNCTION_PREFIX}${FUNCTION_SUFFIX}"   # dev-batch-scanner
+FILE_NAME="scanner"
 LAMBDA_HANDLER="${FILE_NAME}.lambda_handler"
 LAMBDA_RUNTIME="python3.11"
 LAMBDA_TIMEOUT=900       # 15 min (runs in seconds; generous headroom)
@@ -47,7 +46,7 @@ REFERENCE_FUNCTION="${REFERENCE_FUNCTION:-${FUNCTION_PREFIX}scanner-snapshot-bui
 LAMBDA_DEPLOY_BUCKET="${LAMBDA_DEPLOY_BUCKET:-dev-condvest-lambda-deploy}"
 PACKAGE_DIR="$SCRIPT_DIR/package/$FUNCTION_SUFFIX"
 ZIP_FILE="$SCRIPT_DIR/${FUNCTION_SUFFIX}.zip"
-REQUIREMENTS="$PROCESSING_DIR/lambda_functions/requirements.vectorized_scanner.txt"
+REQUIREMENTS="$PROCESSING_DIR/lambda_functions/requirements.scanner.txt"
 
 CREATE_MODE=false
 usage() {
@@ -66,7 +65,7 @@ PIP_CMD=$(command -v pip3 2>/dev/null || command -v pip 2>/dev/null || echo "pip
 separator() { echo ""; echo "============================================================"; }
 
 separator
-echo "  vectorized_scanner_runner Lambda — Deploy"
+echo "  Scanner Lambda — Deploy"
 separator
 echo "Region:       $AWS_REGION"
 echo "Function:     $FUNCTION_NAME"
@@ -154,7 +153,7 @@ if $CREATE_MODE; then
                 SNAPSHOT_PREFIX=scanner-snapshots,
                 SCAN_WINDOW_DAYS=1095
             }" \
-            --description "Vectorized full-universe scanner: snapshot -> daily_scan_signals (replaces Batch worker array)" \
+            --description "Full-universe scanner: snapshot -> daily_scan_signals (single Polars pass)" \
             --region "$AWS_REGION" --output json | jq '{FunctionName, Runtime, Handler, Timeout, MemorySize, LastModified}'
         echo "Function created."
         echo ""
@@ -187,7 +186,12 @@ deploy_to() {
 }
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" &>/dev/null; then
-    echo "Updating $FUNCTION_NAME..."; deploy_to "$FUNCTION_NAME"; echo "Deployed successfully."
+    echo "Updating $FUNCTION_NAME..."; deploy_to "$FUNCTION_NAME"
+    aws lambda update-function-configuration \
+        --function-name "$FUNCTION_NAME" \
+        --handler "$LAMBDA_HANDLER" \
+        --region "$AWS_REGION" --output json | jq '{FunctionName, Handler, LastModified}'
+    echo "Deployed successfully."
 else
     echo "ERROR: Function $FUNCTION_NAME not found. First-time setup? Run: $0 --create"
     rm -f "$ZIP_FILE"; rm -rf "$PACKAGE_DIR"; exit 1

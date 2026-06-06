@@ -44,7 +44,7 @@ flowchart TB
 
   subgraph SCAN["Scanner"]
     LF_SNAP["snapshot-builder (Lambda, VPC)"]
-    LF_VEC["vectorized-scanner (Lambda, VPC)"]
+    LF_SCAN["scanner (Lambda, VPC)"]
     BATCH_A["scanner-aggregator (Batch/Fargate)"]
   end
 
@@ -74,8 +74,8 @@ flowchart TB
   S3_META --> LF_INGEST_M --> T_META
   SFN --> LF_SNAP
   T_OHLCV --> LF_SNAP --> S3_SNAP
-  SFN --> LF_VEC
-  S3_SNAP --> LF_VEC --> T_STAGE
+  SFN --> LF_SCAN
+  S3_SNAP --> LF_SCAN --> T_STAGE
   SFN --> BATCH_A
   T_STAGE --> BATCH_A --> T_PICKS
   SFN -->|failure| SNS
@@ -93,7 +93,7 @@ flowchart TB
 | 1 — Fetch | `daily-ohlcv-fetcher`, `daily-meta-fetcher` | Lambda (no VPC) | Pull Polygon → S3 bronze (parquet OHLCV + JSON metadata manifest) |
 | 2 — Ingest | `daily-ohlcv-ingest-handler`, `daily-meta-ingest-handler` | Lambda (VPC) | Upsert S3 bronze → RDS; update SCD-2 watermark |
 | 3 — Snapshot | `scanner-snapshot-builder` | Lambda (VPC) | Dedupe/trim RDS 1d bars → long-format `market_1d.parquet` in S3 |
-| 4 — Scan | `vectorized-scanner` | Lambda (VPC) | Read snapshot, run every strategy across the whole universe in one Polars pass (1d anchor + 3d/5d confirm), write `daily_scan_signals` |
+| 4 — Scan | `scanner` | Lambda (VPC) | Read snapshot, run every strategy across the whole universe in one Polars pass (1d anchor + 3d/5d confirm), write `daily_scan_signals` |
 | 5 — Aggregate | `scanner-aggregator` | Batch/Fargate | Rank globally across the universe, write `stock_picks`, clear staging |
 
 EventBridge triggers the Step Functions pipeline Mon–Fri at 4:05 PM ET; any stage failure routes to the SNS alert topic. Multi-timeframe bars (3d/5d) are resampled on the fly from 1d — no silver tables are persisted.
@@ -109,7 +109,7 @@ EventBridge triggers the Step Functions pipeline Mon–Fri at 4:05 PM ET; any st
 | OHLCV ingest | `dev-batch-daily-ohlcv-ingest-handler` (Lambda) | VPC |
 | Meta ingest | `dev-batch-daily-meta-ingest-handler` (Lambda) | VPC |
 | Snapshot builder | `dev-batch-scanner-snapshot-builder` (Lambda) | VPC |
-| Vectorized scanner | `dev-batch-vectorized-scanner` (Lambda) | VPC |
+| Scanner | `dev-batch-scanner` (Lambda) | VPC |
 | Aggregator | `dev-batch-scanner-aggregator` (Batch/Fargate) | VPC |
 | Orchestrator | `dev-daily-ohlcv-pipeline` (Step Functions) + EventBridge schedule | — |
 
@@ -119,7 +119,7 @@ EventBridge triggers the Step Functions pipeline Mon–Fri at 4:05 PM ET; any st
 | `shared.clients` | RDS client (connection + upsert + watermark) and Polygon REST wrapper |
 | `shared.models.data_models` | Pydantic DTOs |
 | `shared.utils` | Watermark + 5-year retention helpers; US/Eastern trading-day arithmetic |
-| `shared.analytics_core` | Strategy engine: `indicators/`, `strategies/` (base + builder + library), `vectorized_scanner.py`, `scanner.py`, `backtester.py`, `executor.py`, `inputs.py`, `models.py` |
+| `shared.analytics_core` | Strategy engine: `indicators/`, `strategies/` (base + builder + library), `scanner.py`, `backtester.py`, `executor.py`, `inputs.py`, `models.py` |
 
 ### Serving layer
 | Component | AWS resource | What it does |

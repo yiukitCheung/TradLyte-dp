@@ -7,7 +7,7 @@ Backend data pipeline for **TradLyte**, a trading-analytics platform. It ingests
 | Path | What it does |
 |---|---|
 | `cloud/` | Production AWS stack (batch pipeline + serving API) |
-| `cloud/batch_layer/` | Daily pipeline: fetch → ingest → snapshot → vectorized scan → aggregate |
+| `cloud/batch_layer/` | Daily pipeline: fetch → ingest → snapshot → scan → aggregate |
 | `cloud/serving_layer/` | FastAPI-on-Lambda REST API behind HTTP API Gateway |
 | `cloud/shared/` | Cross-layer libraries: clients, models, utils, and the `analytics_core` strategy engine |
 | `cloud/speed_layer/` | Archived real-time (Kinesis/Flink) design — not deployed |
@@ -20,7 +20,7 @@ Backend data pipeline for **TradLyte**, a trading-analytics platform. It ingests
 Polygon.io ─► Batch Layer (Step Functions, daily at market close) ─► stock_picks (RDS) ─► Serving API ─► Frontend
 ```
 
-The batch layer fetches OHLCV + metadata to S3, ingests to RDS, builds a long-format market snapshot, runs every strategy across the whole universe in one vectorized pass, and ranks the results into `stock_picks`. The serving layer reads those tables over a REST API.
+The batch layer fetches OHLCV + metadata to S3, ingests to RDS, builds a long-format market snapshot, runs every strategy across the whole universe in one pass, and ranks the results into `stock_picks`. The serving layer reads those tables over a REST API.
 
 ## Tech stack
 

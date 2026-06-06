@@ -11,4 +11,4 @@ Components removed from the active pipeline. Kept here for reference / one-off b
 These were retired by two pipeline changes:
 
 - **Resampling moved to runtime** — multi-timeframe bars are computed on the fly from 1d (Polars `group_by_dynamic`), so the consolidator/resampler and silver tables are no longer written.
-- **Scanner went single-pass** — the partitioner + 10-child Fargate worker array was replaced by the vectorized scanner Lambda, which scans the whole universe in one pass from the market snapshot.
+- **Scanner went single-pass** — the partitioner + 10-child Fargate worker array was replaced by the scanner Lambda (`dev-batch-scanner`), which scans the whole universe in one pass from the market snapshot.

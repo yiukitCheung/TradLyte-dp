@@ -2,7 +2,7 @@
 # Build and deploy the snapshot_builder Lambda function.
 #
 # Maintains the consolidated long-format 1d OHLCV Parquet snapshot in S3 that
-# the vectorized scanner reads. Self-contained: bundles only polars +
+# the scanner reads. Self-contained: bundles only polars +
 # psycopg2-binary (no shared/ modules — it resolves the RDS secret itself).
 #
 # Usage:
@@ -21,7 +21,7 @@
 #   LAMBDA_ROLE_ARN     IAM role for Lambda execution (auto-detected for --create)
 #   LAMBDA_DEPLOY_BUCKET  S3 bucket for large packages (default: dev-condvest-lambda-deploy)
 #   REFERENCE_FUNCTION  Existing Lambda to copy IAM role + VPC config from
-#                       (default: dev-batch-scan-partitioner)
+#                       (default: dev-batch-daily-ohlcv-ingest-handler)
 
 set -e
 
@@ -45,7 +45,7 @@ LAMBDA_RUNTIME="python3.11"
 LAMBDA_TIMEOUT=900       # 15 min — bootstrap reads years of history from RDS
 LAMBDA_MEMORY=4096       # MB — full ~10M-row universe frame in RAM (bootstrap + incremental rewrite)
 LAMBDA_EPHEMERAL=2048    # MB /tmp — stage existing + output Parquet on disk (avoids in-memory byte copies)
-REFERENCE_FUNCTION="${REFERENCE_FUNCTION:-${FUNCTION_PREFIX}scan-partitioner}"
+REFERENCE_FUNCTION="${REFERENCE_FUNCTION:-${FUNCTION_PREFIX}daily-ohlcv-ingest-handler}"
 
 LAMBDA_DEPLOY_BUCKET="${LAMBDA_DEPLOY_BUCKET:-dev-condvest-lambda-deploy}"
 PACKAGE_DIR="$SCRIPT_DIR/package/$FUNCTION_SUFFIX"
@@ -68,7 +68,7 @@ usage() {
     echo "  RDS_SECRET_ARN       Secrets Manager ARN     (required for --create)"
     echo "  S3_BUCKET_NAME       Datalake S3 bucket      (required for --create)"
     echo "  LAMBDA_ROLE_ARN      IAM execution role ARN  (auto-detected for --create)"
-    echo "  REFERENCE_FUNCTION   Lambda to copy role+VPC (default: dev-batch-scan-partitioner)"
+    echo "  REFERENCE_FUNCTION   Lambda to copy role+VPC (default: dev-batch-daily-ohlcv-ingest-handler)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -196,7 +196,7 @@ if $CREATE_MODE; then
                 SNAPSHOT_PREFIX=scanner-snapshots,
                 SNAPSHOT_RETENTION_DAYS=1825
             }" \
-            --description "Builds/maintains the long-format 1d OHLCV Parquet snapshot for the vectorized scanner" \
+            --description "Builds/maintains the long-format 1d OHLCV Parquet snapshot for the scanner" \
             --region "$AWS_REGION" \
             --output json | jq '{FunctionName, Runtime, Handler, Timeout, MemorySize, LastModified}'
 

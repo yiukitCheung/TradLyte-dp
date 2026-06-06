@@ -1,35 +1,16 @@
 """
-Vectorized Scanner Runner Lambda
+Scanner Lambda (dev-batch-scanner)
 
-Single-pass replacement for the per-symbol AWS Batch scanner *worker* phase
-(the 10-child array job). Reads the consolidated long-format snapshot
+Reads the consolidated long-format snapshot
 (scanner-snapshots/latest/market_1d.parquet), runs every registered strategy
-across the ENTIRE universe at once using Polars window functions, and writes
-raw BUY signals to ``daily_scan_signals`` — the exact same staging table the
-existing Phase-2 aggregator reads. The aggregator (global ranking ->
-stock_picks) is unchanged.
+across the entire universe in one Polars pass, and writes raw BUY signals to
+``daily_scan_signals`` — the staging table the aggregator reads.
 
-Why this exists
----------------
-The old worker phase fanned out into N containers, each querying RDS for ~500
-symbols and looping symbol-by-symbol through strategies. This Lambda collapses
-that into one vectorized scan over an in-memory frame. Offline parity against
-``DailyScanner._score_signal`` was validated to produce identical BUY sets and
-confidences (golden_cross + vegas_channel_short_term).
-
-Parity-critical details
-------------------------
-* Window: scores against a trailing 3-year window ending at scan_date — the
-  same window ``DailyScanner.run`` uses (scan_date - 3*365 days). Indicator
-  warm-up therefore matches the per-symbol path exactly.
-* Resampling/scoring live in ``analytics_core.vectorized_scanner`` (the whole
-  package is bundled), which mirrors ``resample_ohlcv`` and ``_score_signal``
-  and runs the SAME shared library strategies partition-aware (one source of
-  truth for signal logic across scanner/backtester).
+Scoring logic lives in ``analytics_core.scanner`` (bundled with this deployment).
 
 Invoked by Step Functions (after BuildScannerSnapshot):
   Payload:
-    scan_date: "YYYY-MM-DD"   (required in pipeline; defaults to snapshot max date)
+    scan_date: "YYYY-MM-DD"   (defaults to snapshot max date)
     strategies: ["golden_cross", ...]  (optional; default = all registered)
 
 Environment:
@@ -50,13 +31,12 @@ import boto3
 import polars as pl
 import psycopg2
 
-# The analytics_core package is bundled by the deploy script so the runner uses
-# the SAME partition-aware strategy library as the per-symbol scanner/backtester.
-# Fall back to the shared package path for local execution / tests.
+# analytics_core is bundled at deploy time. Use the package import so this file
+# can also be named scanner.py without shadowing the library module.
 try:
-    from analytics_core import vectorized_scanner as vs
+    from analytics_core import scanner as ac_scanner
 except ImportError:  # pragma: no cover - local dev
-    from shared.analytics_core import vectorized_scanner as vs  # type: ignore
+    from shared.analytics_core import scanner as ac_scanner  # type: ignore
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -69,7 +49,7 @@ SCAN_WINDOW_DAYS = int(os.environ.get("SCAN_WINDOW_DAYS", "1095"))  # 3 years
 
 LOCAL_SNAPSHOT = "/tmp/scanner_snapshot.parquet"
 
-# DDL kept byte-identical to batch_jobs/scan.py so the table contract matches.
+# DDL kept byte-identical to batch_jobs/aggregator.py so the table contract matches.
 _DDL = """
 CREATE TABLE IF NOT EXISTS daily_scan_signals (
     scan_date     DATE         NOT NULL,
@@ -86,7 +66,6 @@ CREATE TABLE IF NOT EXISTS daily_scan_signals (
 """
 _DDL_IDX = "CREATE INDEX IF NOT EXISTS idx_daily_scan_signals_date ON daily_scan_signals(scan_date);"
 
-# Single logical worker (no array fan-out anymore).
 WORKER_IDX = 0
 
 
@@ -138,7 +117,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     event = event or {}
     logger.info("Event: %s", json.dumps(event, default=str))
 
-    # ---- load snapshot ----
     s3 = boto3.client("s3")
     s3.download_file(BUCKET, LATEST_KEY, LOCAL_SNAPSHOT)
     snapshot = pl.read_parquet(LOCAL_SNAPSHOT)
@@ -149,30 +127,27 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         snapshot.height, snapshot["symbol"].n_unique(), snapshot["date"].min(), snapshot_max, scan_date,
     )
 
-    # ---- trailing window (parity with DailyScanner.run) ----
     window_start = scan_date - timedelta(days=SCAN_WINDOW_DAYS)
     base = snapshot.filter(
         (pl.col("date") >= window_start) & (pl.col("date") <= scan_date)
     ).sort(["symbol", "date"])
     logger.info("Windowed base rows=%s (>= %s)", base.height, window_start)
 
-    strategies = event.get("strategies") or list(vs.STRATEGY_REGISTRY.keys())
+    strategies = event.get("strategies") or list(ac_scanner.STRATEGY_REGISTRY.keys())
 
-    # ---- score every strategy over the full universe ----
     all_rows: List[tuple] = []
     per_strategy: Dict[str, int] = {}
     for name in strategies:
-        if name not in vs.STRATEGY_REGISTRY:
+        if name not in ac_scanner.STRATEGY_REGISTRY:
             logger.warning("Unknown strategy '%s' — skipping.", name)
             continue
-        _, timeframes = vs.STRATEGY_REGISTRY[name]
-        scored = vs.score_multi_timeframe(base, name, scan_date)
+        _, timeframes = ac_scanner.STRATEGY_REGISTRY[name]
+        scored = ac_scanner.score_multi_timeframe(base, name, scan_date)
         rows = _build_rows(scored, name, timeframes, scan_date)
         per_strategy[name] = len(rows)
         all_rows.extend(rows)
         logger.info("Strategy %s -> %s BUY signals", name, len(rows))
 
-    # ---- write to daily_scan_signals ----
     conn = psycopg2.connect(get_rds_connection_string())
     try:
         with conn.cursor() as cur:

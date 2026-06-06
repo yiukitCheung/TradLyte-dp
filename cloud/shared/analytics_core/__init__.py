@@ -9,11 +9,11 @@ A pip-installable package containing:
 - Composite strategy builder (mix-and-match user strategies)
 - Multi-timeframe executor (supports different timeframes per step)
 - Backtester engine (position tracking, performance metrics)
-- Daily scanner (batch processing for all symbols)
-- Data loading utilities (Parquet from S3/Bronze, multi-timeframe support)
+- Full-universe scanner (one Polars pass over all symbols)
+- Data loading utilities (RDS 1d OHLCV + on-the-fly multi-timeframe resampling)
 
 Used by:
-- Batch Layer: Daily Scanner (all symbols × all strategies)
+- Batch Layer: Scanner (all symbols × all strategies, single pass)
 - Serving Layer: Backtester (1 symbol × 1 custom strategy)
 """
 
@@ -23,7 +23,7 @@ from .strategies.base import BaseStrategy
 from .strategies.builder import CompositeStrategy
 from .inputs import load_ohlcv, load_ohlcv_multi_timeframe, resample_ohlcv
 from .executor import MultiTimeframeExecutor
-from .scanner import DailyScanner
+from .scanner import score_multi_timeframe, STRATEGY_REGISTRY
 
 # Backtester is only used by the serving layer — import lazily so the scanner
 # Batch image (which omits numpy) does not fail on package load.
@@ -44,7 +44,9 @@ __all__ = [
     'Backtester',
     'BacktestResult',
     'Position',
-    'DailyScanner',
+    # Scanner
+    'score_multi_timeframe',
+    'STRATEGY_REGISTRY',
     # Data loading
     'resample_ohlcv',
     'load_ohlcv',

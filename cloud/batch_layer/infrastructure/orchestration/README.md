@@ -10,14 +10,14 @@ Step Functions: dev-daily-ohlcv-pipeline
   STAGE 1  Fetch (parallel)  (Lambda, no VPC)     OHLCV + meta → S3 bronze
   STAGE 2  Ingest            (Lambda, VPC)        S3 → RDS upsert + watermark update
   STAGE 3  Build snapshot    (Lambda, VPC)        RDS 1d bars → scanner-snapshots/latest/market_1d.parquet
-  STAGE 4  Vectorized scan   (Lambda, VPC)        whole-universe Polars scan → daily_scan_signals
+  STAGE 4  Scan             (Lambda, VPC)        whole-universe Polars scan → daily_scan_signals
            (CheckSnapshotFreshness fails fast if the snapshot has no bar for scan_date)
   STAGE 5  Aggregate         (Batch/Fargate)      global rank → stock_picks; clear staging
 
   ON FAILURE (any stage) → SNS: condvest-pipeline-alerts → Email
 ```
 
-The vectorized scanner runs every strategy across ~12k symbols in one pass with Polars window functions, replacing the old partitioner + 10-child Fargate array worker. Total run ~18–22 min (dominated by a 15-min RDS-hydration wait).
+The scanner runs every strategy across ~12k symbols in one pass with Polars window functions. Total run ~18–22 min (dominated by a 15-min RDS-hydration wait).
 
 ## AWS resources
 
@@ -30,7 +30,7 @@ The vectorized scanner runs every strategy across ~12k symbols in one pass with 
 | OHLCV / meta fetchers | `dev-batch-daily-ohlcv-fetcher`, `dev-batch-daily-meta-fetcher` | 1 |
 | OHLCV / meta ingest | `dev-batch-daily-ohlcv-ingest-handler`, `dev-batch-daily-meta-ingest-handler` | 2 |
 | Snapshot builder | `dev-batch-scanner-snapshot-builder` | 3 |
-| Vectorized scanner | `dev-batch-vectorized-scanner` | 4 |
+| Scanner | `dev-batch-scanner` | 4 |
 | Aggregator | `dev-batch-scanner-aggregator` (Batch/Fargate) | 5 |
 
 Lambda stages retry twice with exponential backoff; the aggregator Batch stage retries twice. Exact settings live in `state_machine_definition.json`.

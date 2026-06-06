@@ -4,7 +4,7 @@ The snapshot builder (`snapshot_builder.py`) writes to `s3://<datalake>/scanner-
 
 | Key | Purpose | Retention |
 |-----|---------|-----------|
-| `scanner-snapshots/latest/market_1d.parquet` | Stable key the vectorized scanner always reads; overwritten each run | Permanent |
+| `scanner-snapshots/latest/market_1d.parquet` | Stable key the scanner always reads; overwritten each run | Permanent |
 | `scanner-snapshots/history/<date>/market_1d.parquet` | Point-in-time dated copy | 14 days (lifecycle) |
 
 Dated copies live under a dedicated `history/` subprefix so the expiry rule targets them without ever touching the permanent `latest/` object.
