@@ -25,6 +25,7 @@ venv.bak/
 prefect_medallion/process/storage/silver/resampled.duckdb
 prefect_medallion/process/storage/gold/*.parquet
 .cloud_dp/
+cloud/.cloud_dp/
 .local_dp/
 
 # AWS Lambda Architecture specific

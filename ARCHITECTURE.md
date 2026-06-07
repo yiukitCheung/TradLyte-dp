@@ -4,7 +4,7 @@ A serverless, event-driven market-data platform on AWS, following a Batch + Serv
 
 - **Batch Layer** — ingests daily OHLCV + symbol metadata and runs the daily strategy scanner at market close.
 - **Serving Layer** — REST APIs for screener, picks, market data, and backtest.
-- **Speed Layer** — designed but archived (Kinesis/Flink path in `cloud/speed_layer/Archive/`).
+- **Speed Layer** — designed but archived (Kinesis/Flink path in `cloud/_archive/speed_layer/`).
 
 Two structural rules: no real-time streaming in the MVP, and strict separation between **fetch (stateless, no VPC)** and **ingest (VPC, private DB)** so external egress and private DB access never share blast radius.
 
