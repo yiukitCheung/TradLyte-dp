@@ -1,6 +1,7 @@
 # Local development and CI tooling (not bundled into Lambdas).
 -r requirements.txt
 
+cachetools>=5.5.0
 pytest==8.3.4
 pytest-asyncio==0.24.0
 moto==5.0.21

@@ -43,8 +43,9 @@ _PICKS_TODAY_JOIN_WHERE = """
           AND (%(industry)s::text IS NULL OR m.industry = %(industry)s)
           AND (%(min_mc)s::bigint IS NULL OR m.marketcap >= %(min_mc)s)
           AND (%(max_mc)s::bigint IS NULL OR m.marketcap <= %(max_mc)s)
-        ORDER BY m.marketcap DESC
 """
+
+_PICKS_ORDER_BY = "m.marketcap DESC NULLS LAST, sp.rank ASC"
 
 
 def _parse_horizons(raw_horizons: str) -> List[int]:
@@ -92,9 +93,10 @@ def get_picks_today(
                sp.signal,
                sp.price,
                sp.confidence,
-               sp.metadata
+               sp.metadata,
+               m.marketcap AS market_cap
         {_PICKS_TODAY_JOIN_WHERE}
-        ORDER BY sp.rank ASC
+        ORDER BY {_PICKS_ORDER_BY}
         LIMIT %(limit)s;
     """
     rows = execute_query(query, params=params)
@@ -105,6 +107,7 @@ def get_picks_today(
             "count": len(rows),
             "limit": limit,
             "scan_date": scan_date,
+            "sort": "marketcap:desc",
             "filters": {
                 "industry": filt["industry"],
                 "min_market_cap": filt["min_mc"],
@@ -141,9 +144,10 @@ def get_picks_today_metadata(
                sp.rank,
                sp.symbol,
                sp.strategy_name,
-               sp.metadata
+               sp.metadata,
+               m.marketcap AS market_cap
         {_PICKS_TODAY_JOIN_WHERE}
-        ORDER BY sp.rank ASC
+        ORDER BY {_PICKS_ORDER_BY}
         LIMIT %(limit)s;
     """
     rows = execute_query(query, params=params)
@@ -154,6 +158,7 @@ def get_picks_today_metadata(
             "count": len(rows),
             "limit": limit,
             "scan_date": scan_date,
+            "sort": "marketcap:desc",
             "filters": {
                 "industry": filt["industry"],
                 "min_market_cap": filt["min_mc"],
@@ -284,7 +289,8 @@ def get_pick_returns(
                    sp.strategy_name,
                    sp.signal,
                    sp.price AS pick_price,
-                   sp.scan_date
+                   sp.scan_date,
+                   m.marketcap AS market_cap
             FROM stock_picks sp
             LEFT JOIN symbol_metadata m ON m.symbol = sp.symbol
             WHERE sp.scan_date = %(scan_date)s::date
@@ -329,7 +335,7 @@ def get_pick_returns(
                     LIMIT 1
                ) AS close_now
         FROM picks p
-        ORDER BY p.rank;
+        ORDER BY p.market_cap DESC NULLS LAST, p.rank ASC;
     """
     rows = execute_query(query, params=params)
 
@@ -352,6 +358,7 @@ def get_pick_returns(
                 "strategy_name": row["strategy_name"],
                 "signal": row["signal"],
                 "pick_price": row["pick_price"],
+                "market_cap": row.get("market_cap"),
                 "close_now": row.get("close_now"),
                 "return_to_date": _to_return(row.get("pick_price"), row.get("close_now")),
                 "returns": return_map,
@@ -364,6 +371,7 @@ def get_pick_returns(
             "count": len(data),
             "scan_date": scan_date.isoformat(),
             "horizons": selected_horizons,
+            "sort": "marketcap:desc",
             "filters": {
                 "industry": filt["industry"],
                 "min_market_cap": filt["min_mc"],
