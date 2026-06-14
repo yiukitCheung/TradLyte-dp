@@ -132,6 +132,10 @@ cp "$PROCESSING_DIR/lambda_functions/${FILE_NAME}.py" "$PACKAGE_DIR/${FILE_NAME}
 mkdir -p "$PACKAGE_DIR/clients"
 cp "$CLOUD_DIR/shared/clients/rds_connection.py" "$PACKAGE_DIR/clients/rds_connection.py"
 touch "$PACKAGE_DIR/clients/__init__.py"
+# Shared DB layer (catalog SQL) — flattened to db/ at the zip root;
+# snapshot_builder imports `from db.catalog`.
+rm -rf "$PACKAGE_DIR/db"
+cp -r "$CLOUD_DIR/shared/db" "$PACKAGE_DIR/db"
 
 echo "Removing cache files..."
 find "$PACKAGE_DIR" -name "*.pyc" -delete

@@ -37,10 +37,12 @@ try:
     from analytics_core import scanner as ac_scanner
     from clients.rds_connection import get_rds_connection_string
     from database.staging import ensure_daily_scan_signals
+    from db.catalog import load_sql
 except ImportError:  # pragma: no cover - local dev
     from shared.analytics_core import scanner as ac_scanner  # type: ignore
     from shared.clients.rds_connection import get_rds_connection_string  # type: ignore
     from shared.database.staging import ensure_daily_scan_signals  # type: ignore
+    from shared.db.catalog import load_sql  # type: ignore
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -128,22 +130,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 
         if all_rows:
             with conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO daily_scan_signals
-                        (scan_date, worker_idx, symbol, strategy_name,
-                         signal, price, confidence, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                    ON CONFLICT (scan_date, symbol, strategy_name)
-                    DO UPDATE SET
-                        signal     = EXCLUDED.signal,
-                        price      = EXCLUDED.price,
-                        confidence = EXCLUDED.confidence,
-                        metadata   = EXCLUDED.metadata,
-                        worker_idx = EXCLUDED.worker_idx
-                    """,
-                    all_rows,
-                )
+                cur.executemany(load_sql("scan_signals.insert_staging"), all_rows)
             conn.commit()
     finally:
         conn.close()

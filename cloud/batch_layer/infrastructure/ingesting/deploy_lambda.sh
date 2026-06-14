@@ -147,6 +147,10 @@ EOF
     fi
     cp "$SHARED_DIR/__init__.py" "$package_dir/shared/"
 
+    # Shared DB layer (catalog SQL + connection) — single source of truth for
+    # all queries. rds_timescale_client / pipeline import it as shared.db.*.
+    cp -r "$SHARED_DIR/db" "$package_dir/shared/db"
+
     find "$package_dir" -name "*.pyc" -delete
     find "$package_dir" -name "*.pyo" -delete
     find "$package_dir" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true

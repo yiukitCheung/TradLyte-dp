@@ -14,7 +14,11 @@ import boto3
 from fastapi import APIRouter, HTTPException, Query
 
 from serving_api.cache import MARKET_CACHE, make_cache_key
-from serving_api.db import execute_one, execute_query
+
+try:  # deployed layout copies shared/db -> db/ at the zip root
+    from db.repositories import MarketRepository
+except ImportError:  # pragma: no cover - local/test fallback
+    from shared.db.repositories import MarketRepository
 
 router = APIRouter(prefix="/market", tags=["market"])
 
@@ -123,34 +127,7 @@ def get_latest_quote(symbol: str) -> Dict[str, Any]:
         cached["meta"]["cache_hit"] = True
         return cached
 
-    row = execute_one(
-        """
-        SELECT m.symbol,
-               m.name,
-               m.industry,
-               m.marketcap AS market_cap,
-               m.type,
-               m.primary_exchange,
-               o.timestamp::date AS as_of_date,
-               o.open,
-               o.high,
-               o.low,
-               o.close,
-               o.volume
-        FROM symbol_metadata m
-        JOIN LATERAL (
-            SELECT timestamp, open, high, low, close, volume
-            FROM raw_ohlcv
-            WHERE symbol = m.symbol
-              AND interval = '1d'
-            ORDER BY timestamp DESC
-            LIMIT 1
-        ) o ON TRUE
-        WHERE m.symbol = %(symbol)s
-        LIMIT 1;
-        """,
-        params={"symbol": normalized_symbol},
-    )
+    row = MarketRepository().latest_quote(normalized_symbol)
     if not row:
         raise HTTPException(status_code=404, detail=f"Symbol not found or no OHLCV data: {normalized_symbol}")
 
@@ -177,38 +154,32 @@ def get_ohlcv_history(
     if normalized_sort not in SORT_DIRECTIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported sort: {sort}")
 
-    params: Dict[str, Any] = {
-        "symbol": normalized_symbol,
-        "interval": normalized_interval,
-        "limit": limit,
-        "start_date": start_date.isoformat() if start_date else None,
-        "end_date": end_date.isoformat() if end_date else None,
-    }
-    cache_key = make_cache_key("market_ohlcv", params | {"sort": normalized_sort})
+    start_iso = start_date.isoformat() if start_date else None
+    end_iso = end_date.isoformat() if end_date else None
+    cache_key = make_cache_key(
+        "market_ohlcv",
+        {
+            "symbol": normalized_symbol,
+            "interval": normalized_interval,
+            "limit": limit,
+            "start_date": start_iso,
+            "end_date": end_iso,
+            "sort": normalized_sort,
+        },
+    )
     cached = MARKET_CACHE.get(cache_key)
     if cached is not None:
         cached["meta"]["cache_hit"] = True
         return cached
 
-    query = f"""
-        SELECT symbol,
-               interval,
-               timestamp,
-               timestamp::date AS trading_date,
-               open,
-               high,
-               low,
-               close,
-               volume
-        FROM raw_ohlcv
-        WHERE symbol = %(symbol)s
-          AND interval = %(interval)s
-          AND (%(start_date)s::date IS NULL OR timestamp::date >= %(start_date)s::date)
-          AND (%(end_date)s::date IS NULL OR timestamp::date <= %(end_date)s::date)
-        ORDER BY timestamp {normalized_sort.upper()}
-        LIMIT %(limit)s;
-    """
-    rows = execute_query(query, params=params)
+    rows = MarketRepository().ohlcv_history(
+        symbol=normalized_symbol,
+        interval=normalized_interval,
+        limit=limit,
+        sort=normalized_sort,
+        start_date=start_iso,
+        end_date=end_iso,
+    )
     response = {
         "data": rows,
         "meta": {
@@ -216,8 +187,8 @@ def get_ohlcv_history(
             "interval": normalized_interval,
             "count": len(rows),
             "limit": limit,
-            "start_date": params["start_date"],
-            "end_date": params["end_date"],
+            "start_date": start_iso,
+            "end_date": end_iso,
             "sort": normalized_sort,
             "cache_hit": False,
         },
@@ -297,25 +268,7 @@ def get_symbol_returns(
         cached["meta"]["cache_hit"] = True
         return cached
 
-    row = execute_one(
-        """
-        WITH prices AS (
-            SELECT timestamp::date AS trade_date,
-                   close,
-                   ROW_NUMBER() OVER (ORDER BY timestamp DESC) AS rn
-            FROM raw_ohlcv
-            WHERE symbol = %(symbol)s
-              AND interval = '1d'
-        )
-        SELECT MAX(CASE WHEN rn = 1 THEN trade_date END) AS as_of_date,
-               MAX(CASE WHEN rn = 1 THEN close END) AS close_now,
-               MAX(CASE WHEN rn = 2 THEN close END) AS close_1d_ago,
-               MAX(CASE WHEN rn = 6 THEN close END) AS close_5d_ago,
-               MAX(CASE WHEN rn = 22 THEN close END) AS close_21d_ago
-        FROM prices;
-        """,
-        params={"symbol": normalized_symbol},
-    )
+    row = MarketRepository().symbol_returns(normalized_symbol)
     if not row or row.get("close_now") is None:
         raise HTTPException(status_code=404, detail=f"No OHLCV data found for symbol: {normalized_symbol}")
 

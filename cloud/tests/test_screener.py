@@ -2,8 +2,8 @@
 
 from unittest.mock import patch
 
+from db.repositories.screener import normalize_sort
 from serving_api.cache import SCREENER_CACHE
-from serving_api.routers.screener import _normalize_sort
 
 
 def setup_function():
@@ -15,25 +15,24 @@ def teardown_function():
 
 
 def test_normalize_sort_default_marketcap_desc():
-    assert _normalize_sort("") == "m.marketcap DESC NULLS LAST"
+    assert normalize_sort("") == "market_cap DESC NULLS LAST"
 
 
 def test_normalize_sort_symbol_asc():
-    assert _normalize_sort("symbol:asc") == "m.symbol ASC NULLS FIRST"
+    assert normalize_sort("symbol:asc") == "symbol ASC NULLS FIRST"
 
 
 def test_normalize_sort_close_desc():
-    assert _normalize_sort("close:desc") == "o.close DESC NULLS LAST"
+    assert normalize_sort("close:desc") == "close DESC NULLS LAST"
 
 
 def test_normalize_sort_unknown_field_falls_back_to_marketcap():
-    assert _normalize_sort("unknown:asc") == "m.marketcap ASC NULLS FIRST"
+    assert normalize_sort("unknown:asc") == "market_cap ASC NULLS FIRST"
 
 
-@patch("serving_api.routers.screener.execute_one")
-@patch("serving_api.routers.screener.execute_query")
-def test_get_screener_quotes_returns_payload(mock_execute_query, mock_execute_one, serving_client):
-    mock_execute_query.return_value = [
+@patch("serving_api.routers.screener.ScreenerRepository")
+def test_get_screener_quotes_returns_payload(mock_repo, serving_client):
+    mock_repo.return_value.quotes.return_value = [
         {
             "symbol": "AAPL",
             "name": "Apple Inc.",
@@ -49,7 +48,7 @@ def test_get_screener_quotes_returns_payload(mock_execute_query, mock_execute_on
             "volume": 50_000_000,
         }
     ]
-    mock_execute_one.return_value = {"as_of_date": "2026-06-05"}
+    mock_repo.return_value.as_of_date.return_value = {"as_of_date": "2026-06-05"}
 
     response = serving_client.get("/screener/quotes?limit=1&sort=marketcap:desc")
 
@@ -60,5 +59,12 @@ def test_get_screener_quotes_returns_payload(mock_execute_query, mock_execute_on
     assert body["meta"]["as_of_date"] == "2026-06-05"
     assert body["data"][0]["symbol"] == "AAPL"
 
-    query = mock_execute_query.call_args.args[0]
-    assert "ORDER BY m.marketcap DESC NULLS LAST" in query
+    mock_repo.return_value.quotes.assert_called_once_with(
+        sort="marketcap:desc",
+        limit=1,
+        offset=0,
+        industry=None,
+        type=None,
+        min_market_cap=None,
+        max_market_cap=None,
+    )

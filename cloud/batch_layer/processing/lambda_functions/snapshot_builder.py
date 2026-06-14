@@ -126,8 +126,10 @@ LOCAL_OUT = "/tmp/snapshot_out.parquet"
 
 try:
     from clients.rds_connection import get_rds_connection_string
+    from db.catalog import load_sql
 except ImportError:  # pragma: no cover - local dev
     from shared.clients.rds_connection import get_rds_connection_string  # type: ignore
+    from shared.db.catalog import load_sql  # type: ignore
 
 
 def _read_rows_to_frame(conn, query: str, params: tuple, server_side: bool) -> pl.DataFrame:
@@ -237,21 +239,6 @@ def _write_snapshot(s3, df: pl.DataFrame, scan_date: date) -> Dict[str, str]:
 # Modes
 # ---------------------------------------------------------------------------
 
-# Columns from raw_ohlcv, numeric cast to float8 so psycopg2 never returns
-# Decimal (which Polars would reject against the Float64 schema).
-_SELECT_COLS = (
-    "symbol, timestamp::date AS date, "
-    "open::float8 AS open, high::float8 AS high, low::float8 AS low, "
-    "close::float8 AS close, volume::float8 AS volume"
-)
-
-# DISTINCT ON keeps exactly one row per (symbol, calendar day): the one with the
-# latest intraday timestamp. The leading ORDER BY columns MUST match the
-# DISTINCT ON list; ``timestamp DESC`` then selects the most recent bar.
-_DISTINCT_ON = "DISTINCT ON (symbol, timestamp::date)"
-_DEDUPE_ORDER = "ORDER BY symbol, timestamp::date, timestamp DESC"
-
-
 def run_bootstrap(
     conn,
     s3,
@@ -271,11 +258,7 @@ def run_bootstrap(
         window_end = min(date(window_start.year, 12, 31), end)
         # Exclusive upper bound on timestamp to capture the whole end day.
         upper_exclusive = window_end + timedelta(days=1)
-        query = (
-            f"SELECT {_DISTINCT_ON} {_SELECT_COLS} FROM raw_ohlcv "
-            "WHERE interval = '1d' AND timestamp >= %s AND timestamp < %s "
-            f"{_DEDUPE_ORDER}"
-        )
+        query = load_sql("ohlcv.snapshot_dedup_range")
         frame = _read_rows_to_frame(
             conn, query, (window_start, upper_exclusive), server_side=True
         )
@@ -318,11 +301,7 @@ def run_incremental(conn, s3, scan_date: date) -> Dict[str, Any]:
         logger.info("No existing snapshot found — falling back to BOOTSTRAP.")
         return run_bootstrap(conn, s3, scan_date, start=None, end=scan_date)
 
-    query = (
-        f"SELECT {_DISTINCT_ON} {_SELECT_COLS} FROM raw_ohlcv "
-        "WHERE interval = '1d' AND timestamp::date = %s "
-        f"{_DEDUPE_ORDER}"
-    )
+    query = load_sql("ohlcv.snapshot_dedup_date")
     new_bars = _read_rows_to_frame(conn, query, (scan_date,), server_side=False)
     logger.info("INCREMENTAL scan_date=%s — pulled %s new 1d bars from RDS", scan_date, new_bars.height)
 

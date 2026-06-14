@@ -1,4 +1,9 @@
-"""Stock pick API routes."""
+"""Stock pick API routes.
+
+SQL lives in the shared query catalog (``db/sql/picks/*.sql``) and is reached
+through ``PicksRepository``; the join to ``symbol_metadata`` and market-cap
+exposure are defined once in the ``vw_picks`` database view.
+"""
 
 from datetime import date
 from decimal import Decimal
@@ -7,9 +12,17 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import APIRouter, HTTPException, Query
 
 from serving_api.cache import PICKS_CACHE, RETURNS_CACHE, make_cache_key
-from serving_api.db import execute_query
+
+try:  # deployed layout copies shared/db -> db/ at the zip root
+    from db.repositories import PicksRepository
+except ImportError:  # pragma: no cover - local/test fallback
+    from shared.db.repositories import PicksRepository
 
 router = APIRouter(prefix="/picks", tags=["picks"])
+
+# Canonical serving sort, surfaced in responses. The ORDER BY itself lives in
+# the catalog SQL (sql/picks/*.sql).
+PICKS_SORT = "marketcap:desc"
 
 
 def _to_return(pick_price: Optional[Decimal], close_price: Optional[Decimal]) -> Optional[float]:
@@ -25,7 +38,7 @@ def _picks_today_meta_filters(
     min_market_cap: Optional[int],
     max_market_cap: Optional[int],
 ) -> Dict[str, Any]:
-    """Params + WHERE clause fragment for optional symbol_metadata filters (matches screener semantics)."""
+    """Normalize optional symbol_metadata filters (matches screener semantics)."""
     ind = industry.strip() if industry else None
     if ind == "":
         ind = None
@@ -34,18 +47,6 @@ def _picks_today_meta_filters(
         "min_mc": min_market_cap,
         "max_mc": max_market_cap,
     }
-
-
-_PICKS_TODAY_JOIN_WHERE = """
-        FROM stock_picks sp
-        LEFT JOIN symbol_metadata m ON m.symbol = sp.symbol
-        WHERE sp.scan_date = (SELECT d FROM latest)
-          AND (%(industry)s::text IS NULL OR m.industry = %(industry)s)
-          AND (%(min_mc)s::bigint IS NULL OR m.marketcap >= %(min_mc)s)
-          AND (%(max_mc)s::bigint IS NULL OR m.marketcap <= %(max_mc)s)
-"""
-
-_PICKS_ORDER_BY = "m.marketcap DESC NULLS LAST, sp.rank ASC"
 
 
 def _parse_horizons(raw_horizons: str) -> List[int]:
@@ -83,23 +84,12 @@ def get_picks_today(
         cached["meta"]["cache_hit"] = True
         return cached
 
-    params = {"limit": limit, **filt}
-    query = f"""
-        WITH latest AS (SELECT MAX(scan_date) AS d FROM stock_picks)
-        SELECT sp.scan_date,
-               sp.rank,
-               sp.symbol,
-               sp.strategy_name,
-               sp.signal,
-               sp.price,
-               sp.confidence,
-               sp.metadata,
-               m.marketcap AS market_cap
-        {_PICKS_TODAY_JOIN_WHERE}
-        ORDER BY {_PICKS_ORDER_BY}
-        LIMIT %(limit)s;
-    """
-    rows = execute_query(query, params=params)
+    rows = PicksRepository().today(
+        limit=limit,
+        industry=filt["industry"],
+        min_market_cap=filt["min_mc"],
+        max_market_cap=filt["max_mc"],
+    )
     scan_date = rows[0]["scan_date"] if rows else None
     response = {
         "data": rows,
@@ -107,7 +97,7 @@ def get_picks_today(
             "count": len(rows),
             "limit": limit,
             "scan_date": scan_date,
-            "sort": "marketcap:desc",
+            "sort": PICKS_SORT,
             "filters": {
                 "industry": filt["industry"],
                 "min_market_cap": filt["min_mc"],
@@ -137,20 +127,12 @@ def get_picks_today_metadata(
         cached["meta"]["cache_hit"] = True
         return cached
 
-    params = {"limit": limit, **filt}
-    query = f"""
-        WITH latest AS (SELECT MAX(scan_date) AS d FROM stock_picks)
-        SELECT sp.scan_date,
-               sp.rank,
-               sp.symbol,
-               sp.strategy_name,
-               sp.metadata,
-               m.marketcap AS market_cap
-        {_PICKS_TODAY_JOIN_WHERE}
-        ORDER BY {_PICKS_ORDER_BY}
-        LIMIT %(limit)s;
-    """
-    rows = execute_query(query, params=params)
+    rows = PicksRepository().today_metadata(
+        limit=limit,
+        industry=filt["industry"],
+        min_market_cap=filt["min_mc"],
+        max_market_cap=filt["max_mc"],
+    )
     scan_date = rows[0]["scan_date"] if rows else None
     response = {
         "data": rows,
@@ -158,7 +140,7 @@ def get_picks_today_metadata(
             "count": len(rows),
             "limit": limit,
             "scan_date": scan_date,
-            "sort": "marketcap:desc",
+            "sort": PICKS_SORT,
             "filters": {
                 "industry": filt["industry"],
                 "min_market_cap": filt["min_mc"],
@@ -199,39 +181,11 @@ def get_pick_detail(
         cached["meta"]["cache_hit"] = True
         return cached
 
-    params: Dict[str, Any] = {
-        "symbol": sym,
-        "scan_date": scan_date.isoformat(),
-    }
-    strategy_clause = ""
-    if strategy_name:
-        params["strategy_name"] = strategy_name.strip()
-        strategy_clause = "AND sp.strategy_name = %(strategy_name)s"
-
-    query = f"""
-        SELECT sp.scan_date,
-               sp.rank,
-               sp.symbol,
-               sp.strategy_name,
-               sp.signal,
-               sp.price,
-               sp.confidence,
-               sp.metadata AS pick_metadata,
-               m.name          AS asset_name,
-               m.market,
-               m.locale,
-               m.type          AS asset_type,
-               m.primary_exchange,
-               m.industry,
-               m.marketcap   AS market_cap
-        FROM stock_picks sp
-        LEFT JOIN symbol_metadata m ON m.symbol = sp.symbol
-        WHERE sp.scan_date = %(scan_date)s::date
-          AND UPPER(TRIM(sp.symbol)) = %(symbol)s
-          {strategy_clause}
-        ORDER BY sp.rank ASC, sp.strategy_name ASC;
-    """
-    rows = execute_query(query, params=params)
+    rows = PicksRepository().detail(
+        symbol=sym,
+        scan_date=scan_date.isoformat(),
+        strategy_name=strategy_name.strip() if isinstance(strategy_name, str) else None,
+    )
     if not rows:
         raise HTTPException(
             status_code=404,
@@ -276,68 +230,12 @@ def get_pick_returns(
         cached["meta"]["cache_hit"] = True
         return cached
 
-    params: Dict[str, Any] = {
-        "scan_date": scan_date.isoformat(),
-        "industry": filt["industry"],
-        "min_mc": filt["min_mc"],
-        "max_mc": filt["max_mc"],
-    }
-    query = """
-        WITH picks AS (
-            SELECT sp.symbol,
-                   sp.rank,
-                   sp.strategy_name,
-                   sp.signal,
-                   sp.price AS pick_price,
-                   sp.scan_date,
-                   m.marketcap AS market_cap
-            FROM stock_picks sp
-            LEFT JOIN symbol_metadata m ON m.symbol = sp.symbol
-            WHERE sp.scan_date = %(scan_date)s::date
-              AND (%(industry)s::text IS NULL OR m.industry = %(industry)s)
-              AND (%(min_mc)s::bigint IS NULL OR m.marketcap >= %(min_mc)s)
-              AND (%(max_mc)s::bigint IS NULL OR m.marketcap <= %(max_mc)s)
-        )
-        SELECT p.*,
-               (
-                    SELECT close
-                    FROM raw_ohlcv
-                    WHERE symbol = p.symbol
-                      AND interval = '1d'
-                      AND timestamp::date > p.scan_date
-                    ORDER BY timestamp ASC
-                    LIMIT 1 OFFSET 0
-               ) AS close_1d,
-               (
-                    SELECT close
-                    FROM raw_ohlcv
-                    WHERE symbol = p.symbol
-                      AND interval = '1d'
-                      AND timestamp::date > p.scan_date
-                    ORDER BY timestamp ASC
-                    LIMIT 1 OFFSET 4
-               ) AS close_5d,
-               (
-                    SELECT close
-                    FROM raw_ohlcv
-                    WHERE symbol = p.symbol
-                      AND interval = '1d'
-                      AND timestamp::date > p.scan_date
-                    ORDER BY timestamp ASC
-                    LIMIT 1 OFFSET 20
-               ) AS close_21d,
-               (
-                    SELECT close
-                    FROM raw_ohlcv
-                    WHERE symbol = p.symbol
-                      AND interval = '1d'
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-               ) AS close_now
-        FROM picks p
-        ORDER BY p.market_cap DESC NULLS LAST, p.rank ASC;
-    """
-    rows = execute_query(query, params=params)
+    rows = PicksRepository().returns(
+        scan_date=scan_date.isoformat(),
+        industry=filt["industry"],
+        min_market_cap=filt["min_mc"],
+        max_market_cap=filt["max_mc"],
+    )
 
     data = []
     for row in rows:
@@ -371,7 +269,7 @@ def get_pick_returns(
             "count": len(data),
             "scan_date": scan_date.isoformat(),
             "horizons": selected_horizons,
-            "sort": "marketcap:desc",
+            "sort": PICKS_SORT,
             "filters": {
                 "industry": filt["industry"],
                 "min_market_cap": filt["min_mc"],

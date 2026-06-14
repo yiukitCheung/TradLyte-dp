@@ -21,7 +21,8 @@ def test_protected_route_rejects_missing_api_key(serving_client_with_key):
 def test_protected_route_accepts_valid_api_key(serving_client_with_key):
     from unittest.mock import patch
 
-    with patch("serving_api.routers.picks.execute_query", return_value=[]):
+    with patch("serving_api.routers.picks.PicksRepository") as mock_repo:
+        mock_repo.return_value.today.return_value = []
         response = serving_client_with_key.get("/picks/today", headers={"x-api-key": "test-key"})
 
     assert response.status_code == 200
@@ -30,7 +31,8 @@ def test_protected_route_accepts_valid_api_key(serving_client_with_key):
 def test_http_exception_uses_standard_error_shape(serving_client_with_key):
     from unittest.mock import patch
 
-    with patch("serving_api.routers.picks.execute_query", return_value=[]):
+    with patch("serving_api.routers.picks.PicksRepository") as mock_repo:
+        mock_repo.return_value.today.return_value = []
         response = serving_client_with_key.get("/picks/today")
 
     assert response.status_code == 401

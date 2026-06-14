@@ -24,6 +24,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _catalog_sql(name: str) -> str:
+    """Load a query from the shared SQL catalog across packaging layouts."""
+    try:
+        from ..db.catalog import load_sql  # shared/ package present
+    except ImportError:  # pragma: no cover - flattened deploy layout
+        from db.catalog import load_sql  # type: ignore
+    return load_sql(name)
+
+
 def get_missing_dates(rds_client: RDSTimescaleClient, max_days_back: int = 30) -> List[date]:
     """
     Find missing trading dates using the watermark table (metadata-driven).
@@ -31,16 +40,7 @@ def get_missing_dates(rds_client: RDSTimescaleClient, max_days_back: int = 30) -
     try:
         logger.info("Checking watermark table for missing dates...")
 
-        query = """
-            SELECT
-                MAX(latest_date) as max_date,
-                MIN(latest_date) as min_date,
-                COUNT(DISTINCT symbol) as symbol_count
-            FROM data_ingestion_watermark
-            WHERE is_current = TRUE;
-        """
-
-        result = rds_client.execute_query(query)
+        result = rds_client.execute_query(_catalog_sql("watermark.summary"))
 
         eastern = pytz.timezone("US/Eastern")
         now_et = datetime.now(eastern)
@@ -140,24 +140,12 @@ def update_watermark(rds_client: RDSTimescaleClient, symbols: List[str], fetch_d
         old_autocommit = conn.autocommit
         conn.autocommit = False
 
+        expire_sql = _catalog_sql("watermark.expire_current")
+        insert_sql = _catalog_sql("watermark.insert_current")
         try:
             for symbol in symbols:
-                cursor.execute(
-                    """
-                    UPDATE data_ingestion_watermark
-                    SET is_current = FALSE
-                    WHERE symbol = %s AND is_current = TRUE;
-                    """,
-                    (symbol,),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO data_ingestion_watermark
-                        (symbol, latest_date, ingested_at, records_count, is_current)
-                    VALUES (%s, %s, NOW(), 1, TRUE);
-                    """,
-                    (symbol, fetch_date),
-                )
+                cursor.execute(expire_sql, (symbol,))
+                cursor.execute(insert_sql, (symbol, fetch_date))
 
             conn.commit()
             logger.info("Updated watermark for %s symbols (date: %s, SCD Type 2)", len(symbols), fetch_date)
@@ -182,33 +170,12 @@ def get_new_symbols(rds_client: RDSTimescaleClient, days_threshold: int = 7) -> 
     _ = days_threshold
 
     try:
-        query_not_in_watermark = """
-            SELECT sm.symbol, sm.type, sm.name, 'NO_WATERMARK' as reason
-            FROM symbol_metadata sm
-            LEFT JOIN data_ingestion_watermark diw
-                ON sm.symbol = diw.symbol AND diw.is_current = TRUE
-            WHERE diw.symbol IS NULL
-              AND LOWER(sm.active) = 'true';
-        """
-
-        query_limited_history = """
-            SELECT sm.symbol, sm.type, sm.name, 'LIMITED_HISTORY' as reason
-            FROM symbol_metadata sm
-            JOIN (
-                SELECT symbol, COUNT(*) as record_count
-                FROM data_ingestion_watermark
-                GROUP BY symbol
-                HAVING COUNT(*) = 1
-            ) counts ON sm.symbol = counts.symbol
-            JOIN data_ingestion_watermark diw
-                ON sm.symbol = diw.symbol AND diw.is_current = TRUE
-            WHERE LOWER(sm.active) = 'true'
-              AND diw.records_count <= 5
-            ORDER BY sm.type, sm.symbol;
-        """
-
-        result_no_watermark = rds_client.execute_query(query_not_in_watermark) or []
-        result_limited = rds_client.execute_query(query_limited_history) or []
+        result_no_watermark = rds_client.execute_query(
+            _catalog_sql("watermark.new_symbols_no_watermark")
+        ) or []
+        result_limited = rds_client.execute_query(
+            _catalog_sql("watermark.new_symbols_limited_history")
+        ) or []
 
         all_results = result_no_watermark + result_limited
         seen_symbols = set()

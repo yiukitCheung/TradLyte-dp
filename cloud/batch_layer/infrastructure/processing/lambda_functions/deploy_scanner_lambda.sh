@@ -102,6 +102,10 @@ touch "$PACKAGE_DIR/clients/__init__.py"
 cp "$SHARED_DIR/database/staging.py" "$PACKAGE_DIR/database/staging.py"
 cp "$SHARED_DIR/database/sql/daily_scan_signals.sql" "$PACKAGE_DIR/database/sql/daily_scan_signals.sql"
 touch "$PACKAGE_DIR/database/__init__.py"
+# Shared DB layer (catalog SQL + connection) — single source of truth for all
+# queries. Flattened to db/ at the zip root; scanner imports `from db.catalog`.
+rm -rf "$PACKAGE_DIR/db"
+cp -r "$SHARED_DIR/db" "$PACKAGE_DIR/db"
 
 echo "Removing cache files..."
 find "$PACKAGE_DIR" -name "*.pyc" -delete

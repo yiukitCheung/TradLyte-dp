@@ -18,6 +18,20 @@ from ..models.data_models import OHLCVData
 logger = logging.getLogger(__name__)
 
 
+def _catalog_sql(name: str) -> str:
+    """Load a query from the shared SQL catalog across packaging layouts.
+
+    Works whether this module is imported as ``shared.clients...`` (local dev,
+    ingest Lambda, aggregator container — all keep the ``shared/`` package) or
+    as a top-level ``clients...`` module (flattened Lambda zips).
+    """
+    try:
+        from ..db.catalog import load_sql  # shared/ package present
+    except ImportError:  # pragma: no cover - flattened deploy layout
+        from db.catalog import load_sql  # type: ignore
+    return load_sql(name)
+
+
 class RDSTimescaleClient:
     """Client for RDS PostgreSQL + TimescaleDB database operations"""
 
@@ -247,19 +261,9 @@ class RDSTimescaleClient:
         if not ohlcv_data:
             return 0
         
-        # Use TimescaleDB-optimized bulk insert
-        sql = """
-        INSERT INTO raw_ohlcv (timestamp, symbol, open, high, low, close, volume, interval)
-        VALUES %s
-        ON CONFLICT (timestamp, symbol, interval) 
-        DO UPDATE SET 
-            open = EXCLUDED.open,
-            high = EXCLUDED.high,
-            low = EXCLUDED.low,
-            close = EXCLUDED.close,
-            volume = EXCLUDED.volume
-        """
-        
+        # Use TimescaleDB-optimized bulk insert (SQL lives in the shared catalog).
+        sql = _catalog_sql("ohlcv.insert_raw")
+
         try:
             # Prepare data for bulk insert
             data_tuples = []
@@ -294,25 +298,8 @@ class RDSTimescaleClient:
         if not metadata_list:
             return 0
         
-        sql = """
-        INSERT INTO symbol_metadata (
-            symbol, name, market, locale, active, 
-            primary_exchange, type, marketcap, industry, description
-        )
-        VALUES %s
-        ON CONFLICT (symbol)
-        DO UPDATE SET
-            name = EXCLUDED.name,
-            market = EXCLUDED.market,
-            locale = EXCLUDED.locale,
-            active = EXCLUDED.active,
-            primary_exchange = EXCLUDED.primary_exchange,
-            type = EXCLUDED.type,
-            marketcap = EXCLUDED.marketcap,
-            industry = EXCLUDED.industry,
-            description = EXCLUDED.description
-        """
-        
+        sql = _catalog_sql("ohlcv.insert_metadata")
+
         try:
             # Prepare data for bulk insert
             data_tuples = []
@@ -347,17 +334,10 @@ class RDSTimescaleClient:
     def get_latest_data_date(self, symbol: str = None) -> Optional[date]:
         """Get the latest data date for a symbol or all symbols"""
         if symbol:
-            sql = """
-            SELECT MAX(timestamp) as latest_date 
-            FROM raw_ohlcv 
-            WHERE symbol = %s
-            """
+            sql = _catalog_sql("ohlcv.latest_date_for_symbol")
             parameters = (symbol,)
         else:
-            sql = """
-            SELECT MAX(timestamp) as latest_date 
-            FROM raw_ohlcv
-            """
+            sql = _catalog_sql("ohlcv.latest_date")
             parameters = None
         
         try:

@@ -1,6 +1,17 @@
 """
-Database Initialization Lambda Function
-Creates all required tables and indexes for the batch layer
+Database Initialization Lambda Function (LEGACY)
+
+DEPRECATED — the canonical schema now lives in the forward-only migration
+runner at ``cloud/shared/db/migrations`` (baseline ``V001__baseline_schema.sql``
+plus ``V002..V004`` for functions, serving indexes, and read-contract views).
+Run that instead of this Lambda:
+
+    python -m shared.db.migrations.runner            # apply pending migrations
+    python -m shared.db.migrations.runner --status   # show applied vs pending
+
+The inline ``get_schema_sql()`` below is frozen for backward compatibility with
+any console-triggered invocations and must NOT be extended; add new DDL as a new
+``VNNN__*.sql`` migration so there is a single, versioned source of truth.
 """
 
 import json

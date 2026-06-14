@@ -176,6 +176,9 @@ EOF
         cp -r "$SHARED_DIR/utils/"* "$package_dir/shared/utils/"
     fi
     cp "$SHARED_DIR/__init__.py" "$package_dir/shared/"
+
+    # Shared DB layer (catalog SQL + connection); pipeline imports it as shared.db.*
+    cp -r "$SHARED_DIR/db" "$package_dir/shared/db"
     
     # Remove cache files
     echo "🧹 Cleaning cache files..."

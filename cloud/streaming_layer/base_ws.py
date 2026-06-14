@@ -26,6 +26,3 @@ class BaseTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.task.cancel()
-
-if __name__ == "__main__":
-    unittest.main()

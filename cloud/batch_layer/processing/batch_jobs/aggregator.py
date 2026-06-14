@@ -25,6 +25,11 @@ from shared.analytics_core.models import SignalResult
 from shared.clients.rds_timescale_client import RDSTimescaleClient
 from shared.database.staging import daily_scan_signals_ddl
 
+try:
+    from shared.db.catalog import load_sql
+except ImportError:  # pragma: no cover - flattened layout
+    from db.catalog import load_sql  # type: ignore
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -45,11 +50,59 @@ def ensure_daily_scan_signals_table(rds_client: RDSTimescaleClient) -> None:
 # Ranking + writing (the aggregator owns these)
 # ---------------------------------------------------------------------------
 
+def _market_cap_sort_value(
+    symbol: str,
+    market_caps: Optional[Dict[str, Optional[int]]],
+) -> int:
+    """Higher market cap sorts earlier; missing/unknown caps sort last (NULLS LAST)."""
+    if not market_caps:
+        return -1
+    raw = market_caps.get(symbol)
+    if raw is None:
+        return -1
+    return int(raw)
+
+
+def _signal_sort_key(
+    signal: SignalResult,
+    market_caps: Optional[Dict[str, Optional[int]]] = None,
+) -> tuple:
+    """
+    Sort key: confidence DESC, market cap DESC, symbol ASC.
+
+    Uses ascending tuple order with negated numeric fields so ties break on
+    market cap instead of snapshot insertion order (which skews alphabetical).
+    """
+    confidence = float(signal.confidence or 0.0)
+    market_cap = _market_cap_sort_value(signal.symbol, market_caps)
+    return (-confidence, -market_cap, signal.symbol)
+
+
+def fetch_market_caps(
+    rds_client: Any,
+    symbols: List[str],
+) -> Dict[str, Optional[int]]:
+    """Load symbol -> marketcap from symbol_metadata for ranking tie-breaks."""
+    if not symbols:
+        return {}
+
+    if hasattr(rds_client, "execute_query"):
+        rows = rds_client.execute_query(
+            load_sql("symbols.market_caps"),
+            {"symbols": symbols},
+        )
+    else:
+        raise ValueError("Unsupported rds_client for fetch_market_caps")
+
+    return {row["symbol"]: row.get("marketcap") for row in rows}
+
+
 def rank_signals(
     signals: List[SignalResult],
     top_k: int = 10,
     by_pick_type: bool = False,
     unique_symbol: bool = True,
+    market_caps: Optional[Dict[str, Optional[int]]] = None,
 ) -> Union[List[SignalResult], Dict[str, List[SignalResult]]]:
     """
     Rank signals by confidence (dense rank).
@@ -59,21 +112,23 @@ def rank_signals(
         top_k: Maximum dense-rank bucket to include (per strategy_name if by_pick_type=True).
         by_pick_type: If True, group by strategy_name and return dict; else return flat list.
         unique_symbol: If True, only one signal per symbol.
+        market_caps: Optional symbol -> marketcap map for tie-breaking equal confidence scores.
     """
     if not signals:
         return {} if by_pick_type else []
 
     def rank_dense_confidence(items: List[SignalResult]) -> List[SignalResult]:
-        scored: List[tuple[float, SignalResult]] = [
-            (float(signal.confidence or 0.0), signal) for signal in items
-        ]
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = sorted(
+            items,
+            key=lambda signal: _signal_sort_key(signal, market_caps),
+        )
 
         ranked_items: List[SignalResult] = []
         seen_symbols: set[str] = set()
         current_rank = 0
         previous_confidence: Optional[float] = None
-        for confidence, signal in scored:
+        for signal in scored:
+            confidence = float(signal.confidence or 0.0)
             if previous_confidence is None or confidence != previous_confidence:
                 current_rank += 1
                 previous_confidence = confidence
@@ -84,6 +139,9 @@ def rank_signals(
             metadata = dict(signal.metadata or {})
             metadata["ranking_score"] = confidence
             metadata["dense_rank"] = current_rank
+            cap = _market_cap_sort_value(signal.symbol, market_caps)
+            if cap >= 0:
+                metadata["market_cap"] = cap
             signal.metadata = metadata
             ranked_items.append(signal)
             seen_symbols.add(signal.symbol)
@@ -137,18 +195,7 @@ def write_picks(
     if not values:
         return 0
 
-    query = """
-    INSERT INTO stock_picks
-    (scan_date, symbol, strategy_name, signal, price, confidence, metadata, rank)
-    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-    ON CONFLICT (scan_date, symbol, strategy_name)
-    DO UPDATE SET
-        signal = EXCLUDED.signal,
-        price = EXCLUDED.price,
-        confidence = EXCLUDED.confidence,
-        metadata = EXCLUDED.metadata,
-        rank = EXCLUDED.rank
-    """
+    query = load_sql("picks.upsert")
 
     if conn:
         with conn.cursor() as cur:
@@ -186,21 +233,12 @@ def run_aggregator(
     ensure_daily_scan_signals_table(rds_client)
 
     # ----- read raw signals -----
-    filter_clause = ""
-    params: tuple = (scan_date.isoformat(),)
-    if strategy_names:
-        placeholders  = ", ".join(["%s"] * len(strategy_names))
-        filter_clause = f"AND strategy_name IN ({placeholders})"
-        params        = (scan_date.isoformat(), *strategy_names)
-
     rows = rds_client.execute_query(
-        f"""
-        SELECT symbol, scan_date::text AS date, strategy_name,
-               signal, price, confidence, metadata
-        FROM   daily_scan_signals
-        WHERE  scan_date = %s {filter_clause}
-        """,
-        params,
+        load_sql("scan_signals.select_for_date"),
+        {
+            "scan_date": scan_date.isoformat(),
+            "strategies": list(strategy_names) if strategy_names else None,
+        },
     )
 
     if not rows:
@@ -233,8 +271,22 @@ def run_aggregator(
         for r in rows
     ]
 
+    symbols = sorted({s.symbol for s in signals})
+    market_caps = fetch_market_caps(rds_client, symbols)
+    logger.info(
+        "Loaded market caps for %s/%s ranked symbols",
+        sum(1 for cap in market_caps.values() if cap is not None),
+        len(symbols),
+    )
+
     # ----- global rank -----
-    ranked = rank_signals(signals, by_pick_type=True, top_k=10, unique_symbol=True)
+    ranked = rank_signals(
+        signals,
+        by_pick_type=True,
+        top_k=10,
+        unique_symbol=True,
+        market_caps=market_caps,
+    )
 
     total = (
         sum(len(picks) for picks in ranked.values())
@@ -247,6 +299,7 @@ def run_aggregator(
                 {
                     "symbol": s.symbol,
                     "confidence": s.confidence,
+                    "market_cap": (s.metadata or {}).get("market_cap"),
                     "strategy_name": (s.metadata or {}).get("strategy_name"),
                 }
                 for s in v[:3]
@@ -258,6 +311,7 @@ def run_aggregator(
             {
                 "symbol": s.symbol,
                 "confidence": s.confidence,
+                "market_cap": (s.metadata or {}).get("market_cap"),
                 "strategy_name": (s.metadata or {}).get("strategy_name"),
             }
             for s in ranked[:10]
@@ -268,12 +322,8 @@ def run_aggregator(
     picks_written = write_picks(ranked, rds_client, scan_date)
     logger.info(f"Wrote {picks_written} rows to stock_picks")
     stock_picks_count = rds_client.execute_query(
-        """
-        SELECT COUNT(*) AS cnt
-        FROM stock_picks
-        WHERE scan_date = %s
-        """,
-        (scan_date.isoformat(),),
+        load_sql("scan_signals.count_picks_for_date"),
+        {"scan_date": scan_date.isoformat()},
     )[0]["cnt"]
     logger.info(
         "AGGREGATOR post-write stock_picks rows for %s: %s",
@@ -289,8 +339,8 @@ def run_aggregator(
             conn.autocommit = False
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM daily_scan_signals WHERE scan_date = %s",
-                    (scan_date.isoformat(),),
+                    load_sql("scan_signals.delete_for_date"),
+                    {"scan_date": scan_date.isoformat()},
                 )
                 deleted = cur.rowcount
             conn.commit()

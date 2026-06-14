@@ -1,34 +1,22 @@
-"""Screener API routes."""
+"""Screener API routes.
+
+SQL lives in the shared query catalog (``db/sql/screener/*.sql``) reached
+through ``ScreenerRepository``; the metadata x daily-bar join is the
+``vw_screener_quotes`` database view.
+"""
 
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Query
 
 from serving_api.cache import SCREENER_CACHE, make_cache_key
-from serving_api.db import execute_one, execute_query
+
+try:  # deployed layout copies shared/db -> db/ at the zip root
+    from db.repositories import ScreenerRepository
+except ImportError:  # pragma: no cover - local/test fallback
+    from shared.db.repositories import ScreenerRepository
 
 router = APIRouter(prefix="/screener", tags=["screener"])
-
-SORT_FIELDS = {
-    "marketcap": "m.marketcap",
-    "symbol": "m.symbol",
-    "close": "o.close",
-    "volume": "o.volume",
-}
-
-
-def _normalize_sort(sort: str) -> str:
-    field = "marketcap"
-    direction = "DESC"
-    if sort:
-        parts = sort.split(":")
-        if parts and parts[0].strip().lower() in SORT_FIELDS:
-            field = parts[0].strip().lower()
-        if len(parts) > 1 and parts[1].strip().lower() == "asc":
-            direction = "ASC"
-    order_by = SORT_FIELDS[field]
-    nulls = "NULLS LAST" if direction == "DESC" else "NULLS FIRST"
-    return f"{order_by} {direction} {nulls}"
 
 
 @router.get("/quotes")
@@ -41,8 +29,7 @@ def get_screener_quotes(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> Dict[str, Any]:
-    order_by_clause = _normalize_sort(sort)
-    params = {
+    cache_params = {
         "industry": industry,
         "type": type,
         "min_mc": min_market_cap,
@@ -52,51 +39,23 @@ def get_screener_quotes(
         "sort": sort,
     }
 
-    cache_key = make_cache_key("screener", params)
+    cache_key = make_cache_key("screener", cache_params)
     cached = SCREENER_CACHE.get(cache_key)
     if cached is not None:
         cached["meta"]["cache_hit"] = True
         return cached
 
-    query = f"""
-        WITH md AS (
-            SELECT MAX(latest_date) AS as_of
-            FROM data_ingestion_watermark
-            WHERE is_current
-        )
-        SELECT m.symbol,
-               m.name,
-               m.industry,
-               m.marketcap AS market_cap,
-               m.type,
-               m.primary_exchange,
-               o.timestamp::date AS as_of_date,
-               o.open,
-               o.high,
-               o.low,
-               o.close,
-               o.volume
-        FROM symbol_metadata m
-        JOIN raw_ohlcv o
-          ON o.symbol = m.symbol
-         AND o.interval = '1d'
-         AND o.timestamp::date = (SELECT as_of FROM md)
-        WHERE LOWER(COALESCE(m.active::text, 'true')) = 'true'
-          AND (%(industry)s::text IS NULL OR m.industry = %(industry)s)
-          AND (%(type)s::text IS NULL OR m.type = %(type)s)
-          AND (%(min_mc)s::bigint IS NULL OR m.marketcap >= %(min_mc)s)
-          AND (%(max_mc)s::bigint IS NULL OR m.marketcap <= %(max_mc)s)
-        ORDER BY {order_by_clause}
-        LIMIT %(limit)s OFFSET %(offset)s;
-    """
-    rows = execute_query(query, params=params)
-    as_of_row = execute_one(
-        """
-        SELECT MAX(latest_date) AS as_of_date
-        FROM data_ingestion_watermark
-        WHERE is_current
-        """
+    repo = ScreenerRepository()
+    rows = repo.quotes(
+        sort=sort,
+        limit=limit,
+        offset=offset,
+        industry=industry,
+        type=type,
+        min_market_cap=min_market_cap,
+        max_market_cap=max_market_cap,
     )
+    as_of_row = repo.as_of_date()
     response = {
         "data": rows,
         "meta": {

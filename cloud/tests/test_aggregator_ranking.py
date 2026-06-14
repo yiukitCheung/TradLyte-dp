@@ -39,3 +39,42 @@ def test_rank_signals_groups_by_strategy_when_by_pick_type():
     grouped = rank_signals(signals, top_k=1, by_pick_type=True)
     assert set(grouped.keys()) == {"golden_cross", "vegas_channel_short_term"}
     assert grouped["golden_cross"][0].symbol == "AAA"
+
+
+def test_rank_signals_breaks_confidence_ties_by_market_cap():
+    signals = [
+        _signal("AAA", 1.0, "vegas_channel_short_term"),
+        _signal("MSFT", 1.0, "vegas_channel_short_term"),
+        _signal("NVDA", 1.0, "vegas_channel_short_term"),
+    ]
+    market_caps = {
+        "AAA": 1_000_000_000,
+        "MSFT": 3_000_000_000_000,
+        "NVDA": 2_000_000_000_000,
+    }
+
+    ranked = rank_signals(
+        signals,
+        top_k=1,
+        unique_symbol=True,
+        market_caps=market_caps,
+    )
+
+    symbols = [s.symbol for s in ranked]
+    assert symbols == ["MSFT", "NVDA", "AAA"]
+    assert ranked[0].metadata["market_cap"] == 3_000_000_000_000
+
+
+def test_rank_signals_puts_missing_market_cap_last_on_tie():
+    signals = [
+        _signal("AAA", 0.5),
+        _signal("MSFT", 0.5),
+    ]
+    ranked = rank_signals(
+        signals,
+        top_k=1,
+        market_caps={"MSFT": 500_000_000_000},
+    )
+
+    assert [s.symbol for s in ranked] == ["MSFT", "AAA"]
+    assert "market_cap" not in ranked[1].metadata

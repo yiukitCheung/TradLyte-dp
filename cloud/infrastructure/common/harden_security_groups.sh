@@ -86,4 +86,4 @@ aws ec2 describe-security-group-rules --region "$AWS_REGION" \
   --output table
 
 echo ""
-echo "Done. Dev DB access: SSM port-forward — see SECURITY_GROUPS.md"
+echo "Done. Dev DB access: SSM port-forward — see cloud/infrastructure/common/SSM_BASTION.md"

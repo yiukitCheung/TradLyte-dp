@@ -5,10 +5,29 @@ Load OHLCV from RDS (raw 1d) and resample at use for multi-timeframe (3d, 5d, et
 No S3 loading; resampling is done in memory from 1d data.
 """
 
+import re
 import psycopg2
 import polars as pl
 from typing import Optional, Union, List, Dict
 from datetime import date, timedelta
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _catalog_sql(name: str) -> str:
+    """Load a query from the shared SQL catalog across packaging layouts."""
+    try:
+        from ..db.catalog import load_sql  # shared/ package present
+    except ImportError:  # pragma: no cover - flattened deploy layout
+        from db.catalog import load_sql  # type: ignore
+    return load_sql(name)
+
+
+def _safe_table(table_name: str) -> str:
+    """Guard the table identifier we splice into the catalog SQL (__TABLE__)."""
+    if not _IDENTIFIER_RE.match(table_name or ""):
+        raise ValueError(f"Unsafe table name: {table_name!r}")
+    return table_name
 
 
 def load_ohlcv(
@@ -45,19 +64,12 @@ def load_ohlcv(
     # source column is a timestamp (date params are often interpreted as 00:00:00).
     end_exclusive = (end_date + timedelta(days=1)) if end_date is not None else None
 
+    table = _safe_table(table_name)
     if len(symbols) > 1:
-        query = (
-            f"SELECT * FROM {table_name} "
-            "WHERE symbol = ANY(%s) AND timestamp >= %s AND timestamp < %s "
-            "ORDER BY symbol, timestamp ASC"
-        )
+        query = _catalog_sql("ohlcv.load_range_multi").replace("__TABLE__", table)
         params = (symbols, start_date, end_exclusive)
     else:
-        query = (
-            f"SELECT * FROM {table_name} "
-            "WHERE symbol = %s AND timestamp >= %s AND timestamp < %s "
-            "ORDER BY timestamp ASC"
-        )
+        query = _catalog_sql("ohlcv.load_range_single").replace("__TABLE__", table)
         params = (symbols[0], start_date, end_exclusive)
 
     try:

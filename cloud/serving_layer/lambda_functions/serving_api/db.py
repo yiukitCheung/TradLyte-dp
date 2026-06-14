@@ -1,75 +1,39 @@
-"""Shared RDS access helpers for serving endpoints."""
+"""Backward-compatible shim over the shared DB connection layer.
 
-import json
-import logging
-import os
-from functools import lru_cache
-from typing import Any, Dict, List, Optional
+The real implementation now lives in ``db.connection`` (canonical source
+``cloud/shared/db/connection.py``), which the serving Lambda bundles as ``db/``.
+This module is kept so any direct importers of ``serving_api.db`` keep working
+and so there is a single connection/pool/secret path across the whole project.
+"""
 
-import boto3
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-logger = logging.getLogger(__name__)
-
-_connection: Optional[psycopg2.extensions.connection] = None
-_secrets_client = boto3.client(
-    "secretsmanager", region_name=os.environ.get("AWS_REGION", "ca-west-1")
-)
-
-
-@lru_cache(maxsize=1)
-def load_rds_secret() -> Dict[str, Any]:
-    secret_arn = os.environ.get("RDS_SECRET_ARN")
-    if not secret_arn:
-        raise RuntimeError("RDS_SECRET_ARN environment variable is required")
-
-    response = _secrets_client.get_secret_value(SecretId=secret_arn)
-    secret = json.loads(response["SecretString"])
-    return {
-        "host": secret["host"],
-        "port": int(secret.get("port", 5432)),
-        "database": secret.get("database", secret.get("dbname", "postgres")),
-        "username": secret["username"],
-        "password": secret["password"],
-    }
-
-def get_connection() -> psycopg2.extensions.connection:
-    global _connection
-
-    if _connection is not None and _connection.closed == 0:
-        return _connection
-
-    cfg = load_rds_secret()
-    _connection = psycopg2.connect(
-        host=cfg["host"],
-        port=cfg["port"],
-        dbname=cfg["database"],
-        user=cfg["username"],
-        password=cfg["password"],
-        connect_timeout=5,
-        sslmode=os.environ.get("RDS_SSL_MODE", "require"),
-        application_name="tradlyte-serving-api",
+try:  # deployed layout copies shared/db -> db/ at the zip root
+    from db.connection import (  # noqa: F401
+        connect,
+        execute_one,
+        execute_query,
+        get_connection,
+        load_db_credentials,
     )
-    _connection.autocommit = True
-    logger.info("Established serving API PostgreSQL connection")
-    return _connection
+except ImportError:  # pragma: no cover - local/test fallback
+    from shared.db.connection import (  # noqa: F401
+        connect,
+        execute_one,
+        execute_query,
+        get_connection,
+        load_db_credentials,
+    )
 
-def execute_query(sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    conn = get_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(sql, params or {})
-            return [dict(row) for row in cursor.fetchall()]
-    except psycopg2.OperationalError:
-        # Retry once after dropping a stale connection.
-        global _connection
-        _connection = None
-        conn = get_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            cursor.execute(sql, params or {})
-            return [dict(row) for row in cursor.fetchall()]
 
-def execute_one(sql: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    rows = execute_query(sql, params=params)
-    return rows[0] if rows else None
+def load_rds_secret():
+    """Deprecated alias retained for compatibility (use ``load_db_credentials``)."""
+    return load_db_credentials()
+
+
+__all__ = [
+    "connect",
+    "execute_one",
+    "execute_query",
+    "get_connection",
+    "load_db_credentials",
+    "load_rds_secret",
+]
